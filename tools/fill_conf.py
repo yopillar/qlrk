@@ -676,63 +676,22 @@ def writer_types(path: str, writer: str) -> tuple[dict[str, str], bool] | None:
     return None
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Point d'entree en ligne de commande.
+def collect_io(
+    scripts: list[Path],
+) -> tuple[dict[str, dict], dict[str, dict], dict[str, Counter], list[str]]:
+    """Ce que les scripts lisent et ecrivent, fusionne sur tout le dossier.
+
+    Un script qu'on n'arrive pas a analyser n'empeche pas de completer la
+    conf pour les autres : on le note et on continue.
 
     Args:
-        argv: les arguments ; par defaut ceux de la ligne de commande.
+        scripts: les scripts Qlik.
 
     Returns:
-        Le code retour du programme.
+        (lectures par nom, ecritures par nom, indices de type par colonne,
+        scripts ou instructions non analyses).
     """
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("path", type=Path, help="un script Qlik ou le dossier script_qvd/")
-    p.add_argument(
-        "--var",
-        action="append",
-        default=[],
-        metavar="NOM=VALEUR",
-        help="valeur d'une variable des locations, pour aller lire "
-        "les fichiers de donnees (ex. --var entrees=data/input)",
-    )
-    p.add_argument(
-        "--quiet",
-        action="store_true",
-        help="n'afficher que ce qui est ajoute (migrate.py le "
-        "relance avant chaque script)",
-    )
-    p.add_argument(
-        "--draft",
-        action="store_true",
-        help="ne rien modifier, ecrire un brouillon dans conf/draft/",
-    )
-    args = p.parse_args(argv)
-    variables = dict(v.split("=", 1) for v in args.var if "=" in v)
-    scripts = find_scripts(args.path)
-    if not scripts:
-        print(f"Aucun script Qlik dans {args.path} (.qvs, .txt ou sans extension)")
-        return 1
-
-    conf = IoConf()
-    raw = _load_yaml(IO_FILE) if IO_FILE.exists() else {}
-    sections = {
-        k: next((s for s in raw if kind in str(s).lower()), default)
-        for k, kind, default in (
-            ("input", "input", "inputs"),
-            ("output", "output", "outputs"),
-        )
-    }
-    schema_dir = next(
-        (str(Path(e.schema_file).parent) for e in conf.inputs if e.schema_file),
-        "schemas",
-    )
-    base = schema_base(conf)
-    style = schema_style(conf, base)
-    in_prefix = var_prefix(conf, "input", "${entrees}")
-    out_prefix = var_prefix(conf, "output", "${sorties}")
-
-    # Ce que les scripts lisent et ecrivent, fusionne sur tout le dossier.
-    reads: dict[str, dict] = {}  # nom -> path, colonnes, star, scripts
+    reads: dict[str, dict] = {}  # nom -> path, colonnes, star, scripts, spec
     writes: dict[str, dict] = {}  # nom -> path, colonnes, scripts
     hints: dict[str, Counter] = {}
     failed: list[str] = []
@@ -796,29 +755,205 @@ def main(argv: list[str] | None = None) -> int:
                             "columns": [c for c in cols if c not in "*?"],
                         },
                     )
+    return reads, writes, hints, failed
 
-    produced = {norm_path(w["path"]) for w in writes.values()} | set(writes)
-    new_inputs, new_outputs, schemas_out, warnings = [], [], {}, []
-    waiting: list[str] = []  # fichiers dont l'auteur n'est pas traduit
-    unknown_vars: set[str] = set()
 
+def output_entries(
+    writes: dict[str, dict], conf: IoConf, out_prefix: str
+) -> list[tuple[str, dict[str, Any], str]]:
+    """Sorties a ajouter dans io.yml : celles qui n'y sont pas encore.
+
+    Args:
+        writes: les fichiers ecrits par les scripts.
+        conf: conf/io.yml lu.
+        out_prefix: debut des locations de sortie (${sorties}).
+
+    Returns:
+        (cle, proprietes, commentaire) pour chaque sortie.
+    """
+    entries = []
     for _, w in sorted(writes.items()):
         if conf.find(w["path"], "output"):
             continue
-        # une sortie porte le nom du fichier (ou de la table) du script Qlik
-        new_outputs.append(
-            (
-                # cle en minuscules ; la location garde le nom du fichier
-                file_stem(w["path"]).lower(),
-                {"location": f"{out_prefix}/{file_stem(w['path'])}"},
-                (
-                    f"table {w['model']} du modele de donnees de "
-                    f"{', '.join(sorted(w['scripts']))} (pas de STORE dans Qlik)"
-                    if w.get("model")
-                    else f"STORE dans {', '.join(sorted(w['scripts']))}"
-                ),
-            )
+        scripts = ", ".join(sorted(w["scripts"]))
+        why = (
+            f"table {w['model']} du modele de donnees de {scripts} "
+            "(pas de STORE dans Qlik)"
+            if w.get("model")
+            else f"STORE dans {scripts}"
         )
+        # cle en minuscules ; la location garde le nom du fichier
+        name = file_stem(w["path"])
+        entries.append((name.lower(), {"location": f"{out_prefix}/{name}"}, why))
+    return entries
+
+
+def first_readable(
+    candidates: list[str], header: bool, name: str, warnings: list[str]
+) -> tuple[list[str], dict[str, str], str | None, str, str | None]:
+    """Colonnes et types du premier fichier de donnees qu'on arrive a lire.
+
+    Args:
+        candidates: les chemins ou chercher le fichier, dans l'ordre.
+        header: le CSV a une ligne d'en-tete.
+        name: le nom de l'entree, pour les messages.
+        warnings: les remarques, completees si un fichier est illisible.
+
+    Returns:
+        (colonnes, types, format, d'ou viennent les types, chemin lu), tout
+        vide si aucun fichier n'a ete trouve.
+    """
+    for loc in candidates:
+        try:
+            cols, types, fmt, how = file_columns(loc, header)
+        except Exception as exc:  # fichier illisible
+            warnings.append(f"{name} : {loc} illisible ({exc})")
+            continue
+        if fmt:
+            return cols, types, fmt, how, loc
+    return [], {}, None, "", None
+
+
+def print_summary(
+    quiet: bool,
+    draft: bool,
+    where: str,
+    new_inputs: list[tuple[str, dict[str, Any], str]],
+    new_outputs: list[tuple[str, dict[str, Any], str]],
+    created: list[Path],
+    schemas_out: dict[str, tuple[str, list]],
+    waiting: list[str],
+    unknown_vars: set[str],
+    warnings: list[str],
+    failed: list[str],
+) -> None:
+    """Affiche ce qui a ete ajoute, ce qui reste a verifier et pourquoi.
+
+    Args:
+        quiet: n'afficher que ce qui est ajoute.
+        draft: brouillon dans conf/draft/ plutot que la vraie conf.
+        where: le dossier ecrit.
+        new_inputs: les entrees ajoutees.
+        new_outputs: les sorties ajoutees.
+        created: les schemas crees.
+        schemas_out: les schemas calcules, pour compter les types devines.
+        waiting: les fichiers en attente de leur script auteur.
+        unknown_vars: les variables de location inconnues.
+        warnings: les remarques.
+        failed: les scripts ou instructions non analyses.
+    """
+    if quiet and not (new_inputs or new_outputs or created):
+        return
+    verb = "propose(s) dans" if draft else "ajoute(s) dans"
+    print(
+        f"conf : {len(new_inputs)} entree(s), {len(new_outputs)} sortie(s) "
+        f"et {len(created)} schema(s) {verb} {where} "
+        f"({(DRAFT if draft else IO_FILE).resolve()})"
+    )
+    for name, *_ in new_inputs + new_outputs:
+        print(f"  + {name}")
+    for target in created:
+        print(f"  + {target}")
+    notes = [n for _, lines in schemas_out.values() for _, _, n in lines]
+    unknown = sum(n.startswith("type inconnu") for n in notes)
+    guessed = sum(
+        n.endswith("a verifier") and not n.startswith("type inconnu") for n in notes
+    )
+    if guessed or unknown:
+        print(
+            f"Types a verifier : {guessed} devine(s) d'apres les scripts, "
+            f"{unknown} inconnu(s) mis en string (reperables a leur "
+            "commentaire dans les schemas). Pour des types surs, il faut "
+            "que fill_conf trouve le Parquet : dans data/input/, ou a sa "
+            "location avec les variables passees par --var."
+        )
+    if quiet:
+        return
+    if waiting:
+        print(
+            "En attente, declares avec leurs types exacts quand le script "
+            "qui les ecrit aura ete traduit (migrate.py s'en charge) : "
+            + " ; ".join(waiting)
+        )
+    if unknown_vars:
+        print(
+            "[!] Parquet non lus, types devines : variable(s) "
+            f"{', '.join('${' + v + '}' for v in sorted(unknown_vars))} "
+            "inconnue(s). Les passer, ex. --var "
+            f"{sorted(unknown_vars)[0]}=/chemin/des/fichiers, puis relancer "
+            "sur des schemas supprimes (un schema existant n'est jamais "
+            "reecrit)."
+        )
+    for warning in warnings:
+        print(f"[!] {warning}")
+    for f in failed:
+        print(f"[!] non analyse, entrees et sorties a verifier a la main : {f}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Point d'entree en ligne de commande.
+
+    Args:
+        argv: les arguments ; par defaut ceux de la ligne de commande.
+
+    Returns:
+        Le code retour du programme.
+    """
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("path", type=Path, help="un script Qlik ou le dossier script_qvd/")
+    p.add_argument(
+        "--var",
+        action="append",
+        default=[],
+        metavar="NOM=VALEUR",
+        help="valeur d'une variable des locations, pour aller lire "
+        "les fichiers de donnees (ex. --var entrees=data/input)",
+    )
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="n'afficher que ce qui est ajoute (migrate.py le "
+        "relance avant chaque script)",
+    )
+    p.add_argument(
+        "--draft",
+        action="store_true",
+        help="ne rien modifier, ecrire un brouillon dans conf/draft/",
+    )
+    args = p.parse_args(argv)
+    variables = dict(v.split("=", 1) for v in args.var if "=" in v)
+    scripts = find_scripts(args.path)
+    if not scripts:
+        print(f"Aucun script Qlik dans {args.path} (.qvs, .txt ou sans extension)")
+        return 1
+
+    conf = IoConf()
+    raw = _load_yaml(IO_FILE) if IO_FILE.exists() else {}
+    sections = {
+        k: next((s for s in raw if kind in str(s).lower()), default)
+        for k, kind, default in (
+            ("input", "input", "inputs"),
+            ("output", "output", "outputs"),
+        )
+    }
+    schema_dir = next(
+        (str(Path(e.schema_file).parent) for e in conf.inputs if e.schema_file),
+        "schemas",
+    )
+    base = schema_base(conf)
+    style = schema_style(conf, base)
+    in_prefix = var_prefix(conf, "input", "${entrees}")
+    out_prefix = var_prefix(conf, "output", "${sorties}")
+
+    reads, writes, hints, failed = collect_io(scripts)
+    produced = {norm_path(w["path"]) for w in writes.values()} | set(writes)
+    new_inputs: list[tuple[str, dict[str, Any], str]] = []
+    schemas_out: dict[str, tuple[str, list]] = {}
+    warnings: list[str] = []
+    waiting: list[str] = []  # fichiers dont l'auteur n'est pas traduit
+    unknown_vars: set[str] = set()
+
+    new_outputs = output_entries(writes, conf, out_prefix)
 
     for name, r in sorted(reads.items()):
         entry = conf.find(r["path"], "input")
@@ -890,19 +1025,7 @@ def main(argv: list[str] | None = None) -> int:
         if is_produced:
             qlik_fmt, options = "parquet", {}  # ecrit par le job
         header = options.get("header", "true") == "true"
-        cols = []
-        types: dict[str, str] = {}
-        fmt = None
-        origin, how = None, ""
-        for loc in found:
-            try:
-                cols, types, fmt, how = file_columns(loc, header)
-            except Exception as exc:  # fichier illisible
-                warnings.append(f"{name} : {loc} illisible ({exc})")
-                cols, types, fmt, how = [], {}, None, ""
-            if fmt:
-                origin = loc
-                break
+        cols, types, fmt, how, origin = first_readable(found, header, name, warnings)
         if not fmt and "${" in found[0]:
             # Cause la plus frequente de types devines : le Parquet existe,
             # mais sa location contient une variable qu'on ne connait pas.
@@ -1020,59 +1143,19 @@ def main(argv: list[str] | None = None) -> int:
         target.write_text(schema_text(why, lines, style), encoding="utf-8")
         created.append(target)
 
-    if args.quiet and not (new_inputs or new_outputs or created):
-        return 0
-    verb = "propose(s) dans" if args.draft else "ajoute(s) dans"
-    print(
-        f"conf : {len(new_inputs)} entree(s), {len(new_outputs)} sortie(s) "
-        f"et {len(created)} schema(s) {verb} {where} "
-        f"({(DRAFT if args.draft else IO_FILE).resolve()})"
+    print_summary(
+        args.quiet,
+        args.draft,
+        where,
+        new_inputs,
+        new_outputs,
+        created,
+        schemas_out,
+        waiting,
+        unknown_vars,
+        warnings,
+        failed,
     )
-    for name, *_ in new_inputs + new_outputs:
-        print(f"  + {name}")
-    for target in created:
-        print(f"  + {target}")
-    guessed = sum(
-        1
-        for _, lines in schemas_out.values()
-        for _, _, n in lines
-        if n.endswith("a verifier") and not n.startswith("type inconnu")
-    )
-    unknown = sum(
-        1
-        for _, lines in schemas_out.values()
-        for _, _, n in lines
-        if n.startswith("type inconnu")
-    )
-    if guessed or unknown:
-        print(
-            f"Types a verifier : {guessed} devine(s) d'apres les scripts, "
-            f"{unknown} inconnu(s) mis en string (reperables a leur "
-            "commentaire dans les schemas). Pour des types surs, il faut "
-            "que fill_conf trouve le Parquet : dans data/input/, ou a sa "
-            "location avec les variables passees par --var."
-        )
-    if args.quiet:
-        return 0
-    if waiting:
-        print(
-            "En attente, declares avec leurs types exacts quand le script "
-            "qui les ecrit aura ete traduit (migrate.py s'en charge) : "
-            + " ; ".join(waiting)
-        )
-    if unknown_vars:
-        print(
-            "[!] Parquet non lus, types devines : variable(s) "
-            f"{', '.join('${' + v + '}' for v in sorted(unknown_vars))} "
-            "inconnue(s). Les passer, ex. --var "
-            f"{sorted(unknown_vars)[0]}=/chemin/des/fichiers, puis relancer "
-            "sur des schemas supprimes (un schema existant n'est jamais "
-            "reecrit)."
-        )
-    for warning in warnings:
-        print(f"[!] {warning}")
-    for f in failed:
-        print(f"[!] non analyse, entrees et sorties a verifier a la main : {f}")
     return 0
 
 

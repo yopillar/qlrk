@@ -1,7 +1,7 @@
 """Range un script traduit dans le projet.
 
 Les requetes vont dans src/sql/, et la description du script
-(entrees, etapes, sorties) dans work/<script>/assembly.json, qu'orchestrate.py
+(tables et sorties) dans work/<script>/assembly.json, qu'orchestrate.py
 relit ensuite pour ecrire le job.
 
 Le job lit et ecrit par nom, avec read_input() et write_output() de
@@ -67,13 +67,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # On verifie tout avant de copier quoi que ce soit, pour ne pas laisser
     # un script a moitie assemble dans sql/.
-    inputs, read_paths, undeclared = {}, set(), []
+    inputs: dict[str, str] = {}
+    undeclared: list[str] = []
     for s in secs:
         if s["id"] in pending:
             continue
         for view, src in s.get("views", {}).items():
             if "path" in src:
-                read_paths.add(src["path"])
                 if src.get("io"):
                     inputs[view] = src["io"]
                 else:
@@ -112,17 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         k += 1
         name = f"{stem}__{k:02d}_{s['id'].split('_', 1)[1]}.sql"
         shutil.copyfile(args.workdir / s["id"] / "query.sql", out / name)
-        output = s.get("outputs", {}).get(s["table"])
-        # Le script relit-il le fichier qu'il ecrit ? Le job devra alors
-        # couper la lignee avant d'ecrire.
-        steps.append(
-            [
-                name,
-                s["view"],
-                s.get("output_io", {}).get(s["table"]),
-                output in read_paths,
-            ]
-        )
+        steps.append([name, s["view"], s.get("output_io", {}).get(s["table"])])
 
     if not any(st[2] for st in steps):
         print(
@@ -133,7 +123,6 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             {
                 "script": manifest["script"],
-                "inputs": dict(sorted(inputs.items())),
                 "steps": steps,
                 "partial": bool(pending),
             },

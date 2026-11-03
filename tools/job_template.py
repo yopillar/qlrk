@@ -236,8 +236,8 @@ def render_step(
     Args:
         project: le nom du projet.
         scripts: pour chaque script, dans l'ordre ou ils tournent : (nom de
-            la fonction, fichier du script Qlik, ses etapes [fichier sql,
-            table, sortie ou None, ...], fonctions dont il depend).
+            la fonction, fichier du script Qlik, ses tables [fichier sql,
+            table, sortie ou None], fonctions dont il depend).
 
     Returns:
         Le code du module.
@@ -246,6 +246,7 @@ def render_step(
     for func, _, steps, _ in scripts:
         lines = "".join(
             _table_line(sql_file, table, output or None) + "\n"
+            # *_ : les anciens assembly.json ont une 4e valeur, ignoree
             for sql_file, table, output, *_ in steps
         )
         parts.append(

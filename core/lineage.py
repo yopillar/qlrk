@@ -1,10 +1,10 @@
 """Tables intermediaires, pour que chaque table Qlik remonte dans
 OpenLineage.
 
-Une vue temporaire n'est pas un jeu de donnees pour OpenLineage : la lignee
-sautait des fichiers lus aux sorties, sans les tables Qlik entre les deux.
-Chaque table Qlik est donc ecrite en Parquet dans une table du catalogue,
-<base>.<script>__<table>, puis relue de la.
+Une vue temporaire n'est pas un jeu de donnees pour OpenLineage : avec des
+vues seulement, la lignee irait des fichiers lus aux sorties sans montrer
+les tables Qlik entre les deux. Chaque table Qlik est donc ecrite en Parquet
+dans une table du catalogue, <base>.<script>__<table>, puis relue de la.
 """
 
 from __future__ import annotations

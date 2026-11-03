@@ -1,11 +1,13 @@
-"""Le decorateur @pipeline, point d'entree de chaque job, et le decorateur
-@script, pose sur chaque script Qlik du projet.
+"""Les deux decorateurs du job : @pipeline sur sa fonction principale,
+@script sur chaque script Qlik (ou chacune de vos etapes).
 
-    @pipeline("demo")
+    @pipeline("demo")                     # src/job_demo.py
     def run(spark: SparkSession, args: list[str]) -> None:
-        calendrier.run()
-        ventes.run()
-        synthese.run()
+        demo_step_010_run_sql.run()
+
+    @script                               # src/scripts/demo_step_010_run_sql.py
+    def ventes() -> None:
+        run_tables(VENTES)
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ logger = logging.getLogger("core")
 
 # La fonction principale d'un job : run(spark, args).
 JobFunction = Callable[[SparkSession, list[str]], None]
-# La fonction run() d'un script Qlik.
+# Une fonction de script, sans argument.
 ScriptFunction = Callable[[], None]
 
 
@@ -125,7 +127,7 @@ def parse_options(args: list[str]) -> argparse.Namespace:
         start (--from), only (--only), database (--database) et
         temp_views (--temp-views).
     """
-    p = argparse.ArgumentParser(prog="job.py", add_help=False)
+    p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--from", dest="start", help="reprendre a ce script")
     p.add_argument("--only", help="ne lancer que ce script")
     p.add_argument(

@@ -6,8 +6,7 @@
                                                    FileTime())
     write_output("ventes_v2", table="Ventes")      STORE Ventes INTO ventes_v2
 
-Une seule fonction pour les deux usages : avant, datasets.py renvoyait le
-DataFrame et tables.py le rangeait dans une vue sans rien renvoyer.
+read_input sert aux deux : PySpark classique, et tables pour les requetes.
 """
 
 from __future__ import annotations
