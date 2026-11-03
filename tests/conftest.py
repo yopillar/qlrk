@@ -72,7 +72,7 @@ class Project:
         return res
 
     def run_job(self, *args: str) -> subprocess.CompletedProcess[str]:
-        """Lance le job genere src/demo/job.py.
+        """Lance le job genere src/job_demo.py.
 
         Args:
             args: ses arguments (--only ventes...).
@@ -87,14 +87,14 @@ class Project:
             sorties="data/output",
         )
         res = subprocess.run(
-            [sys.executable, "src/demo/job.py", *args],
+            [sys.executable, "src/job_demo.py", *args],
             cwd=self.path,
             env=env,
             capture_output=True,
             text=True,
         )
         if res.returncode:
-            raise AssertionError(f"job.py {' '.join(args)}\n{res.stderr[-3000:]}")
+            raise AssertionError(f"job_demo.py {' '.join(args)}\n{res.stderr[-3000:]}")
         return res
 
     def __truediv__(self, other: str) -> Path:

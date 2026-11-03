@@ -1,8 +1,8 @@
 # Migration Qlik -> Spark SQL
 
 Chaque script Qlik est traduit en requetes Spark SQL, une par table, rangees
-dans `src/<nom-projet>/sql/`. Un job unique, `src/<nom-projet>/job.py`, les
-enchaine pour tout le projet. Le job ne contient aucun code PySpark : il
+dans `src/sql/`. L'etape `src/scripts/<projet>_step_010_run_sql.py` les
+enchaine pour tout le projet, et le job `src/job_<projet>.py` la lance. Le job ne contient aucun code PySpark : il
 appelle des fonctions du socle `spark_foundation` (`spark-foundation-core`),
 qui s'appuie sur `pyspark_commons`. Un developpeur Qlik peut le lire sans
 connaitre Spark.
@@ -21,9 +21,11 @@ mon-projet/
 |-- data/input/               donnees lues (si absentes de conf/io.yml)    (a fournir)
 |-- data/qlik_outputs/        sorties Qlik pour comparer, facultatif       (a fournir)
 |-- data/output/              donnees ecrites par le job                   (genere)
-|-- src/<nom-projet>/job.py   job du projet, tous les scripts dans l'ordre (genere)
-|-- src/<nom-projet>/<script>.py un fichier par script Qlik, a cote de job.py (genere)
-|-- src/<nom-projet>/sql/     <script>__01_<table>.sql, ...                  (genere)
+|-- src/job_<projet>.py       le job, le seul a lancer               (cree une fois)
+|-- src/scripts/__init__.py                                          (cree une fois)
+|-- src/scripts/<projet>_step_010_run_sql.py  les scripts Qlik       (genere)
+|-- src/scripts/<projet>_step_020_<nom>.py    vos etapes             (a la main)
+|-- src/sql/                  <script>__01_<table>.sql, ...          (genere)
 |-- work/                     travail intermediaire, journal.csv           (genere)
 |-- .opencode/agents/translator.md
 |-- .opencode/skills/         4 skills SQL (jointures, mappings, chaines TMP, Peek/Previous)
@@ -31,11 +33,19 @@ mon-projet/
 `-- tools/
 ```
 
-`<nom-projet>` est le nom du dossier du projet, ou la valeur de la variable
-`QLIK_PROJECT` si elle est definie. Comme `src/<nom-projet>/` est un package
-Python (le kit y cree un `__init__.py` s'il manque) et que ce nom est aussi
-celui du traitement passe a `@pipeline`, il est ramene a un identifiant
-Python : `mon-projet` devient `mon_projet`. Tous les scripts partagent le meme
+`<projet>` est le nom du dossier du projet, ou la valeur de la variable
+`QLIK_PROJECT` si elle est definie, ramene a un identifiant Python
+(`mon-projet` devient `mon_projet`) : il sert dans les noms de fichiers et
+c'est le nom du traitement passe a `@pipeline`. On le retrouve dans les
+noms de fichiers et dans chaque ligne de log, ce qui permet de s'y
+retrouver dans YARN.
+
+D'autres jobs peuvent venir a cote (`src/job_<traitement>_<projet>.py` :
+export d'un data product, transformation ou nettoyage en PySpark) : ils
+partagent `scripts/` et `sql/`. Les etapes sont numerotees de 10 en 10 pour
+pouvoir en inserer une plus tard. `scripts/` a un `__init__.py` : c'est un
+package, et `from scripts import ...` se resout de la meme facon pour
+Python et pour les outils de CI (a partir de `src/`). Tous les scripts partagent le meme
 dossier `sql/`, d'ou le prefixe `<script>__` dans les noms de fichiers : deux
 scripts peuvent avoir une table du meme nom. Le numero suit l'ordre des
 tables dans le script.
@@ -46,10 +56,10 @@ Le code genere n'importe que le socle, et seulement ces fonctions :
 
 | Import dans le code genere | Fichier du socle | Role |
 |---|---|---|
-| `from spark_foundation import pipeline` (`job.py`) | `spark_foundation/runner.py` | `@pipeline("<nom-projet>")` ouvre la session, lit `--from`, `--only`, `--database`, `--temp-views` et trouve `sql/` a cote de `job.py` |
-| `from spark_foundation.runner import script` (`<script>.py`) | `spark_foundation/runner.py` | `@script` sur le `run()` d'un script : `--from` / `--only`, vues du script, arret au premier echec |
-| `from spark_foundation.datasets import read_input, write_output` (`<script>.py`) | `spark_foundation/datasets.py` | lire une entree de `conf/io.yml`, ecrire une table dans une sortie |
-| `from spark_foundation.tables import run_sql` (`<script>.py`) | `spark_foundation/tables.py` | calculer une table Qlik avec sa requete du dossier `sql/` |
+| `from spark_foundation import pipeline` (job) | `spark_foundation/runner.py` | `@pipeline("<projet>")` ouvre la session, configure les logs, lit `--from`, `--only`, `--database`, `--temp-views` et trouve `sql/` a cote du job |
+| `from spark_foundation.runner import script` (etape) | `spark_foundation/runner.py` | `@script` sur la fonction d'un script Qlik : `--from` / `--only`, vues du script, logs, arret au premier echec |
+| `from spark_foundation.datasets import write_output` (etape) | `spark_foundation/datasets.py` | ecrire une table dans une sortie de `conf/io.yml` (et `read_input` pour vos etapes PySpark) |
+| `from spark_foundation.tables import run_sql` (etape) | `spark_foundation/tables.py` | calculer une table Qlik avec sa requete du dossier `sql/`, apres avoir lu les entrees dont elle a besoin |
 
 - les autres fichiers du socle, a plat (aucun sous-dossier) : session et reglages SQL (`session.py`),
   lecture de `conf/io.yml` (`config.py`), etat du job (`context.py`),
@@ -95,10 +105,10 @@ genere).
 Toute fonction, classe et module de `core/`, `commons/` et `tools/` a une
 docstring et des annotations de type (`DataFrame` pour un DataFrame) :
 `ruff` (regles `D1` et `ANN`) et `mypy` le verifient. Le code genere
-(`job.py`, `<script>.py`) aussi, et le test de bout en bout passe le projet genere a
+(job et etape 010) aussi, et le test de bout en bout passe le projet genere a
 `ruff` et `mypy`.
 
-Le texte du job et des modules de scripts est dans
+Le texte du job et de l'etape 010 est dans
 `tools/job_template.py`. Si on veut changer leur forme, on corrige ce
 fichier et on relance `migrate.py` (ou `orchestrate.py`).
 
@@ -128,7 +138,7 @@ Deux sortes d'arguments, a ne pas confondre :
 ```bash
 python tools/migrate.py script_qvd/ventes.qvs --pilot 3   # la 1re fois, puis on relit
 python tools/migrate.py script_qvd/ --jobs 4              # tout le dossier
-python src/<nom-projet>/job.py                            # lancer le resultat
+python src/job_<projet>.py                                # lancer le resultat
 ```
 
 Pour chaque script, `migrate.py` traduit ce qu'il peut sans modele, fait
@@ -143,74 +153,91 @@ n'est pas refait.
 Pour savoir ou on en est, `work/<script>/rapport.md` dit table par table ce
 qui a ete traduit sans modele, ce qui reste a completer, et pourquoi.
 
-## Le job du projet : `src/<nom-projet>/job.py`
+## Le job du projet : `src/job_<projet>.py`
 
 ```bash
-python src/<nom-projet>/job.py                  # tous les scripts
-python src/<nom-projet>/job.py --from ventes    # reprendre apres un echec
-python src/<nom-projet>/job.py --only ventes    # un seul script
+python src/job_<projet>.py                  # tous les scripts
+python src/job_<projet>.py --from ventes    # reprendre apres un echec
+python src/job_<projet>.py --only ventes    # un seul script
 ```
 
 Sur le cluster, depuis la racine du projet (la commande est rappelee en tete
-de `job.py`) :
+du job) :
 
 ```bash
-spark-submit --name <nom-projet> --deploy-mode client \
+spark-submit --name <projet> --deploy-mode client \
     --py-files <spark-foundation-core et pyspark-commons, s'ils ne sont pas installes> \
-    src/<nom-projet>/job.py [--from <script> | --only <script>]
+    src/job_<projet>.py [--from <script> | --only <script>]
 ```
 
-En mode client, le driver lit les requetes dans `src/<nom-projet>/sql/`. Le
-mode cluster demanderait d'envoyer aussi ce dossier et `conf/` : pas prevu
-pour l'instant. Les reglages SQL dont dependent les requetes (sensibilite a
-la casse, ANSI desactive, `timeParserPolicy=CORRECTED`) sont poses par
-le socle a l'ouverture de la session, il n'y a donc pas de `--conf` a passer.
+En mode client, le driver lit `src/scripts/` et les requetes de `src/sql/`
+sur place. Le mode cluster demanderait d'envoyer aussi ces dossiers et
+`conf/` : pas prevu pour l'instant. Les reglages SQL dont dependent les
+requetes (sensibilite a la casse, ANSI desactive,
+`timeParserPolicy=CORRECTED`) sont poses par le socle a l'ouverture de la
+session, il n'y a donc pas de `--conf` a passer.
 
-Le job tient en quelques lignes :
+Le job est cree une fois, puis jamais reecrit : c'est la qu'on ajoute ses
+propres etapes, dans l'ordre.
 
 ```python
-import calendrier
-import synthese
-import ventes
+from scripts import demo_step_010_run_sql
+from spark_foundation import pipeline
 
 
 @pipeline("demo")
 def run(spark: SparkSession, args: list[str]) -> None:
-    calendrier.run()
-    ventes.run()
-    synthese.run()  # apres ventes, dont il lit les sorties
+    demo_step_010_run_sql.run()
 ```
 
-et chaque script Qlik devient un fichier a cote de `job.py`
-(`src/<nom-projet>/ventes.py`, pas de sous-dossier, seul `sql/` en est un)
-avec la liste de ses
-entrees, la liste de ses tables dans l'ordre, et deux boucles. Avec 50
-tables, on ajoute 50 lignes aux listes, pas 140 appels de fonction :
+L'etape 010, elle, est reecrite a chaque migration : une liste de tables
+par script Qlik, une seule boucle, et `run()` qui appelle les scripts dans
+l'ordre. Avec 50 tables, on ajoute 50 lignes a une liste, pas 140 appels de
+fonction. Rien n'y parle des fichiers lus : `run_sql` charge tout seul les
+entrees dont la requete a besoin (vue `in_ventes` -> entree `ventes` de
+`conf/io.yml`), `conf/io.yml` reste la seule source.
 
 ```python
-INPUTS: dict[str, str] = {
-    "ventes": "in_ventes",
-}
-
-TABLES: list[tuple[str, str, str | None]] = [
+VENTES: list[tuple[str, str, str | None]] = [
     ("ventes__01_ventes.sql", "Ventes", "ventes_enrichies_v2"),
     ("ventes__02_clients.sql", "Clients", None),  # None : pas de STORE
 ]
 
 
 @script
+def ventes() -> None:
+    """Script Qlik ventes.qvs."""
+    run_tables(VENTES)
+
+
 def run() -> None:
-    """Rejoue le script ventes.qvs."""
-    for name, table in INPUTS.items():
-        read_input(name, table=table)
-    for sql_file, table, output in TABLES:
-        run_sql(sql_file, table=table)
-        if output:
-            write_output(output, table=table)
+    """Fait tourner les scripts Qlik du projet, dans l'ordre."""
+    calendrier()
+    ventes()
+    synthese()  # apres ventes, dont il lit les sorties
 ```
 
-- L'ordre des scripts est l'ordre des appels dans `job.py`, il n'y a pas
-  de liste a part. Il compte encore : un script qui lit un fichier
+Chaque ligne de log dit le projet, l'etape et le script, puis ce qui se
+passe, avec les chemins et les durees :
+
+```
+[demo] step_010_run_sql > ventes : lecture ventes <- data/input/ventes.csv (table in_ventes)
+[demo] step_010_run_sql > ventes : sql ventes__01_ventes.sql -> Ventes (demo_qlik.ventes__ventes) en 4s
+[demo] step_010_run_sql > ventes : ecriture Ventes -> ventes_enrichies_v2 (data/output/ventes_enrichies_v2)
+```
+
+En cas d'erreur, le message dit quoi regarder et comment reprendre :
+
+```
+[demo] step_010_run_sql > ventes : ECHEC pendant sql/ventes__01_ventes.sql (table Ventes)
+  -> erreur : [UNRESOLVED_COLUMN.WITH_SUGGESTION] ... `s`.`Montantt` ...
+  -> une fois corrige, relancer le job avec --from ventes
+```
+
+Si l'application a deja configure ses logs, le socle n'y touche pas ; sinon
+il les affiche au niveau INFO, sur la sortie d'erreur que YARN recupere.
+
+- L'ordre des scripts est l'ordre des appels dans `run()` de l'etape 010. Il compte encore : un script qui lit un fichier
   ecrit par un autre doit passer apres lui, comme avec l'enchainement des
   taches de rechargement dans Qlik. `orchestrate.py` le calcule a partir de
   `work/stores.json` (ce que chaque script lit et ecrit) et le note en
@@ -219,11 +246,16 @@ def run() -> None:
   les suivants liraient des donnees absentes ou d'hier. L'erreur dit d'ou
   reprendre (`--from <script>`) : `@script` fait sauter les scripts d'avant.
   Un nom inconnu a `--from` ou `--only` est signale a la fin du job. Un
-  script dont le nom est deja pris par Python ou le socle (`calendar`,
-  `json`, `job`...) prend le suffixe `_qlik`, pour ne pas les cacher. Toutes les ecritures sont en overwrite,
-  relancer ne cree donc pas de doublon.
-- Les lectures et ecritures passent par `read_input` et `write_output`,
-  avec les noms de `conf/io.yml`. La location, le format et la resolution
+  script dont le nom est un mot reserve de Python ou deja pris dans l'etape
+  (`run`, `script`, `run_sql`...) prend le suffixe `_qlik`. Toutes les
+  ecritures sont en overwrite, relancer ne cree donc pas de doublon.
+- `@script` marche aussi sur vos etapes : posez-le sur leur fonction pour
+  pouvoir les viser avec `--from` et `--only`.
+- Une entree de `conf/io.yml` doit avoir une cle faite de lettres, chiffres
+  et `_` (c'est ce que `fill_conf.py` ecrit) : sa vue est `in_<cle>`, et
+  `assemble.py` refuse un script dont une entree ne suit pas la regle.
+- Les lectures et ecritures passent par le socle, avec les noms de
+  `conf/io.yml`. La location, le format et la resolution
   des chemins relatifs sont l'affaire du socle.
 - Les vues d'un script sont supprimees quand il a fini, pour que deux
   scripts puissent avoir une table du meme nom.
@@ -662,11 +694,11 @@ tests sont sautes.
 | `check.py` | controles, et syntaxe Spark avec `--parse` |
 | `conf.py` | lecture de `conf/io.yml` et des schemas |
 | `fill_conf.py` | complete `conf/io.yml` et les schemas (lance par `migrate.py`) |
-| `assemble.py` | copie des requetes d'un script dans `src/<nom-projet>/sql/` |
-| `job_template.py` | texte du job et des fichiers de scripts |
+| `assemble.py` | copie des requetes d'un script dans `src/sql/` |
+| `job_template.py` | texte du job et de l'etape 010 |
 | `verify.py` | lance le job et compare avec `data/qlik_outputs/` |
 | `compare.py` | comparaison de deux tables |
-| `orchestrate.py` | genere `job.py` et un fichier par script, ordonne les scripts |
+| `orchestrate.py` | ecrit l'etape 010 (et cree le job s'il manque), ordonne les scripts |
 | `journal.py` | tenue de `work/journal.csv` |
 
 ## Limites connues

@@ -36,12 +36,17 @@ def read_input(name: str, table: str | None = None) -> DataFrame:
         L'entree lue, telle qu'elle est dans le fichier.
     """
     spark = active_session()
+    location = access.input_location(name)
+    context.doing(f"la lecture de {name} ({location})")
     df = access.read_config(spark, name)
+    context.log(
+        f"lecture {name} <- {location}" + (f" (table {table})" if table else "")
+    )
     if table is not None:
         state = context.state()
         add_load_order(df).createOrReplaceTempView(table)
         state.tables.append(table)
-        state.read_locations.add(access.input_location(name))
+        state.read_locations.add(location)
         times = file_times(df)
         if times is not None:
             times.createOrReplaceTempView(table + "__file")
@@ -58,12 +63,15 @@ def write_output(name: str, table: str) -> None:
     """
     spark = active_session()
     state = context.state()
+    location = access.output_location(name)
+    context.doing(f"l'ecriture de {table} dans {name} ({location})")
     df = spark.table(table)
-    if state.database is None and access.output_location(name) in state.read_locations:
+    if state.database is None and location in state.read_locations:
         # Le script ecrase un fichier qu'il a lu : sans table intermediaire,
         # Spark relirait le fichier en l'ecrivant. On fige la table avant.
         df = df.localCheckpoint()
     access.write_config(df, name)
+    context.log(f"ecriture {table} -> {name} ({location})")
 
 
 def file_times(df: DataFrame) -> DataFrame | None:

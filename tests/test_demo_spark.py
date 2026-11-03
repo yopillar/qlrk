@@ -58,7 +58,7 @@ def test_migrate_demo_identical_to_qlik(project: Project) -> None:
         "--var",
         "sorties=data/output",
     )
-    job = (project / "src/demo/job.py").read_text(encoding="utf-8")
+    job = (project / "src/job_demo.py").read_text(encoding="utf-8")
     assert "spark-submit" in job
 
 
@@ -103,37 +103,43 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
     project.run(
         "migrate.py", "script_qvd/", "--skip-selftest", "--var", "sorties=data/output"
     )
-    job = (project / "src/demo/job.py").read_text(encoding="utf-8")
-    # rien de technique dans le job : pipeline et un appel par script
+    src = project / "src"
+    # src/ : le job, scripts/ (un package) et sql/
+    assert (src / "job_demo.py").is_file() and (src / "scripts/__init__.py").is_file()
+    assert sorted((src / "sql").glob("ventes__*.sql"))
+    job = (src / "job_demo.py").read_text(encoding="utf-8")
+    # rien de technique dans le job : pipeline et l'appel de l'etape 010
+    assert "from scripts import demo_step_010_run_sql\n" in job
     assert "from spark_foundation import pipeline" in job
-    assert "run_scripts" not in job and len(job.splitlines()) < 60
-    # l'ordre des scripts est l'ordre des appels
+    assert "    demo_step_010_run_sql.run()\n" in job and len(job.splitlines()) < 60
+    step = (src / "scripts/demo_step_010_run_sql.py").read_text(encoding="utf-8")
+    # une liste par script Qlik, une seule boucle, rien sur les entrees
+    assert '("ventes__01_ventes.sql", "Ventes", "ventes_enrichies_v2"),' in step
+    assert step.count("run_sql(") == 1 and "read_input" not in step
+    assert "@script\ndef ventes() -> None:" in step
+    # l'ordre des scripts est l'ordre des appels dans run()
+    calls = step[step.index("def run() -> None:") :]
     assert (
-        job.index("calendrier.run()")
-        < job.index("ventes.run()")
-        < job.index("synthese.run()")
+        calls.index("calendrier()")
+        < calls.index("ventes()")
+        < calls.index("synthese()")
     )
-    # les scripts sont des fichiers a cote de job.py, sans dossier (hors le
-    # cache que Python cree en lancant le job)
-    src = project / "src/demo"
-    folders = sorted(p.name for p in src.iterdir() if p.is_dir())
-    assert [f for f in folders if f != "__pycache__"] == ["sql"]
-    ventes = (src / "ventes.py").read_text(encoding="utf-8")
-    assert "from spark_foundation.runner import script" in ventes
-    assert "@script\ndef run() -> None:" in ventes
-    assert (
-        "from spark_foundation.datasets import read_input, write_output\n"
-        "from spark_foundation.runner import script\n"
-        "from spark_foundation.tables import run_sql\n"
-    ) in ventes
-    # une liste des entrees, une liste des tables, et deux boucles
-    assert '"ventes": "in_ventes",' in ventes
-    assert '("ventes__01_ventes.sql", "Ventes", "ventes_enrichies_v2"),' in ventes
-    assert ventes.count("read_input(") == 1 and ventes.count("run_sql(") == 1
     check_generated_code(project)
+    # le job n'est jamais reecrit : on peut y ajouter ses etapes
+    (src / "job_demo.py").write_text(job + "# mon etape\n", encoding="utf-8")
+    project.run("orchestrate.py")
+    assert (src / "job_demo.py").read_text(encoding="utf-8").endswith("# mon etape\n")
     # le metastore local garde les tables d'un lancement a l'autre ; on
     # relance ventes pour verifier qu'une table existante est bien remplacee
-    project.run_job("--only", "ventes")
+    res = project.run_job("--only", "ventes")
+    # des logs lisibles : projet, etape, script, et ce qui est fait
+    for line in (
+        "[demo] step_010_run_sql > calendrier : saute (--from / --only)",
+        "[demo] step_010_run_sql > ventes : lecture ventes <- ",
+        "[demo] step_010_run_sql > ventes : sql ventes__01_ventes.sql -> Ventes ",
+        "[demo] step_010_run_sql > ventes : ecriture Ventes -> ventes_enrichies_v2 ",
+    ):
+        assert line in res.stderr, res.stderr[-3000:]
     # reprise a un script, et nom de script inconnu
     project.run_job("--from", "synthese")
     with pytest.raises(AssertionError, match="Script inconnu : ventess"):
@@ -151,19 +157,34 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
         text=True,
     )
     assert "ventes__ventes" in res.stdout, res.stderr[-2000:]
+    # une requete cassee : le log dit quel fichier, quelle table, et comment
+    # reprendre
+    sql = project / "src/sql/ventes__01_ventes.sql"
+    sql.write_text(
+        sql.read_text(encoding="utf-8").replace("s.Montant", "s.Montantt", 1),
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError) as failed:
+        project.run_job("--only", "ventes")
+    message = str(failed.value)
+    assert (
+        "[demo] step_010_run_sql > ventes : ECHEC pendant "
+        "sql/ventes__01_ventes.sql (table Ventes)"
+    ) in message
+    assert "Montantt" in message and "relancer le job avec --from ventes" in message
 
 
 def check_generated_code(project: Project) -> None:
     """Le code genere passe les memes controles que le kit : docstrings et
     annotations de type partout (ruff D1, ANN), types coherents (mypy)."""
-    src = project / "src/demo"
+    src = project / "src"
     config = str(ROOT / "pyproject.toml")
     ruff = shutil.which("ruff")
     if ruff:
         for cmd in (["format", "--check"], ["check", "--no-cache"]):
             # depuis la racine du projet, comme on lance ruff en vrai
             res = subprocess.run(
-                [ruff, *cmd, "--config", config, "src/demo"],
+                [ruff, *cmd, "--config", config, "src"],
                 cwd=project.path,
                 capture_output=True,
                 text=True,
@@ -173,9 +194,7 @@ def check_generated_code(project: Project) -> None:
     if mypy:
         res = subprocess.run(
             [mypy, "--config-file", config, "--cache-dir", os.devnull]
-            + [
-                str(p.name) for p in sorted(src.glob("*.py")) if p.name != "__init__.py"
-            ],
+            + ["job_demo.py", "scripts"],
             cwd=src,
             env=dict(os.environ, MYPYPATH=JOB_PATH),
             capture_output=True,

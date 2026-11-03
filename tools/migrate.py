@@ -14,13 +14,14 @@ donc relance avant chaque script. Puis, pour chaque script :
                    traduire sans le modele (le reste est marque TODO(model))
   2. translate.py  fait completer les TODO par le modele, une table par
                    appel, avec un controle et une relance si ca ne passe pas
-  3. assemble.py   copie les requetes dans src/<nom-projet>/sql/ quand tout
-                   est valide, puis orchestrate.py regenere job.py
+  3. assemble.py   copie les requetes dans src/sql/ quand tout est valide,
+                   puis orchestrate.py regenere l'etape 010
+                   (src/scripts/<projet>_step_010_run_sql.py)
   4. verify.py     compare avec Qlik, s'il y a des sorties dans
                    data/qlik_outputs/
 
-Au bout, src/<nom-projet>/job.py contient tous les scripts assembles, dans
-l'ordre de leurs dependances.
+Au bout, l'etape 010 contient tous les scripts assembles, dans l'ordre de
+leurs dependances, et src/job_<projet>.py la lance.
 
 On peut relancer autant de fois qu'on veut : ce qui est deja traduit et n'a
 pas bouge n'est pas refait.
@@ -37,7 +38,7 @@ from pathlib import Path
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 from conf import WORK, find_scripts  # noqa: E402
-from job_template import project_dir  # noqa: E402
+from job_template import job_path  # noqa: E402
 from orchestrate import STORES, order_scripts  # noqa: E402
 
 
@@ -219,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
             break
 
     print()
-    run("orchestrate.py")  # regenere src/<nom-projet>/job.py
+    run("orchestrate.py")  # regenere l'etape 010 (et cree le job)
 
     print(f"\n{'=' * 70}\nRESUME")
     print(f"Conf : {conf_state}")
@@ -229,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    a corriger : {WORK / Path(name).stem / sid}/query.sql")
     ready = sum("assemble" in state for _, state, _ in summary)
     print(
-        f"\nJob du projet : {(project_dir() / 'job.py').resolve()} "
+        f"\nJob du projet : {job_path().resolve()} "
         f"({'contient les scripts assembles' if ready else 'aucun script assemble pour le moment'})"
     )
     print(f"Journal : {WORK / 'journal.csv'}")
