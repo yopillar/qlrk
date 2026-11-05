@@ -367,8 +367,11 @@ D'ou viennent les informations :
   1. les metadonnees du Parquet, dans `data/input/` ou a sa location
      (variables passees par `--var`) ;
   2. les types que pandas lit dans un fichier Excel ;
-  3. les valeurs d'un CSV (5 000 premieres lignes) : entier, decimal a
-     point, sinon texte ;
+  3. les valeurs d'un CSV (tout le fichier) : entier, decimal a point,
+     date et horodatage ISO (`2024-01-31`, `2024-01-31 10:00:00`), booleen
+     `true`/`false`, sinon texte. Une date a la francaise (`29/12/2024`)
+     ou un decimal a virgule restent en texte : Spark ne les lirait pas
+     sans options ;
   4. le script Qlik : la fonction qui recoit la colonne (`Year(col)` donne
      `date`, `Sum(col)` donne `double`, `Trim(col)` donne `string`), la
      constante a laquelle elle est comparee, ou son nom (`date_...`) ;
@@ -380,7 +383,10 @@ D'ou viennent les informations :
   le commentaire "type inconnu".
 
   Les metadonnees du Parquet se lisent avec `pyarrow`, ou a defaut avec
-  Spark (plus lent a demarrer). Sans les deux, `fill_conf.py` le signale et
+  Spark (plus lent a demarrer). Les types sont repris exactement : un
+  decimal garde sa precision (`decimal(18,2)`, et non `decimal`, que Spark
+  lirait en `decimal(10,0)`), une colonne categorielle prend le type de ses
+  valeurs. Sans les deux, `fill_conf.py` le signale et
   les types sont devines. Un schema deja ecrit n'est jamais corrige : un
   schema cree avec des types devines (fichier absent, pyarrow manquant) est
   a supprimer pour etre recree avec les vrais types.

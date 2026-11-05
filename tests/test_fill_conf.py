@@ -1,5 +1,7 @@
 """Completion de conf/io.yml et des schemas par fill_conf.py."""
 
+import datetime as dt
+import decimal
 import subprocess
 import sys
 from pathlib import Path
@@ -7,8 +9,9 @@ from pathlib import Path
 import pytest
 import yaml
 
+from check import spark_type
 from conftest import Project
-from fill_conf import parquet_types
+from fill_conf import csv_types, parquet_types
 
 SCRIPTS = ("script_qvd/calendrier", "script_qvd/synthese.txt", "script_qvd/ventes.qvs")
 
@@ -322,3 +325,63 @@ def test_parquet_types_without_pyarrow(
     monkeypatch.setitem(sys.modules, "pyarrow", None)
     monkeypatch.setitem(sys.modules, "pyarrow.parquet", None)
     assert parquet_types(path) == {"Site": "string", "Qte": "bigint"}
+
+
+def test_parquet_types_keep_precision(tmp_path: Path) -> None:
+    """Les types Parquet sont repris exactement : un decimal garde sa
+    precision (sinon Spark le lit en decimal(10,0), sans les decimales)."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    table = pa.table(
+        {
+            "montant": pa.array([decimal.Decimal("12.34")], pa.decimal128(18, 2)),
+            "qte": pa.array([1], pa.int32()),
+            "id": pa.array([1], pa.uint32()),
+            "taux": pa.array([1.5], pa.float16()),
+            "code": pa.array([1]).dictionary_encode(),
+            "libelle": pa.array(["x"]).dictionary_encode(),
+            "blob": pa.array([b"x"]),
+            "heure": pa.array([dt.time(1, 2)], pa.time64("us")),
+        }
+    )
+    path = tmp_path / "t.parquet"
+    pq.write_table(table, path)
+    assert parquet_types(path) == {
+        "montant": "decimal(18,2)",
+        "qte": "int",
+        "id": "bigint",
+        "taux": "double",
+        "code": "bigint",
+        "libelle": "string",
+        "blob": "binary",
+        "heure": "string",
+    }
+
+
+def test_csv_values_give_dates_and_booleans(tmp_path: Path) -> None:
+    """Dates et horodatages ISO et booleens d'un CSV sont types, pas les
+    dates a la francaise ni les fausses dates."""
+    path = tmp_path / "t.csv"
+    path.write_text(
+        "jour;moment;actif;fr;faux;mixte\n"
+        "2024-01-31;2024-01-31 10:00:00;true;29/12/2024;2024-13-45;2024-01-31\n"
+        "2024-02-01;2024-02-01T11:30:15;False;30/12/2024;2024-01-01;"
+        "2024-02-01 08:00\n",
+        encoding="utf-8",
+    )
+    _, types, _ = csv_types(path)
+    assert types == {
+        "jour": "date",
+        "moment": "timestamp",
+        "actif": "boolean",
+        "fr": "string",
+        "faux": "string",
+        "mixte": "timestamp",
+    }
+
+
+def test_check_keeps_decimal_precision() -> None:
+    """Le controle declare les vues avec la precision des decimaux."""
+    assert spark_type("DECIMAL(18,2)") == "DECIMAL(18,2)"
+    assert spark_type("decimal") == "DECIMAL(38,10)"
+    assert spark_type("binary") == "BINARY"

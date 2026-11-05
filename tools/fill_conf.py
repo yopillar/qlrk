@@ -145,20 +145,6 @@ HINTS = {
 # en cas d'indices contradictoires, le plus specifique gagne
 PRIORITY = ("string", "timestamp", "date", "double")
 
-ARROW_TYPES = (
-    ("large_string", "string"),
-    ("string", "string"),
-    ("int64", "bigint"),
-    ("int", "int"),
-    ("uint", "bigint"),
-    ("double", "double"),
-    ("float", "double"),
-    ("decimal", "decimal"),
-    ("date", "date"),
-    ("timestamp", "timestamp"),
-    ("bool", "boolean"),
-)
-
 
 def yaml_key(name: str) -> str:
     """Nom de colonne ou d'entree utilisable comme cle YAML."""
@@ -354,20 +340,42 @@ def file_columns(
     return [], {}, None, ""
 
 
-# Type Spark -> type du schema, quand le Parquet est lu par Spark.
-SPARK_TYPES = (
-    ("string", "string"),
-    ("bigint", "bigint"),
-    ("int", "int"),
-    ("smallint", "int"),
-    ("tinyint", "int"),
-    ("double", "double"),
-    ("float", "double"),
-    ("decimal", "decimal"),
-    ("date", "date"),
-    ("timestamp", "timestamp"),
-    ("boolean", "boolean"),
-)
+def arrow_type(t: Any) -> str:
+    """Type du schema (au sens de Spark) d'une colonne Parquet lue par
+    pyarrow.
+
+    Les decimaux gardent leur precision : un simple "decimal" serait lu par
+    Spark comme decimal(10,0), sans les decimales. Une colonne categorielle
+    (dictionary) a le type de ses valeurs. Ce que Spark n'a pas (heure seule,
+    types imbriques) est mis en string.
+
+    Args:
+        t: le type pyarrow.
+
+    Returns:
+        bigint, decimal(18,2), timestamp...
+    """
+    import pyarrow.types as pt
+
+    if pt.is_dictionary(t):
+        return arrow_type(t.value_type)
+    if pt.is_decimal(t):
+        return f"decimal({t.precision},{t.scale})"
+    if pt.is_int64(t) or pt.is_uint32(t) or pt.is_uint64(t):
+        return "bigint"
+    if pt.is_integer(t):
+        return "int"
+    if pt.is_floating(t):
+        return "double"
+    if pt.is_boolean(t):
+        return "boolean"
+    if pt.is_date(t):
+        return "date"
+    if pt.is_timestamp(t):
+        return "timestamp"
+    if pt.is_binary(t) or pt.is_large_binary(t):
+        return "binary"
+    return "string"
 
 
 def parquet_types(path: Path) -> dict[str, str]:
@@ -391,12 +399,7 @@ def parquet_types(path: Path) -> dict[str, str]:
     except ImportError:
         pq = None
     if pq is not None:
-        return {
-            f.name: next(
-                (t for a, t in ARROW_TYPES if str(f.type).startswith(a)), "string"
-            )
-            for f in pq.read_schema(path)
-        }
+        return {f.name: arrow_type(f.type) for f in pq.read_schema(path)}
     try:
         from pyspark.sql import SparkSession
     except ImportError as exc:
@@ -408,11 +411,9 @@ def parquet_types(path: Path) -> dict[str, str]:
         .config("spark.ui.enabled", "false")
         .getOrCreate()
     )
+    # simpleString est deja un type Spark exact : decimal(18,2), bigint...
     return {
-        f.name: next(
-            (t for a, t in SPARK_TYPES if f.dataType.simpleString().startswith(a)),
-            "string",
-        )
+        f.name: f.dataType.simpleString()
         for f in spark.read.parquet(str(path)).schema.fields
     }
 
@@ -445,10 +446,12 @@ def excel_types(path: Path) -> tuple[list[str], dict[str, str]]:
 
 def csv_types(path: Path, header: bool = True) -> tuple[list[str], dict[str, str], int]:
     """En-tete d'un CSV et types deduits de ses valeurs (sur place : rien
-    n'en sort du poste). On ne retient que des types surs a la lecture :
-    entier, decimal a point. Une date en texte (29/12/2024) ou un decimal a
-    virgule restent en string, car Spark ne les lirait pas sans options ; le
-    kit lit deja comme une date un texte au DateFormat du script.
+    n'en sort du poste). On ne retient que des types que Spark relit sans
+    option : entier, decimal a point, date et horodatage ISO (2024-01-31,
+    2024-01-31 10:00:00), booleen true/false. Une date a la francaise
+    (29/12/2024) ou un decimal a virgule restent en string, car Spark ne les
+    lirait pas sans options ; le kit lit deja comme une date un texte au
+    DateFormat du script.
 
     On lit tout le fichier : une seule valeur texte, meme a la millionieme
     ligne, met la colonne en string. Un echantillon la laissait en bigint, et
@@ -475,23 +478,53 @@ def csv_types(path: Path, header: bool = True) -> tuple[list[str], dict[str, str
             for k, v in enumerate(row[: len(cols)]):
                 v = v.strip()
                 if v and "string" not in seen[k]:
-                    seen[k].add(
-                        "bigint"
-                        if re.fullmatch(r"-?\d{1,18}", v)
-                        else "double"
-                        if re.fullmatch(r"-?\d*\.\d+([eE][-+]?\d+)?", v)
-                        else "string"
-                    )
+                    seen[k].add(value_kind(v))
     types = {}
     for k, c in enumerate(cols):
         kinds = seen[k]
-        if kinds and kinds <= {"bigint"}:
-            types[c] = "bigint"
-        elif kinds and kinds <= {"bigint", "double"}:
-            types[c] = "double"
-        elif kinds:
-            types[c] = "string"
+        if kinds:
+            types[c] = next(
+                (t for t, allowed in CSV_TYPES if kinds <= allowed), "string"
+            )
     return cols, types, n
+
+
+# Type d'une colonne CSV d'apres les sortes de valeurs vues : le premier qui
+# les couvre toutes.
+CSV_TYPES = (
+    ("bigint", {"bigint"}),
+    ("double", {"bigint", "double"}),
+    ("date", {"date"}),
+    ("timestamp", {"date", "timestamp"}),
+    ("boolean", {"boolean"}),
+)
+
+
+def value_kind(v: str) -> str:
+    """Sorte d'une valeur CSV : bigint, double, date, timestamp, boolean ou
+    string. Une date doit en etre une vraie (pas 2024-13-45), sinon Spark la
+    lirait en null.
+
+    Args:
+        v: la valeur, sans espaces autour.
+
+    Returns:
+        Sa sorte.
+    """
+    if re.fullmatch(r"-?\d{1,18}", v):
+        return "bigint"
+    if re.fullmatch(r"-?\d*\.\d+([eE][-+]?\d+)?", v):
+        return "double"
+    if v.lower() in ("true", "false"):
+        return "boolean"
+    m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})([ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?", v)
+    if m:
+        try:
+            dt.datetime.fromisoformat(v.replace("T", " "))
+        except ValueError:
+            return "string"
+        return "timestamp" if m.group(2) else "date"
+    return "string"
 
 
 def var_prefix(conf: IoConf, kind: str, default: str) -> str:

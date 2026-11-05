@@ -85,6 +85,8 @@ SPARK_TYPES = {
     "bigint": "BIGINT",
     "long": "BIGINT",
     "smallint": "SMALLINT",
+    "tinyint": "TINYINT",
+    "binary": "BINARY",
     "double": "DOUBLE",
     "float": "DOUBLE",
     "decimal": "DECIMAL(38,10)",
@@ -107,8 +109,11 @@ def spark_type(t: object) -> str:
     connait pas)."""
     if not t:
         return "STRING"
-    t = str(t).lower().split("(")[0].strip()
-    return SPARK_TYPES.get(t, "STRING")
+    text = str(t).lower().strip()
+    # un decimal garde sa precision : decimal(18,2)
+    if re.fullmatch(r"(decimal|numeric)\(\s*\d+\s*,\s*\d+\s*\)", text):
+        return "DECIMAL" + text[text.index("(") :].replace(" ", "")
+    return SPARK_TYPES.get(text.split("(")[0].strip(), "STRING")
 
 
 # Erreurs liees aux types. Tant que toutes les colonnes ne sont pas typees (une
