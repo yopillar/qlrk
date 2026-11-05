@@ -264,9 +264,31 @@ python tools/conf.py      # ce qui a ete compris de conf/io.yml
 
 Le socle ne lit et n'ecrit que par nom : tout fichier lu ou ecrit doit
 etre declare. Une lecture se cherche dans `inputs`, une ecriture dans
-`outputs`. Un fichier ecrit par un script et lu par un autre apparait donc
-dans les deux sections, avec la meme location. Le rapport liste ce qui
-manque, et `assemble.py` refuse d'assembler un script tant qu'il en
+`outputs`.
+
+Un fichier ecrit par un script et relu par un autre est une sortie, et en
+entree un simple renvoi vers elle, sous un autre nom :
+
+```yaml
+inputs:
+  ventes_enrichies_v2_relue:
+    from_output: ventes_enrichies_v2
+outputs:
+  ventes_enrichies_v2:
+    location: ${sorties}/ventes_enrichies_v2
+```
+
+L'entree reprend la location de la sortie et se lit en Parquet (le job
+ecrit toujours ses sorties en Parquet, qui porte ses types : pas de schema
+a ecrire). Elle ne peut pas porter le meme nom que la sortie : Spark refuse
+une entree et une sortie du meme nom. Le controle des requetes qui la lisent
+prend les types de la requete Spark qui ecrit la sortie.
+
+`fill_conf.py` ne modifie jamais une entree existante : une ancienne entree
+qui relit une sortie avec sa propre location (et souvent le meme nom que la
+sortie) est a supprimer a la main, il ecrira alors le `from_output`.
+
+Le rapport liste ce qui manque, et `assemble.py` refuse d'assembler un script tant qu'il en
 manque. Pour la traduction seule, un fichier non declare est cherche dans
 `data/input/<nom>` (ou `data/output/<nom>` s'il est ecrit par un `STORE`),
 ce qui permet d'avancer en attendant de completer la conf.
@@ -304,8 +326,23 @@ D'ou viennent les informations :
   d'apres les fichiers Qlik, avec le prefixe de location deja utilise dans
   `io.yml` (`${entrees}/...`).
 - **Le format** est celui que Qlik lit : `(txt, ...)` ou un `.csv` donne
-  `csv`, avec le nom complet du fichier dans la location ; un QVD est
+  `csv`, `(ooxml, ...)` ou un `.xlsx` donne `xlsx` (`xls` pour un ancien
+  Excel), avec le nom complet du fichier dans la location ; un QVD est
   suppose converti en Parquet sous le meme nom.
+- **Un fichier Excel** recoit une cle `options` avec la feuille lue : celle
+  du `table is ...` de Qlik, sinon `"*"`, toutes les feuilles mises bout a
+  bout (elles doivent avoir les memes colonnes). Le socle le lit en
+  binaire, puis l'ouvre avec pandas sur le driver (`openpyxl` requis), et
+  le convertit aux types du schema.
+
+  ```yaml
+  tarifs:
+     format: xlsx
+     schema_file: schemas/tarifs.yml
+     location: ${entrees}/tarifs.xlsx
+     options:
+        sheets: "*"
+  ```
 - **Un CSV** recoit une cle `options` avec les noms des options du lecteur
   CSV de Spark, d'apres la specification Qlik : `header` (toujours ecrit),
   `sep`, `encoding`, `quote`.
@@ -329,10 +366,7 @@ D'ou viennent les informations :
 - **Les types**, du plus sur au moins sur :
   1. les metadonnees du Parquet, dans `data/input/` ou a sa location
      (variables passees par `--var`) ;
-  2. pour un fichier ecrit par un autre script du projet, les types de la
-     requete Spark qui l'ecrit : ce sont exactement ceux du Parquet que le
-     job ecrira. Ce fichier n'est donc declare qu'une fois son auteur
-     traduit (`migrate.py` traite les auteurs d'abord) ;
+  2. les types que pandas lit dans un fichier Excel ;
   3. les valeurs d'un CSV (5 000 premieres lignes) : entier, decimal a
      point, sinon texte ;
   4. le script Qlik : la fonction qui recoit la colonne (`Year(col)` donne
@@ -578,10 +612,10 @@ socle ; seul le nom des packages differe :
 | `core/datasets.py` | `datasets.py` | `read_input`, `write_output`, `file_times` |
 | `core/tables.py` | `tables.py` | `run_sql` |
 | `core/session.py` | `session.py` | `get_session`, `active_session` |
-| `core/config.py` | `config.py` | `load_io`, `section`, `entry`, `location`, `schema_ddl` |
+| `core/config.py` | `config.py` | `load_io`, `section`, `entry` (resout `from_output`), `location`, `schema_columns`, `schema_ddl` |
 | `core/context.py` | `context.py` | `JobState`, `state`, `start_job`, `script_scope`, `log` |
 | `core/lineage.py` | `lineage.py` | `ensure_database`, `table_name`, `materialize` |
-| `core/access.py` | `access.py` | `read_config`, `write_config`, `input_location`, `output_location` |
+| `core/access.py` | `access.py` | `read_config`, `read_excel`, `write_config`, `input_location`, `output_location` |
 | `commons/` | `pyspark_commons` | `add_load_order`, `cast_void_to_string`, `drop_columns` |
 
 Les tests lancent le code genere sur `tests/fakelib/spark_foundation/`, qui
@@ -603,7 +637,7 @@ docstring et des annotations de type : `ruff` (regles `D1` et `ANN`) et
 `mypy` le verifient.
 
 ```bash
-pip install pyspark pyyaml pandas pyarrow pytest
+pip install pyspark pyyaml pandas pyarrow openpyxl pytest
 python -m pytest -m "not spark"     # rapide, sans Spark
 python -m pytest                    # tout, Spark et Java requis
 ```

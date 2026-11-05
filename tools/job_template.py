@@ -119,9 +119,9 @@ Sur le cluster, depuis la racine du projet :
 from __future__ import annotations
 
 from pyspark.sql import SparkSession
+from spark_foundation import pipeline
 
 from scripts import {step}
-from spark_foundation import pipeline
 
 
 @pipeline("{project}")

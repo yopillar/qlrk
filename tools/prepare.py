@@ -48,6 +48,7 @@ from conf import (  # noqa: E402
     find_scripts,
     resolve_location,
     safe_name,
+    writer_types,
 )
 from qlik2sql import (
     FEW_COLUMNS,
@@ -1541,20 +1542,24 @@ def file_stem(path: str) -> str:
 
 
 # Format Qlik (1er mot de la specification, sinon extension) -> format du
-# socle. Un QVD est suppose converti en Parquet, sous le meme nom.
+# socle. Un QVD est suppose converti en Parquet, sous le meme nom ; un
+# fichier Excel est lu tel quel.
 QLIK_FORMATS = {
     "txt": "csv",
     "csv": "csv",
     "tsv": "csv",
     "qvd": "parquet",
     "parquet": "parquet",
-    "ooxml": "excel",
-    "biff": "excel",
-    "xlsx": "excel",
-    "xls": "excel",
+    "ooxml": "xlsx",
+    "biff": "xls",
+    "xlsx": "xlsx",
+    "xls": "xls",
     "json": "json",
     "xml": "xml",
 }
+# Formats lus sous leur vrai nom de fichier, extension comprise.
+EXCEL_FORMATS = ("xlsx", "xls")
+KEEP_FILE_NAME = ("csv", *EXCEL_FORMATS)
 CODEPAGES = {
     "utf8": "UTF-8",
     "unicode": "UTF-16",
@@ -1571,9 +1576,12 @@ CODEPAGES = {
 def source_format(
     path: str, spec: str | None = None
 ) -> tuple[str | None, dict[str, str]]:
-    """Format d'un fichier lu par Qlik, et ses options de lecture CSV
-    (sep, header, encoding, quote) d'apres la specification Qlik :
+    """Format d'un fichier lu par Qlik, et ses options de lecture d'apres la
+    specification Qlik :
         (txt, codepage is 28591, embedded labels, delimiter is ';', msq)
+        donne pour un CSV sep, header, encoding, quote ;
+        (ooxml, embedded labels, table is Feuil1)
+        donne pour un fichier Excel la feuille lue, sheets ("*" : toutes).
     Renvoie (None, {}) si on ne sait pas."""
     # decoupage qui respecte les guillemets : delimiter is ','
     parts = split_top(spec or "")
@@ -1581,6 +1589,16 @@ def source_format(
     ext = Path(re.split(r"[\\/]", path)[-1]).suffix.lower()[1:]
     fmt = QLIK_FORMATS.get(words[0] if words else "") or QLIK_FORMATS.get(ext)
     options: dict[str, str] = {}
+    if fmt in EXCEL_FORMATS:
+        sheet = next(
+            (
+                unquote(p.strip()[m.end() :].strip())
+                for p in parts
+                if (m := re.match(r"table\s+is\s+", p.strip(), re.I))
+            ),
+            "*",
+        )
+        return fmt, {"sheets": sheet}
     if fmt != "csv":
         return fmt, options
     for orig in parts:
@@ -1673,10 +1691,10 @@ def resolve_io(
     if output:
         return f"{OUTPUT_DIR}/{file_stem(path)}", "parquet", None
     fmt, _ = source_format(path)
-    if fmt == "csv":
-        # un CSV se lit sous son vrai nom, extension comprise
+    if fmt in KEEP_FILE_NAME:
+        # un CSV ou un fichier Excel se lit sous son vrai nom, extension comprise
         name = re.split(r"[\\/]", path)[-1]
-        return f"{INPUT_DIR}/{name}", "csv", None
+        return f"{INPUT_DIR}/{name}", fmt, None
     return f"{INPUT_DIR}/{file_stem(path)}", fmt or "parquet", None
 
 
@@ -2420,8 +2438,15 @@ def prepare(
             "io": entry.name if entry else None,
             "columns": file_schema(path),
         }
-        if entry and entry.types:
-            inputs[view]["types"] = entry.types
+        types = entry.types if entry else {}
+        writer = project_stores["names"].get(file_stem(path).lower())
+        if entry and entry.from_output and writer:
+            # Relu depuis une sortie : les types de la requete qui l'ecrit.
+            # S'ils ne sont pas surs, un STRING peut n'etre qu'un defaut.
+            found, sure = writer_types(path, writer) or ({}, False)
+            types = {c: t for c, t in found.items() if sure or t != "STRING"}
+        if types:
+            inputs[view]["types"] = types
         return view
 
     def file_schema(path: str) -> list[str] | None:

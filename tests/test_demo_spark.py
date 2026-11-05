@@ -27,8 +27,12 @@ def test_migrate_demo_identical_to_qlik(project: Project) -> None:
         assert (
             f"- {script} : assemble dans src/, donnees identiques a Qlik" in summary
         ), res.stdout
-    # ventes passe avant synthese, qui lit ce qu'il ecrit
+    # ventes passe avant synthese, qui lit ce qu'il ecrit, et relit cette
+    # sortie par un from_output
     assert summary.index("ventes.qvs") < summary.index("synthese.txt")
+    conf = (project / "conf/io.yml").read_text(encoding="utf-8")
+    assert "ventes_enrichies_v2_relue:" in conf
+    assert "from_output: ventes_enrichies_v2" in conf
 
     # l'ordre de chargement est garde, jusque dans la sortie ecrite
     project.run(
@@ -236,3 +240,61 @@ def test_read_input_gives_a_dataframe_and_optionally_a_table(
     assert out[3] == "vue _qlik_order"
     # FileTime() : date du fichier, dans la vue in_ventes__file
     assert out[4] == "fichier datetime"
+
+
+def test_excel_input_read_by_the_socle(project: Project) -> None:
+    """Un fichier Excel est lu feuille par feuille, aux types du schema."""
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("openpyxl")
+    with pd.ExcelWriter(project / "data/input/tarifs.xlsx") as writer:
+        pd.DataFrame({"Code": [1, 2], "Jour": ["2024-01-01", "2024-02-01"]}).to_excel(
+            writer, sheet_name="A", index=False
+        )
+        pd.DataFrame({"Code": [3], "Jour": ["2024-03-01"]}).to_excel(
+            writer, sheet_name="B", index=False
+        )
+    (project / "conf/schemas/tarifs.yml").write_text(
+        "columns:\n  Code: INT\n  Jour: DATE\n", encoding="utf-8"
+    )
+    io_yml = project / "conf/io.yml"
+    io_yml.write_text(
+        io_yml.read_text(encoding="utf-8").replace(
+            "inputs:\n",
+            "inputs:\n"
+            "   tarifs:\n"
+            "       format: xlsx\n"
+            "       schema_file: schemas/tarifs.yml\n"
+            "       location: ${entrees}/tarifs.xlsx\n"
+            "       options:\n"
+            '           sheets: "*"\n'
+            "   tarifs_b:\n"
+            "       format: xlsx\n"
+            "       location: ${entrees}/tarifs.xlsx\n"
+            '       options: {sheets: "B"}\n',
+        ),
+        encoding="utf-8",
+    )
+    code = (
+        "from core.session import get_session\n"
+        "from core import context\n"
+        "from spark_foundation.datasets import read_input\n"
+        "get_session('demo').sparkContext.setLogLevel('ERROR')\n"
+        "context.start_job('demo')\n"
+        "df = read_input('tarifs', table='in_tarifs')\n"
+        "print('schema', df.schema.simpleString())\n"
+        "print('codes', [r.Code for r in df.collect()])\n"
+        "print('b', [r.Code for r in read_input('tarifs_b').collect()])\n"
+    )
+    res = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=project.path,
+        env=dict(os.environ, PYTHONPATH=JOB_PATH, entrees="data/input"),
+        capture_output=True,
+        text=True,
+    )
+    out = [line for line in res.stdout.splitlines() if " " in line]
+    assert out == [
+        "schema struct<Code:int,Jour:date>",
+        "codes [1, 2, 3]",
+        "b ['3']",
+    ], res.stderr[-2000:]

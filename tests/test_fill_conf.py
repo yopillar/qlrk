@@ -143,41 +143,68 @@ def test_model_table_name_taken_by_another_script(project: Project) -> None:
     assert "dates" not in conf["outputs"]
 
 
-def test_produced_file_waits_for_its_writer(project: Project) -> None:
-    """Un fichier relu n'est declare qu'une fois le script qui l'ecrit traduit."""
-    # synthese relit ce que ventes ecrit : tant que ventes n'est pas
-    # traduit, on ne fige pas un schema devine
-    res = fill(project)
+def test_reread_output_declared_with_from_output(project: Project) -> None:
+    """Un fichier ecrit par un script et relu par un autre est une sortie,
+    et en entree un simple from_output, sous un autre nom."""
+    fill(project)
     conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
+    # synthese relit ce que ventes ecrit
+    assert conf["outputs"]["ventes_enrichies_v2"] == {
+        "location": "${sorties}/ventes_enrichies_v2"
+    }
+    assert conf["inputs"]["ventes_enrichies_v2_relue"] == {
+        "from_output": "ventes_enrichies_v2"
+    }
+    # pas d'entree du meme nom que la sortie, et pas de schema a ecrire
     assert "ventes_enrichies_v2" not in conf["inputs"]
-    assert "En attente" in res.stdout and "ventes_enrichies_v2" in res.stdout
+    assert not (project / "conf/schemas/ventes_enrichies_v2.yml").exists()
 
 
 @pytest.mark.spark
-def test_produced_file_gets_exact_spark_types(project: Project) -> None:
-    """Un fichier relu prend les types exacts de la requete Spark qui l'ecrit."""
+def test_reread_output_gets_writer_types(project: Project) -> None:
+    """La requete qui lit une sortie est controlee avec les types de la
+    requete Spark qui l'ecrit."""
     fill(project)
     project.run("prepare.py", "script_qvd/ventes.qvs")
     project.run("check.py", "work/ventes", "--parse")
-    project.run("fill_conf.py", "script_qvd/")
-    conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
-    # relue la ou ventes l'ecrit
-    assert conf["inputs"]["ventes_enrichies_v2"] == {
-        "format": "parquet",
-        "schema_file": "schemas/ventes_enrichies_v2.yml",
-        "location": "${sorties}/ventes_enrichies_v2",
-    }
-    schema = yaml.safe_load(
-        (project / "conf/schemas/ventes_enrichies_v2.yml").read_text(encoding="utf-8")
+    project.run("prepare.py", "script_qvd/synthese.txt")
+    manifest = yaml.safe_load(
+        (project / "work/synthese/manifest.json").read_text(encoding="utf-8")
     )
-    # toutes les colonnes du STORE, dans l'ordre, avec les types de Spark
-    assert schema["columns"] == {
-        "Site": "STRING",
-        "Produit": "STRING",
-        "MontantTTC": "DOUBLE",
-        "Region": "STRING",
-        "Taille": "STRING",
-    }
+    view = next(
+        v
+        for sec in manifest["sections"]
+        for name, v in sec.get("views", {}).items()
+        if name == "in_ventes_enrichies_v2_relue"
+    )
+    assert view["io"] == "ventes_enrichies_v2_relue"
+    assert view["types"]["MontantTTC"] == "DOUBLE"
+
+
+def test_excel_input_declared_with_its_sheets(project: Project) -> None:
+    """Un fichier Excel garde son nom et recoit l'option sheets."""
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("openpyxl")
+    pd.DataFrame({"Code": [1, 2], "Libelle": ["a", "b"]}).to_excel(
+        project / "data/input/tarifs.xlsx", sheet_name="Prix", index=False
+    )
+    (project / "script_qvd/tarifs.qvs").write_text(
+        "Tarifs:\nLOAD Code, Libelle\n"
+        "FROM [lib://in/tarifs.xlsx] (ooxml, embedded labels, table is Prix);\n"
+        "Tout:\nLOAD Code FROM [lib://in/tarifs.xlsx] (ooxml, embedded labels);\n"
+        "STORE Tarifs INTO [lib://out/tarifs_sortie.qvd] (qvd);\n"
+    )
+    project.run("prepare.py", "--collect", "script_qvd/tarifs.qvs")
+    project.run("fill_conf.py", "script_qvd/tarifs.qvs")
+    conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
+    entry = conf["inputs"]["tarifs"]
+    assert entry["format"] == "xlsx"
+    assert entry["location"] == "${entrees}/tarifs.xlsx"
+    assert entry["options"] == {"sheets": "Prix"}
+    schema = yaml.safe_load(
+        (project / "conf/schemas/tarifs.yml").read_text(encoding="utf-8")
+    )
+    assert list(schema["columns"]) == ["Code", "Libelle"]
 
 
 def test_types_from_script_comparisons_and_shared_fields(project: Project) -> None:

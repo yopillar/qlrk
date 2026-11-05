@@ -14,6 +14,7 @@ l'une des deux rangee sous une cle columns, fields ou schema.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -128,6 +129,47 @@ class IoEntry:
     schema_file: str | None = None
     columns: list[str] | None = None
     types: dict[str, str] = field(default_factory=dict)
+    # entree qui relit une sortie : le nom de cette sortie
+    from_output: str | None = None
+
+
+def reread_name(output: str) -> str:
+    """Nom de l'entree qui relit une sortie. Il differe du nom de la sortie :
+    une entree et une sortie du meme nom entrent en conflit cote Spark.
+
+    Args:
+        output: le nom de la sortie dans io.yml.
+
+    Returns:
+        <sortie>_relue.
+    """
+    return f"{output}_relue"
+
+
+def writer_types(path: str, writer: str) -> tuple[dict[str, str], bool] | None:
+    """Types des colonnes d'un fichier ecrit par un autre script, tels que
+    Spark les calcule pour la requete qui l'ecrit (check.py --parse les
+    garde dans le manifest) : ce sont les types du Parquet que le job ecrit.
+
+    Args:
+        path: le fichier, tel que le script Qlik le nomme.
+        writer: le script qui l'ecrit (ventes.qvs).
+
+    Returns:
+        (types par colonne, surs ou non), ou None si ce script n'a pas
+        encore ete traduit et controle.
+    """
+    mpath = WORK / Path(writer).stem / "manifest.json"
+    if not mpath.exists():
+        return None
+    for sec in json.loads(mpath.read_text(encoding="utf-8"))["sections"]:
+        if not sec.get("output_types"):
+            continue
+        for table, location in sec.get("outputs", {}).items():
+            io_name = sec.get("output_io", {}).get(table) or ""
+            if io_key(path) in {io_key(location), io_key(io_name)}:
+                return sec["output_types"], sec.get("output_types_sure", False)
+    return None
 
 
 def _stem(text: str) -> str:
@@ -201,6 +243,10 @@ def _entries(section: Any, kind: str) -> Iterator[IoEntry]:
     for name, props in items:
         if not isinstance(props, dict):
             continue
+        if kind == "input" and props.get("from_output"):
+            # location et format repris de la sortie, plus tard (IoConf)
+            yield IoEntry(name, kind, "", from_output=str(props["from_output"]))
+            continue
         location = props.get("location") or props.get("path")
         if not location:
             continue
@@ -239,8 +285,22 @@ class IoConf:
             if kind:
                 target = self.inputs if kind == "input" else self.outputs
                 target.extend(_entries(section, kind))
+        for entry in self.inputs:
+            if entry.from_output:
+                self._link_output(entry)
         for entry in self.inputs + self.outputs:
             self._load_schema(entry)
+
+    def _link_output(self, entry: IoEntry) -> None:
+        """Entree qui relit une sortie : meme location, en Parquet (le job
+        ecrit toujours ses sorties en Parquet)."""
+        out = next((o for o in self.outputs if o.name == entry.from_output), None)
+        if out is None:
+            self.problems.append(
+                f"{entry.name} : from_output {entry.from_output} absent des outputs"
+            )
+            return
+        entry.location, entry.format = out.location, "parquet"
 
     @property
     def enabled(self) -> bool:

@@ -2,7 +2,8 @@
 
 io.yml a deux sections, inputs et outputs. Chaque entree a une location
 (avec des variables ${entrees}, ${sorties}...), un format, et pour une
-entree un schema_file et des options de lecture.
+entree un schema_file et des options de lecture. Une entree qui relit une
+sortie du job s'ecrit simplement "from_output: <nom de la sortie>".
 """
 
 from __future__ import annotations
@@ -60,7 +61,13 @@ def entry(kind: str, name: str) -> dict[str, Any]:
     entries = section(kind)
     if name not in entries:
         raise KeyError(f"{name} absent de la section {kind}s de {IO_FILE}")
-    return entries[name]
+    description = entries[name]
+    target = description.get("from_output") if kind == "input" else None
+    if target:
+        # entree qui relit une sortie du job : meme location, en Parquet
+        output = entry("output", str(target))
+        return {"format": "parquet", **output}
+    return description
 
 
 def location(description: dict[str, Any]) -> str:
@@ -84,6 +91,22 @@ def location(description: dict[str, Any]) -> str:
     return re.sub(r"\$\{(\w+)\}", value, str(description["location"]))
 
 
+def schema_columns(description: dict[str, Any]) -> dict[str, str]:
+    """Colonnes d'une entree et leur type, d'apres son schema_file.
+
+    Args:
+        description: l'entree de io.yml.
+
+    Returns:
+        {colonne: type} dans l'ordre du schema, vide sans schema.
+    """
+    if not description.get("schema_file"):
+        return {}
+    path = IO_FILE.parent / description["schema_file"]
+    columns = (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("columns")
+    return {str(c): str(t) for c, t in (columns or {}).items()}
+
+
 def schema_ddl(description: dict[str, Any]) -> str | None:
     """Schema d'une entree, au format DDL de Spark.
 
@@ -93,10 +116,7 @@ def schema_ddl(description: dict[str, Any]) -> str | None:
     Returns:
         "`col` TYPE, ..." dans l'ordre du schema, ou None sans schema.
     """
-    if not description.get("schema_file"):
-        return None
-    path = IO_FILE.parent / description["schema_file"]
-    columns = (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("columns")
+    columns = schema_columns(description)
     if not columns:
         return None
     return ", ".join(f"`{name}` {typ}" for name, typ in columns.items())

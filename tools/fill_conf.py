@@ -15,16 +15,17 @@ Avec --draft, rien n'est touche : tout est ecrit dans conf/draft/.
 D'ou viennent les informations :
   - les entrees et les sorties : les FROM et les STORE des scripts, plus
     les tables du modele de donnees (encore la a la fin du script, sans
-    STORE). Un fichier ecrit par un script et relu par un autre est ajoute
-    dans les deux sections, avec la meme location. Le # des noms de fichiers
-    est deja devenu un _ (voir normalize.py).
+    STORE). Un fichier ecrit par un script et relu par un autre est une
+    sortie, et en entree "<sortie>_relue: {from_output: <sortie>}" : pas de
+    location en double, et pas deux fois le meme nom (Spark le refuse). Le
+    # des noms de fichiers est deja devenu un _ (voir normalize.py).
   - le format d'une entree : celui que Qlik lit (txt -> csv, qvd -> parquet)
   - les colonnes : celles que les scripts lisent dans chaque fichier. Si le
     fichier est present dans data/input/ (ou a sa location), on prend toutes
     ses colonnes, y compris celles que les scripts n'utilisent pas.
-  - les types : lus dans les metadonnees du Parquet ; pour un fichier
-    ecrit par un autre script, ceux de la requete Spark qui l'ecrit ;
-    sinon deduits des valeurs du CSV. Sans fichier, devines d'apres le
+  - les types : lus dans les metadonnees du Parquet, sinon deduits des
+    valeurs du CSV (un fichier relu depuis une sortie n'a pas de schema :
+    son Parquet a ses types). Sans fichier, devines d'apres le
     script (Year(col) donne date, x > 0 donne double, Trim(col) donne
     string...), le nom, ou le champ du meme nom dans une autre table. Sans
     aucun indice, on met string, le type que le kit suppose de toute facon.
@@ -51,15 +52,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from conf import (
     CONF,
     IO_FILE,
-    WORK,
     IoConf,
     _load_yaml,
     find_scripts,
-    io_key,  # noqa: E402
+    reread_name,
     resolve_location,
 )
 from prepare import (
+    EXCEL_FORMATS,
     INPUT_DIR,
+    KEEP_FILE_NAME,
     analyze_script,
     file_stem,  # noqa: E402
     mask_strings,
@@ -171,10 +173,10 @@ def io_name(path: str) -> str:
 
 
 def source_file(path: str, spec: str | None) -> str:
-    """Nom de fichier d'une entree dans sa location : un CSV garde son nom
-    complet, extension comprise ; un QVD, suppose converti en Parquet, perd
-    son extension."""
-    if source_format(path, spec)[0] == "csv":
+    """Nom de fichier d'une entree dans sa location : un CSV ou un fichier
+    Excel garde son nom complet, extension comprise ; un QVD, suppose
+    converti en Parquet, perd son extension."""
+    if source_format(path, spec)[0] in KEEP_FILE_NAME:
         return re.split(r"[\\/]", path)[-1]
     return file_stem(path)
 
@@ -355,7 +357,37 @@ def file_columns(
                 "csv",
                 (f"deduit des {n} ligne(s) de {csv_files[0]}"),
             )
+        if p.is_file() and p.suffix.lower()[1:] in EXCEL_FORMATS:
+            cols, types = excel_types(p)
+            fmt = p.suffix.lower()[1:]
+            return cols, types, fmt, f"deduit de la 1re feuille de {p}"
     return [], {}, None, ""
+
+
+# Type pandas -> type du schema, pour un fichier Excel.
+PANDAS_TYPES = (("int", "bigint"), ("float", "double"), ("datetime", "timestamp"))
+
+
+def excel_types(path: Path) -> tuple[list[str], dict[str, str]]:
+    """Colonnes et types de la 1re feuille d'un fichier Excel (5 000 lignes).
+
+    Args:
+        path: le fichier .xlsx ou .xls.
+
+    Returns:
+        (colonnes, types) ; vides si pandas ou openpyxl manquent.
+    """
+    try:
+        import pandas as pd
+
+        sheet = pd.read_excel(path, sheet_name=0, nrows=5000)
+    except ImportError:
+        return [], {}
+    types = {
+        str(c): next((t for p_, t in PANDAS_TYPES if str(d).startswith(p_)), "string")
+        for c, d in sheet.dtypes.items()
+    }
+    return list(types), types
 
 
 def csv_types(path: Path, header: bool = True) -> tuple[list[str], dict[str, str], int]:
@@ -657,25 +689,6 @@ def propagate_types(schemas_out: dict, conf: IoConf) -> None:
                 )
 
 
-def writer_types(path: str, writer: str) -> tuple[dict[str, str], bool] | None:
-    """Types des colonnes d'un fichier ecrit par un autre script, tels que
-    Spark les calcule pour la requete qui l'ecrit (check.py --parse les
-    garde dans le manifest). Ce sont les types exacts du Parquet que le job
-    ecrira. None si ce script n'a pas encore ete traduit et controle."""
-    mpath = WORK / Path(writer).stem / "manifest.json"
-    if not mpath.exists():
-        return None
-    for sec in json.loads(mpath.read_text(encoding="utf-8"))["sections"]:
-        if not sec.get("output_types"):
-            continue
-        for table, location in sec.get("outputs", {}).items():
-            io_name_ = sec.get("output_io", {}).get(table) or ""
-            names = {io_key(location), io_key(io_name_)}
-            if io_key(path) in names:
-                return sec["output_types"], sec.get("output_types_sure", False)
-    return None
-
-
 def collect_io(
     scripts: list[Path],
 ) -> tuple[dict[str, dict], dict[str, dict], dict[str, Counter], list[str]]:
@@ -822,7 +835,6 @@ def print_summary(
     new_outputs: list[tuple[str, dict[str, Any], str]],
     created: list[Path],
     schemas_out: dict[str, tuple[str, list]],
-    waiting: list[str],
     unknown_vars: set[str],
     warnings: list[str],
     failed: list[str],
@@ -837,7 +849,6 @@ def print_summary(
         new_outputs: les sorties ajoutees.
         created: les schemas crees.
         schemas_out: les schemas calcules, pour compter les types devines.
-        waiting: les fichiers en attente de leur script auteur.
         unknown_vars: les variables de location inconnues.
         warnings: les remarques.
         failed: les scripts ou instructions non analyses.
@@ -869,12 +880,6 @@ def print_summary(
         )
     if quiet:
         return
-    if waiting:
-        print(
-            "En attente, declares avec leurs types exacts quand le script "
-            "qui les ecrit aura ete traduit (migrate.py s'en charge) : "
-            + " ; ".join(waiting)
-        )
     if unknown_vars:
         print(
             "[!] Parquet non lus, types devines : variable(s) "
@@ -912,8 +917,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--quiet",
         action="store_true",
-        help="n'afficher que ce qui est ajoute (migrate.py le "
-        "relance avant chaque script)",
+        help="n'afficher que ce qui est ajoute",
     )
     p.add_argument(
         "--draft",
@@ -950,7 +954,6 @@ def main(argv: list[str] | None = None) -> int:
     new_inputs: list[tuple[str, dict[str, Any], str]] = []
     schemas_out: dict[str, tuple[str, list]] = {}
     warnings: list[str] = []
-    waiting: list[str] = []  # fichiers dont l'auteur n'est pas traduit
     unknown_vars: set[str] = set()
 
     new_outputs = output_entries(writes, conf, out_prefix)
@@ -963,28 +966,23 @@ def main(argv: list[str] | None = None) -> int:
         is_produced = norm_path(r["path"]) in produced or bool(
             name in writes and writes[name]["scripts"] - r["scripts"]
         )
-        # Fichier ecrit par un autre script : ses types exacts sont ceux de
-        # la requete Spark qui l'ecrit. migrate.py traite ce script avant, et
-        # relance fill_conf.py avant chaque script : on attend donc qu'il
-        # soit traduit plutot que de figer un schema devine.
-        written_by = sorted(
-            (writes.get(name) or {}).get("scripts", set()) - r["scripts"]
-        )
-        exact = (
-            next(filter(None, (writer_types(r["path"], w) for w in written_by)), None)
-            if is_produced and not entry
-            else None
-        )
-        if (
-            is_produced
-            and not entry
-            and written_by
-            and exact is None
-            and not args.draft
-        ):
-            waiting.append(
-                f"{name} (lu par {', '.join(sorted(r['scripts']))}"
-                f", ecrit par {', '.join(written_by)})"
+        if entry and entry.from_output:
+            continue  # relit une sortie : rien a decrire, le Parquet a ses types
+        if is_produced and not entry:
+            # Fichier ecrit par un autre script : on le relit depuis sa sortie,
+            # sous un autre nom (une entree et une sortie du meme nom entrent
+            # en conflit cote Spark).
+            written = writes.get(name) or {"path": r["path"], "scripts": set()}
+            out = conf.find(r["path"], "output")
+            output = out.name if out else file_stem(written["path"]).lower()
+            writers = sorted(written["scripts"] - r["scripts"]) or ["ce script"]
+            new_inputs.append(
+                (
+                    reread_name(output),
+                    {"from_output": output},
+                    f"lu par {', '.join(sorted(r['scripts']))}, ecrit par "
+                    f"{', '.join(writers)}",
+                )
             )
             continue
         if entry and entry.columns:
@@ -1049,13 +1047,6 @@ def main(argv: list[str] | None = None) -> int:
             # derniere que le script lit (@4 -> _c0 a _c3).
             used = [int(m.group(1)) for c in cols if (m := re.fullmatch(r"_c(\d+)", c))]
             cols = [positional_column(k + 1) for k in range(max(used, default=-1) + 1)]
-        if exact and not fmt:
-            out_types, sure = exact
-            cols = list(dict.fromkeys(list(out_types) + cols))
-            for c, typ in out_types.items():
-                if sure or typ != "STRING":
-                    types.setdefault(c, typ)
-            how = f"type de la requete Spark qui l'ecrit ({written_by[0]})"
         lines = []
         for c in cols:
             col_type: str | None
@@ -1076,7 +1067,13 @@ def main(argv: list[str] | None = None) -> int:
             why += " ; LOAD * : colonnes incompletes sans le fichier"
         # format du fichier trouve, sinon celui que Qlik lit, sinon a verifier
         fmt = fmt or qlik_fmt
-        extra = {"options": csv_options(options)} if fmt == "csv" else {}
+        extra: dict[str, Any] = (
+            {"options": csv_options(options)}
+            if fmt == "csv"
+            else {"options": {"sheets": options.get("sheets", "*")}}
+            if fmt in EXCEL_FORMATS
+            else {}
+        )
         if not lines:
             # Aucune colonne connue (LOAD * sans le fichier) : un schema vide
             # risquerait de faire planter la lecture par le socle. On declare
@@ -1151,7 +1148,6 @@ def main(argv: list[str] | None = None) -> int:
         new_outputs,
         created,
         schemas_out,
-        waiting,
         unknown_vars,
         warnings,
         failed,
