@@ -379,6 +379,12 @@ D'ou viennent les informations :
   est devine (4 et 5). Sans aucun indice, la colonne est en `string`, avec
   le commentaire "type inconnu".
 
+  Les metadonnees du Parquet se lisent avec `pyarrow`, ou a defaut avec
+  Spark (plus lent a demarrer). Sans les deux, `fill_conf.py` le signale et
+  les types sont devines. Un schema deja ecrit n'est jamais corrige : un
+  schema cree avec des types devines (fichier absent, pyarrow manquant) est
+  a supprimer pour etre recree avec les vrais types.
+
 Les variables des locations (`${entrees}`, `${sorties}`...) sont resolues
 par le socle quand le job tourne. Le kit en a besoin pour aller lire les
 sorties au moment de la comparaison : on les lui donne avec `--var` (ou par

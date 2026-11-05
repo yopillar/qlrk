@@ -329,18 +329,8 @@ def file_columns(
             else []
         )
         if parquet:
-            try:
-                import pyarrow.parquet as pq
-            except ImportError:
-                return [], {}, "parquet", ""
-            schema = pq.read_schema(parquet[0])
-            types = {}
-            for f in schema:
-                arrow = str(f.type)
-                types[f.name] = next(
-                    (t for a, t in ARROW_TYPES if arrow.startswith(a)), "string"
-                )
-            cols = [c for c in schema.names if c != "_qlik_order"]
+            types = parquet_types(parquet[0])
+            cols = [c for c in types if c != "_qlik_order"]
             return cols, types, "parquet", f"lu dans le Parquet {parquet[0]}"
         csv_files = (
             [p]
@@ -362,6 +352,69 @@ def file_columns(
             fmt = p.suffix.lower()[1:]
             return cols, types, fmt, f"deduit de la 1re feuille de {p}"
     return [], {}, None, ""
+
+
+# Type Spark -> type du schema, quand le Parquet est lu par Spark.
+SPARK_TYPES = (
+    ("string", "string"),
+    ("bigint", "bigint"),
+    ("int", "int"),
+    ("smallint", "int"),
+    ("tinyint", "int"),
+    ("double", "double"),
+    ("float", "double"),
+    ("decimal", "decimal"),
+    ("date", "date"),
+    ("timestamp", "timestamp"),
+    ("boolean", "boolean"),
+)
+
+
+def parquet_types(path: Path) -> dict[str, str]:
+    """Colonnes et types d'un Parquet, lus dans ses metadonnees.
+
+    Avec pyarrow, c'est immediat. Sans pyarrow, on demande le schema a Spark
+    (deja necessaire au kit pour controler les requetes), plus lent a
+    demarrer mais juste.
+
+    Args:
+        path: un fichier Parquet.
+
+    Returns:
+        {colonne: type}, dans l'ordre du fichier.
+
+    Raises:
+        ImportError: ni pyarrow ni pyspark ne sont installes.
+    """
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        pq = None
+    if pq is not None:
+        return {
+            f.name: next(
+                (t for a, t in ARROW_TYPES if str(f.type).startswith(a)), "string"
+            )
+            for f in pq.read_schema(path)
+        }
+    try:
+        from pyspark.sql import SparkSession
+    except ImportError as exc:
+        raise ImportError(
+            "ni pyarrow ni pyspark : types du Parquet illisibles (pip install pyarrow)"
+        ) from exc
+    spark = (
+        SparkSession.builder.master("local[1]")
+        .config("spark.ui.enabled", "false")
+        .getOrCreate()
+    )
+    return {
+        f.name: next(
+            (t for a, t in SPARK_TYPES if f.dataType.simpleString().startswith(a)),
+            "string",
+        )
+        for f in spark.read.parquet(str(path)).schema.fields
+    }
 
 
 # Type pandas -> type du schema, pour un fichier Excel.

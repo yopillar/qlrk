@@ -1,11 +1,14 @@
 """Completion de conf/io.yml et des schemas par fill_conf.py."""
 
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import yaml
 
 from conftest import Project
+from fill_conf import parquet_types
 
 SCRIPTS = ("script_qvd/calendrier", "script_qvd/synthese.txt", "script_qvd/ventes.qvs")
 
@@ -305,3 +308,17 @@ def test_csv_types_read_the_whole_file(project: Project) -> None:
         (project / "conf/schemas/gros.yml").read_text(encoding="utf-8")
     )
     assert schema["columns"] == {"Num": "STRING"}
+
+
+@pytest.mark.spark
+def test_parquet_types_without_pyarrow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sans pyarrow, les types du Parquet sont lus par Spark, pas devines."""
+    pd = pytest.importorskip("pandas")
+    path = tmp_path / "stock.parquet"
+    pd.DataFrame({"Site": ["A"], "Qte": [3]}).to_parquet(path)
+    # un module a None dans sys.modules fait echouer son import
+    monkeypatch.setitem(sys.modules, "pyarrow", None)
+    monkeypatch.setitem(sys.modules, "pyarrow.parquet", None)
+    assert parquet_types(path) == {"Site": "string", "Qte": "bigint"}
