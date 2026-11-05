@@ -705,14 +705,14 @@ def collect_io(
         scripts ou instructions non analyses).
     """
     reads: dict[str, dict] = {}  # nom -> path, colonnes, star, scripts, spec
-    writes: dict[str, dict] = {}  # nom -> path, colonnes, scripts
+    writes: dict[str, dict] = {}  # nom -> path, scripts (et model)
     hints: dict[str, Counter] = {}
     failed: list[str] = []
     for script in scripts:
         # Un script qu'on n'arrive pas a analyser ne doit pas empecher de
         # completer la conf pour les autres : on le signale et on continue.
         try:
-            _, _, insts, _, tables, schemas = analyze_script(script)
+            _, _, insts, _, tables, _ = analyze_script(script)
         except Exception as exc:
             failed.append(f"{script.name} : {type(exc).__name__}: {exc}")
             continue
@@ -722,13 +722,9 @@ def collect_io(
                 hints.setdefault(col, Counter()).update(counter)
             if i.kind == "store" and i.stored:
                 w = writes.setdefault(
-                    io_name(i.stored[1]),
-                    {"path": i.stored[1], "columns": [], "scripts": set()},
+                    io_name(i.stored[1]), {"path": i.stored[1], "scripts": set()}
                 )
                 w["scripts"].add(script.name)
-                stored_cols = (schemas.get(i.target) if i.target else None) or []
-                if "*" not in stored_cols and "?" not in stored_cols:
-                    w["columns"] = list(dict.fromkeys(w["columns"] + stored_cols))
             elif i.kind == "load" and i.sources:
                 try:
                     cols, star = columns_read(text)
@@ -755,18 +751,12 @@ def collect_io(
 
         # Tables du modele de donnees (encore la a la fin, sans STORE) :
         # prepare.py les ecrit en sortie sous le nom de la table.
-        for key, t in tables.items():
+        for t in tables.values():
             for _, path, store_fmt, _ in t["stored"]:
                 if store_fmt == "modele":
-                    cols = schemas.get(key) or []
                     writes.setdefault(
                         io_name(path),
-                        {
-                            "path": path,
-                            "scripts": {script.name},
-                            "model": t["name"],
-                            "columns": [c for c in cols if c not in "*?"],
-                        },
+                        {"path": path, "scripts": {script.name}, "model": t["name"]},
                     )
     return reads, writes, hints, failed
 
@@ -968,7 +958,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         if entry and entry.from_output:
             continue  # relit une sortie : rien a decrire, le Parquet a ses types
-        if is_produced and not entry:
+        if is_produced and entry:
+            # ancienne forme, avec sa propre location et souvent le nom de la
+            # sortie : on n'y touche pas, on dit quoi faire
+            warnings.append(
+                f"{entry.name} : relit une sortie avec sa propre location. "
+                "Supprimer cette entree : fill_conf.py la remplacera par un "
+                "from_output (meme nom qu'une sortie : refuse par Spark)."
+            )
+            continue
+        if is_produced:
             # Fichier ecrit par un autre script : on le relit depuis sa sortie,
             # sous un autre nom (une entree et une sortie du meme nom entrent
             # en conflit cote Spark).
@@ -1001,11 +1000,7 @@ def main(argv: list[str] | None = None) -> int:
             location = (
                 out.location
                 if out
-                else (
-                    f"{out_prefix}/{file_stem(r['path'])}"
-                    if is_produced
-                    else f"{in_prefix}/{source_file(r['path'], r['spec'])}"
-                )
+                else f"{in_prefix}/{source_file(r['path'], r['spec'])}"
             )
         # le fichier de donnees, s'il est la, donne les vraies colonnes
         found = list(
@@ -1020,8 +1015,6 @@ def main(argv: list[str] | None = None) -> int:
         # Format : celui que Qlik lit (txt -> csv, qvd -> parquet), et pour un
         # CSV ses options, dont l'en-tete (no labels : pas d'en-tete).
         qlik_fmt, options = source_format(r["path"], r["spec"])
-        if is_produced:
-            qlik_fmt, options = "parquet", {}  # ecrit par le job
         header = options.get("header", "true") == "true"
         cols, types, fmt, how, origin = first_readable(found, header, name, warnings)
         if not fmt and "${" in found[0]:
@@ -1036,11 +1029,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"absentes de {origin} : {', '.join(absent)}"
             )
         if not cols:
-            # Fichier produit par un autre script : le STORE donne toutes ses
-            # colonnes, dans l'ordre. Le lecteur n'en utilise souvent qu'une
-            # partie, et un LOAD * qui suivrait en perdrait.
-            written = (writes.get(name) or {}).get("columns", [])
-            cols = list(dict.fromkeys(written + r["columns"]))
+            cols = r["columns"]
         if not header and not from_file:
             # Sans en-tete, Spark affecte les colonnes par position : le
             # schema doit les lister toutes, dans l'ordre, jusqu'a la
@@ -1055,14 +1044,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 col_type, note = suggest(c, hints.get(c))
             lines.append((c, col_type, note))
-        # relu apres un STORE : meme nom que la sortie qu'il relit
-        entry_name = (
-            file_stem(writes.get(name, r)["path"]).lower() if is_produced else name
-        )
-        schema_file = f"{schema_dir}/{entry_name}.yml"
-        why = f"lu par {', '.join(sorted(r['scripts']))}" + (
-            ", produit par un autre script" if is_produced else ""
-        )
+        schema_file = f"{schema_dir}/{name}.yml"
+        why = f"lu par {', '.join(sorted(r['scripts']))}"
         if r["star"] and not from_file:
             why += " ; LOAD * : colonnes incompletes sans le fichier"
         # format du fichier trouve, sinon celui que Qlik lit, sinon a verifier
@@ -1086,7 +1069,7 @@ def main(argv: list[str] | None = None) -> int:
             if not entry:
                 new_inputs.append(
                     (
-                        entry_name,
+                        name,
                         {"format": fmt or "parquet", "location": location, **extra},
                         why + " ; pas de schema, colonnes inconnues",
                     )
@@ -1110,9 +1093,7 @@ def main(argv: list[str] | None = None) -> int:
             "location": location,
             **extra,
         }
-        new_inputs.append(
-            (entry_name, props, why if fmt else why + " ; format a verifier")
-        )
+        new_inputs.append((name, props, why if fmt else why + " ; format a verifier"))
 
     propagate_types(schemas_out, conf)
     blocks = {
