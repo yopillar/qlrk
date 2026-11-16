@@ -3,6 +3,7 @@ quand pyspark ou pyarrow manquent."""
 
 import argparse
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -37,7 +38,7 @@ def test_opencode_direct_outside_distrobox(monkeypatch: pytest.MonkeyPatch) -> N
 def hide(monkeypatch: pytest.MonkeyPatch, *modules: str) -> None:
     """Fait comme si ces modules n'etaient pas installes."""
     for name in modules:
-        monkeypatch.setitem(__import__("sys").modules, name, None)
+        monkeypatch.setitem(sys.modules, name, None)
 
 
 def test_no_spark_stops_the_check(monkeypatch: pytest.MonkeyPatch) -> None:
