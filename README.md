@@ -535,9 +535,20 @@ un prompt de 2 000 a 45 000 tokens.
 Avant d'assembler un script, `migrate.py` fait analyser toutes ses requetes
 par Spark (`check.py --parse --mark`), sans donnees, sur des vues vides qui
 ont les bonnes colonnes. Une erreur certaine (syntaxe, `GROUP BY`,
-reference ambigue...) bloque la table avant le job. Une colonne introuvable
-est seulement signalee quand les colonnes de la table amont ont ete
-deduites du script, faute de schema.
+reference ambigue...) bloque la table avant le job.
+
+Une colonne introuvable bloque aussi, quand toutes les colonnes que lit la
+table sont sures : celles d'un schema de `conf/schema` ou d'un vrai fichier
+Parquet. A la retraduction, le modele recoit la liste des vraies colonnes
+que donne Spark et peut corriger le nom. Quand une table amont a ses
+colonnes deduites d'un autre script (`RESIDENT`, `STORE`), elles peuvent
+etre incompletes : la colonne introuvable est seulement signalee
+("non bloquant"). `fill_conf.py`, lance avec les vrais fichiers dans
+`data/`, remplit les schemas et rend ces colonnes sures.
+
+Une table bloquee ici perd ses reponses du modele non verifiees dans
+`work/expressions.json` : sans cela, la retraduction les lui redonnerait
+comme piste, et il risquerait de recopier sa reponse fausse.
 
 Le controle refuse aussi :
 - un prefixe `x.colonne` qui ne designe ni une CTE, ni une vue, ni un alias

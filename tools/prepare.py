@@ -2430,13 +2430,18 @@ def prepare(
                 )
             )
         view = view_name("in_" + (entry.name if entry else file_stem(path)))
+        columns, sure = file_schema_sure(path)
         # "io" : le nom de l'entree dans conf/io.yml, celui que le job passe
         # a read_input(). None si le fichier n'y est pas declare.
+        # "columns_sure" : colonnes lues dans un schema ou un vrai fichier,
+        # pas deduites d'un autre script. Le controle bloque alors une
+        # colonne introuvable au lieu de seulement la signaler.
         inputs[view] = {
             "path": location,
             "format": fmt,
             "io": entry.name if entry else None,
-            "columns": file_schema(path),
+            "columns": columns,
+            "columns_sure": sure,
         }
         types = entry.types if entry else {}
         writer = project_stores["names"].get(file_stem(path).lower())
@@ -2451,14 +2456,21 @@ def prepare(
 
     def file_schema(path: str) -> list[str] | None:
         """Colonnes connues d'un fichier lu."""
-        # Par ordre de preference : conf/schema, puis un Parquet deja present,
-        # puis le STORE d'un autre script.
+        return file_schema_sure(path)[0]
+
+    def file_schema_sure(path: str) -> tuple[list[str] | None, bool]:
+        """Colonnes connues d'un fichier lu, et si elles sont sures.
+
+        Par ordre de preference : conf/schema et un Parquet deja present
+        (surs), puis le STORE d'un autre script (deduit de ce script).
+        """
         entry = resolve_io(path, stored, conf)[2]
         if entry and entry.columns:
-            return entry.columns
-        return parquet_columns(
-            resolve_location(map_path(path, stored, conf))
-        ) or project_stores["columns"].get(file_stem(path).lower())
+            return entry.columns, True
+        found = parquet_columns(resolve_location(map_path(path, stored, conf)))
+        if found:
+            return found, True
+        return project_stores["columns"].get(file_stem(path).lower()), False
 
     sections = []
     produced: list[str] = []  # tables deja calculees (vues SQL)
