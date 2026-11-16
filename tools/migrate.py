@@ -192,10 +192,15 @@ def main(argv: list[str] | None = None) -> int:
             if s["status"] in ("escalade", "erreur_modele")
         ]
         if todo or to_fix:
+            # Pas assemble : une ancienne version du script ne doit pas
+            # rester dans le job sans qu'on le sache.
+            was_in_job = (workdir / "assembly.json").exists()
+            (workdir / "assembly.json").unlink(missing_ok=True)
             summary.append(
                 (
                     script.name,
-                    f"{todo} a traduire, {len(to_fix)} a corriger a la main",
+                    f"{todo} a traduire, {len(to_fix)} a corriger a la main"
+                    + (", retire du job jusqu'a correction" if was_in_job else ""),
                     to_fix,
                 )
             )

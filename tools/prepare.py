@@ -2661,6 +2661,13 @@ def prepare(
             else:
                 (d / "holes_prompt.md").unlink(missing_ok=True)
             sec["status"] = "todo"
+        if sec["status"] != "todo" and old.get("draft_hash") == draft_hash:
+            # Meme requete qu'au passage precedent : on garde les types que
+            # Spark avait calcules (check.py les recalcule s'il le peut).
+            # Sans eux, un script qui relit cette sortie repasse en STRING.
+            for key in ("output_types", "output_types_sure"):
+                if key in old:
+                    sec[key] = old[key]
         sections.append(sec)
 
     # avertissements de l'analyse (auto-concatenation, cle de jointure

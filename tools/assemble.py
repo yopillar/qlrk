@@ -58,8 +58,11 @@ def main(argv: list[str] | None = None) -> int:
     if pending and not args.partial:
         print(
             f"{len(pending)} table(s) non validee(s) : {pending[:8]}...\n"
-            "Assemblage annule (--partial pour forcer)."
+            "Assemblage annule (--partial pour forcer) : le script sort du "
+            "job jusqu'a leur correction."
         )
+        # sinon le job garderait l'ancienne version du script, sans le dire
+        (args.workdir / "assembly.json").unlink(missing_ok=True)
         return 1
 
     stem = Path(manifest["script"]).stem
