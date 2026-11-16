@@ -2675,11 +2675,17 @@ def _known(cols: list[str] | None) -> list[str] | None:
 
 def parquet_columns(path: str) -> list[str] | None:
     """Colonnes d'un Parquet deja present dans data/, ou None. Ca permet de
-    traduire les "LOAD * FROM fichier" et de calculer leurs cles."""
-    try:
-        import pyarrow.parquet as pq
-    except ImportError:
-        return None
+    traduire les "LOAD * FROM fichier" et de calculer leurs cles.
+
+    Args:
+        path: le chemin du fichier ou du dossier, avec ou sans joker.
+
+    Returns:
+        Les colonnes, ou None si aucun Parquet n'est la. Sans pyarrow ni
+        pyspark, on s'arrete au lieu de continuer sans les colonnes.
+    """
+    from fill_conf import parquet_types  # fill_conf importe ce module
+
     folder, _, name = path.rpartition("/")
     candidates = (
         sorted(Path(folder).glob(name))
@@ -2690,8 +2696,8 @@ def parquet_columns(path: str) -> list[str] | None:
         files = [c] if c.is_file() else sorted(c.rglob("*.parquet"))
         if files:
             try:
-                return list(pq.read_schema(files[0]).names)
-            except Exception:
+                return list(parquet_types(files[0]))
+            except Exception:  # fichier illisible ; SystemExit passe
                 return None
     return None
 

@@ -184,6 +184,25 @@ def io_key(text: str) -> str:
     return re.sub(r"[\W_]+", "_", _stem(text), flags=re.ASCII).strip("_")
 
 
+def missing_library(library: str, need: str) -> SystemExit:
+    """Arret quand une bibliotheque manque, au lieu de deviner.
+
+    Sans pyspark ni pyarrow, les types des fichiers ne sont pas lisibles :
+    avant, tout passait en STRING sans un mot.
+
+    Args:
+        library: ce qui manque (pyspark, pyarrow...).
+        need: a quoi il servait.
+
+    Returns:
+        L'erreur a lever, avec ce qu'il faut faire.
+    """
+    return SystemExit(
+        f"[!] {library} absent : {need} impossible. Lancer le kit depuis la "
+        "distrobox (ou l'environnement qui a pyspark et pyarrow)."
+    )
+
+
 def _load_yaml(path: Path) -> Any:
     """Contenu d'un fichier YAML, ou {} s'il est vide."""
     try:

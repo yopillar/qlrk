@@ -4,6 +4,7 @@ script en .txt et un sans extension, un io.yml a 3 espaces commente, une
 entree CSV et une sortie avec "#" dans leur nom, une table du modele de
 donnees sans STORE."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -298,3 +299,20 @@ def test_excel_input_read_by_the_socle(project: Project) -> None:
         "codes [1, 2, 3]",
         "b ['3']",
     ], res.stderr[-2000:]
+
+
+def test_inline_numbers_keep_bigint_columns(project: Project) -> None:
+    """Un INLINE de nombres ajoute a une table ne fait pas passer ses
+    colonnes en texte."""
+    (project / "script_qvd/codes.qvs").write_text(
+        "Base:\nLOAD * INLINE [\nId, Qte\n1, 10\n2, 20\n];\n"
+        "Concatenate (Base)\nLOAD * INLINE [\nId, Qte\n99, 0\n];\n"
+        "STORE Base INTO [lib://out/base.qvd] (qvd);\n"
+    )
+    project.run("prepare.py", "script_qvd/codes.qvs")
+    project.run("check.py", "work/codes", "--parse")
+    manifest = json.loads(
+        (project / "work/codes/manifest.json").read_text(encoding="utf-8")
+    )
+    types = {s["table"]: s.get("output_types") for s in manifest["sections"]}
+    assert types["Base"] == {"Id": "BIGINT", "Qte": "BIGINT"}

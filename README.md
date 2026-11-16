@@ -22,6 +22,13 @@ python tools/migrate.py script_qvd/ --jobs 4              # tout le dossier
 python src/job_<projet>.py                                # lancer le resultat
 ```
 
+Le kit se lance dans la distrobox, celle qui a pyspark et pyarrow : sans
+eux, il s'arrete au lieu de mettre toutes les colonnes en `string`.
+opencode, lui, reste installe sur l'hote : depuis la distrobox,
+`translate.py` le lance par `distrobox-host-exec`, sans rien a faire
+(`--opencode-in-box` s'il est installe dans la box). Le projet doit donc
+etre dans un dossier que la box partage avec l'hote, le home en general.
+
 `migrate.py` est la seule commande a connaitre. Pour chaque script, il
 traduit ce qu'il peut sans modele, fait completer le reste par le modele,
 range les requetes dans `src/`, puis lance le job et compare avec Qlik s'il
@@ -419,6 +426,11 @@ relit avec ce format.
   et les LOAD empiles.
 - **Les sources** : fichier, `RESIDENT`, `INLINE`, `SQL SELECT` simple et
   `AUTOGENERATE` (voir plus bas).
+- **Les colonnes d'un `INLINE`** sont typees comme Qlik les lit : que des
+  entiers donnent `BIGINT`, des nombres a point `DOUBLE`. Une valeur a zero
+  en tete (`007`, `01000`) ou une colonne mixte reste du texte. Laissees en
+  texte, elles faisaient passer en `string` la colonne a laquelle on les
+  ajoutait (`CONCATENATE`) et tout `ApplyMap` qui s'en servait.
 - **Tout ce qui depend de l'ordre de chargement** : `RowNo`, `RecNo`,
   `Previous`, `Peek` (champ simple, ou `Peek('f', n, 'T')` sur une autre
   table), `FirstValue`, `LastValue`, `NoOfRows`, et les mappings, qui gardent

@@ -35,7 +35,7 @@ if TYPE_CHECKING:  # pyspark est facultatif pour les controles statiques
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
-from conf import work_dir  # noqa: E402
+from conf import missing_library, work_dir  # noqa: E402
 from qlik2sql import FILE_VIEW_SUFFIX  # noqa: E402
 
 FORBIDDEN = (
@@ -214,15 +214,22 @@ class SparkChecker:
                 return "analyse Spark : " + msg[:300]
 
 
-def get_parser() -> SparkChecker | None:
-    """Renvoie le verificateur Spark, ou None si pyspark n'est pas installe.
+def get_parser() -> SparkChecker:
+    """Renvoie le verificateur Spark.
 
     Pas besoin du socle ici : on ne lit ni n'ecrit rien, une session locale
-    minimale suffit pour parser et analyser."""
+    minimale suffit pour parser et analyser. Sans pyspark on s'arrete : les
+    types des tables seraient perdus, et les sorties ecrites en STRING.
+
+    Returns:
+        Le verificateur.
+    """
     try:
         from pyspark.sql import SparkSession
-    except ImportError:
-        return None
+    except ImportError as exc:
+        raise missing_library(
+            "pyspark", "controle des requetes et calcul des types"
+        ) from exc
     spark = (
         SparkSession.builder.master("local[1]")
         .config("spark.ui.enabled", "false")

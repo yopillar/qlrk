@@ -60,6 +60,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", help="provider/model")
     p.add_argument("--opencode-bin", default="opencode")
     p.add_argument(
+        "--opencode-in-box",
+        action="store_true",
+        help="opencode est dans la distrobox : pas de distrobox-host-exec",
+    )
+    p.add_argument(
         "--skip-selftest",
         action="store_true",
         help="ne pas tester le modele avant de traduire",
@@ -143,6 +148,8 @@ def main(argv: list[str] | None = None) -> int:
         extra = ["--opencode-bin", args.opencode_bin, "--jobs", str(args.jobs)]
         if args.skip_selftest:
             extra.append("--skip-selftest")
+        if args.opencode_in_box:
+            extra.append("--opencode-in-box")
         if args.model:
             extra += ["--model", args.model]
         if args.pilot:

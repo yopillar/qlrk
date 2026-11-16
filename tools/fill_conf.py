@@ -55,6 +55,7 @@ from conf import (
     IoConf,
     _load_yaml,
     find_scripts,
+    missing_library,
     reread_name,
     resolve_location,
 )
@@ -392,7 +393,7 @@ def parquet_types(path: Path) -> dict[str, str]:
         {colonne: type}, dans l'ordre du fichier.
 
     Raises:
-        ImportError: ni pyarrow ni pyspark ne sont installes.
+        SystemExit: ni pyarrow ni pyspark ne sont installes.
     """
     try:
         import pyarrow.parquet as pq
@@ -403,8 +404,8 @@ def parquet_types(path: Path) -> dict[str, str]:
     try:
         from pyspark.sql import SparkSession
     except ImportError as exc:
-        raise ImportError(
-            "ni pyarrow ni pyspark : types du Parquet illisibles (pip install pyarrow)"
+        raise missing_library(
+            "pyarrow et pyspark", f"lecture des types de {path}"
         ) from exc
     spark = (
         SparkSession.builder.master("local[1]")
@@ -429,14 +430,19 @@ def excel_types(path: Path) -> tuple[list[str], dict[str, str]]:
         path: le fichier .xlsx ou .xls.
 
     Returns:
-        (colonnes, types) ; vides si pandas ou openpyxl manquent.
+        (colonnes, types).
+
+    Raises:
+        SystemExit: pandas ou openpyxl ne sont pas installes.
     """
     try:
         import pandas as pd
 
         sheet = pd.read_excel(path, sheet_name=0, nrows=5000)
-    except ImportError:
-        return [], {}
+    except ImportError as exc:
+        raise missing_library(
+            "pandas ou openpyxl", f"lecture des types de {path}"
+        ) from exc
     types = {
         str(c): next((t for p_, t in PANDAS_TYPES if str(d).startswith(p_)), "string")
         for c, d in sheet.dtypes.items()
