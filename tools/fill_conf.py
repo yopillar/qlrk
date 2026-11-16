@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from conf import (
     CONF,
     IO_FILE,
+    WORK,
     IoConf,
     _load_yaml,
     find_scripts,
@@ -70,6 +71,7 @@ from prepare import (
     norm_path,
     source_format,
     strip_comments,
+    write_stores,
 )
 from qlik2sql import (  # noqa: E402
     Untranslatable,
@@ -527,9 +529,11 @@ def value_kind(v: str) -> str:
     Returns:
         Sa sorte.
     """
-    if re.fullmatch(r"-?\d{1,18}", v):
+    # Un zero en tete (001, 007.5) garde la valeur en texte : c'est un code,
+    # Qlik affiche ses zeros. Meme regle que pour un INLINE.
+    if re.fullmatch(r"-?(0|[1-9]\d{0,17})", v):
         return "bigint"
-    if re.fullmatch(r"-?\d*\.\d+([eE][-+]?\d+)?", v):
+    if re.fullmatch(r"-?(0|[1-9]\d*)?\.\d+([eE][-+]?\d+)?", v):
         return "double"
     if v.lower() in ("true", "false"):
         return "boolean"
@@ -1024,6 +1028,10 @@ def main(argv: list[str] | None = None) -> int:
     if not scripts:
         print(f"Aucun script Qlik dans {args.path} (.qvs, .txt ou sans extension)")
         return 1
+    # Le recensement d'abord : une table du modele (sans STORE) qui existe
+    # dans plusieurs scripts prend le nom <script>_<table>, comme dans
+    # prepare.py. Sans lui, toutes partageaient une seule sortie.
+    write_stores(scripts, WORK / "stores.json")
 
     conf = IoConf()
     raw = _load_yaml(IO_FILE) if IO_FILE.exists() else {}
@@ -1054,6 +1062,14 @@ def main(argv: list[str] | None = None) -> int:
 
     for _, r in sorted(reads.items()):
         name = io_name(r["path"])
+        # airports.csv et airports.xlsx : deux entrees, airports_csv et
+        # airports_xlsx (une cle YAML en double n'en garderait qu'une)
+        same_name = [x for x in reads.values() if io_name(x["path"]) == name]
+        entry_name = (
+            f"{name}_{file_ext(r['path'])[1:]}"
+            if len(same_name) > 1 and file_ext(r["path"])
+            else name
+        )
         # Produit par un STORE : meme chemin, ou meme nom et meme extension
         # ecrit par un AUTRE script. Un script qui lit Sources/produits.qvd
         # et ecrit QVD/produits.qvd lit bien la source, pas sa propre sortie ;
@@ -1133,7 +1149,7 @@ def main(argv: list[str] | None = None) -> int:
         absent = [c for c in r["columns"] if from_file and c not in cols]
         if absent:
             warnings.append(
-                f"{name} : colonnes lues par les scripts mais "
+                f"{entry_name} : colonnes lues par les scripts mais "
                 f"absentes de {origin} : {', '.join(absent)}"
             )
         if not cols:
@@ -1152,7 +1168,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 col_type, note = suggest(c, hints.get(c))
             lines.append((c, col_type, note))
-        schema_file = f"{schema_dir}/{name}.yml"
+        schema_file = f"{schema_dir}/{entry_name}.yml"
         why = f"lu par {', '.join(sorted(r['scripts']))}"
         if r["star"] and not from_file:
             why += " ; LOAD * : colonnes incompletes sans le fichier"
@@ -1170,14 +1186,14 @@ def main(argv: list[str] | None = None) -> int:
             # risquerait de faire planter la lecture par le socle. On declare
             # l'entree sans schema_file et on le signale.
             warnings.append(
-                f"{name} : colonnes inconnues ({why}), pas de "
+                f"{entry_name} : colonnes inconnues ({why}), pas de "
                 "schema cree. Deposer le fichier dans data/input/ "
                 "et relancer, ou ecrire le schema a la main."
             )
             if not entry:
                 new_inputs.append(
                     (
-                        name,
+                        entry_name,
                         {"format": fmt or "parquet", "location": location, **extra},
                         why + " ; pas de schema, colonnes inconnues",
                     )
@@ -1201,7 +1217,9 @@ def main(argv: list[str] | None = None) -> int:
             "location": location,
             **extra,
         }
-        new_inputs.append((name, props, why if fmt else why + " ; format a verifier"))
+        new_inputs.append(
+            (entry_name, props, why if fmt else why + " ; format a verifier")
+        )
 
     propagate_types(schemas_out, conf)
     blocks = {

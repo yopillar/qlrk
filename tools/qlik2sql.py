@@ -403,6 +403,65 @@ def as_number(sql: str, ctx: ExprCtx) -> str:
     return NumSql(f"try_cast({out} AS DOUBLE)")
 
 
+class Shown(str):
+    """Expression SQL qui porte aussi le texte que Qlik affiche."""
+
+
+def with_display(sql: str, text: str) -> str:
+    """Attache a une expression le texte que Qlik affiche pour elle :
+    Num(x, '00') vaut x dans un calcul, mais "05" dans une concatenation.
+
+    Args:
+        sql: l'expression (nombre, date...).
+        text: l'expression SQL de son texte affiche.
+
+    Returns:
+        La meme expression, de meme type, avec son texte.
+    """
+    out = sql if type(sql) is not str else Shown(sql)
+    out.display = text  # type: ignore[attr-defined]
+    return out
+
+
+def shown(sql: str) -> str:
+    """Texte d'une expression dans une concatenation ou un Dual.
+
+    Args:
+        sql: l'expression.
+
+    Returns:
+        Son texte affiche s'il est connu, sinon la valeur en texte.
+    """
+    text = getattr(sql, "display", None)
+    return text if text else f"CAST({as_value(sql)} AS STRING)"
+
+
+def display_format(n: str, x: str, fmt: str) -> str | None:
+    """Texte affiche par Num(x, fmt) ou Date(x, fmt), pour les formats
+    simples ; None sinon (on garde alors la valeur).
+
+    Args:
+        n: "num", "date" ou "timestamp".
+        x: l'expression.
+        fmt: le format Qlik.
+
+    Returns:
+        L'expression SQL du texte, ou None.
+    """
+    if n == "num":
+        m = re.fullmatch(r"(0+)(?:\.(0+))?", fmt)
+        if not m:
+            return None
+        width, decimals = len(m.group(1)), len(m.group(2) or "")
+        if not decimals:
+            return f"lpad(CAST(CAST(round({x}) AS BIGINT) AS STRING), {width}, '0')"
+        return f"format_string('%0{width + decimals + 1}.{decimals}f', CAST({x} AS DOUBLE))"
+    try:
+        return f"date_format({x}, {sql_string(qlik_format_to_spark(fmt))})"
+    except Untranslatable:
+        return None
+
+
 def as_value(sql: str) -> str:
     """Booleen utilise comme valeur. En Qlik, vrai vaut -1 et faux vaut 0."""
     return f"CASE WHEN {sql} THEN -1 ELSE 0 END" if isinstance(sql, Bool) else sql
@@ -523,12 +582,9 @@ class ExprParser:
             parts.append(self.p_add())
         if len(parts) == 1:
             return parts[0]
-        # avec & en Qlik, un null se comporte comme une chaine vide
-        return (
-            "concat_ws('', "
-            + ", ".join(f"CAST({as_value(p)} AS STRING)" for p in parts)
-            + ")"
-        )
+        # avec & en Qlik, un null se comporte comme une chaine vide ; une
+        # valeur formatee (Num(x, '00'), Date(d, 'YYYY-MM')) donne son texte
+        return "concat_ws('', " + ", ".join(shown(p) for p in parts) + ")"
 
     def p_add(self) -> str:
         """Addition et soustraction, dates comprises."""
@@ -798,6 +854,12 @@ def translate_function(
         L'expression Spark SQL.
     """
     n = name.lower()
+    if n in ("num", "date", "timestamp") and len(a) >= 2 and raw:
+        # la valeur d'abord, puis le texte que le format affiche
+        value = translate_function(name, a[:1], raw[:1], distinct, ctx)
+        fmt = literal(raw[1])
+        text = display_format(n, value, fmt) if fmt else None
+        return with_display(value, text) if text else value
     if n in DATE_ARG_FUNCTIONS and a:
         a = [as_date(a[0], ctx)] + a[1:]
     if n in NUMBER_ARG_FUNCTIONS:
@@ -1135,6 +1197,19 @@ def _translate_function(
     if n == "mod":
         need(2)
         return f"pmod({a[0]}, {a[1]})"
+    if n == "daynumberofyear":
+        need(1)
+        return f"dayofyear({as_date(a[0], ctx)})"
+    if n == "quarterstart":
+        need(1)
+        return DateSql(f"trunc({as_date(a[0], ctx)}, 'QUARTER')")
+    if n in ("even", "odd"):
+        need(1)
+        # vrai ou faux pour un entier, NULL sinon, comme Qlik
+        rest = "0" if n == "even" else "1"
+        return Bool(
+            f"(CASE WHEN {a[0]} = floor({a[0]}) THEN pmod({a[0]}, 2) = {rest} END)"
+        )
     if n == "div":
         need(2)
         return f"CAST({a[0]} / {a[1]} AS BIGINT)"
@@ -1143,8 +1218,9 @@ def _translate_function(
         return f"power({a[0]}, {a[1]})"
     if n == "dual":
         need(2)
-        # Parquet n'a qu'un type par colonne : on garde le texte (a valider)
-        return a[0]
+        # Parquet n'a qu'un type par colonne : on garde le texte (a valider),
+        # tel que Qlik l'affiche (Date(d, 'YYYY-MM') donne "2024-01")
+        return shown(a[0]) if getattr(a[0], "display", None) else a[0]
     if n == "null":
         return "NULL"
     if n == "isnull":
@@ -1381,7 +1457,12 @@ def parse_fields(text: str) -> list[tuple[str, str | None]]:
             m = pos
             break
         if m is not None:
-            alias = part[m + 2 :].strip().strip('[]"')
+            alias = part[m + 2 :].strip()
+            # AS [Nom], AS "Nom" ou AS 'Nom' : Qlik accepte les trois
+            if len(alias) >= 2 and alias[0] == alias[-1] == "'":
+                alias = alias[1:-1].strip()
+            else:
+                alias = alias.strip('[]"')
             if not alias:
                 raise Untranslatable(f"alias vide : {part[:40]}")
             out.append((part[:m].strip(), alias))
@@ -2225,8 +2306,12 @@ class SectionTranslator:
                 raise Untranslatable(f"WHILE : '{val}' non resolu")
         cap = self.WHILE_CAP
         # range() renvoie des BIGINT, et Spark refuse date + BIGINT
-        c_outer = cond(seg.while_cond or "", ExprCtx(iterno="CAST(g.id AS INT)"))
-        c_inner = cond(seg.while_cond or "", ExprCtx(iterno="CAST(r.id AS INT)"))
+        # contexte qui lit les tables : le calendrier classique compare
+        # IterNo() a Peek('MaxDate', 0, 'Bornes')
+        outer, inner = self.base_ectx(), self.base_ectx()
+        outer.iterno, inner.iterno = "CAST(g.id AS INT)", "CAST(r.id AS INT)"
+        c_outer = cond(seg.while_cond or "", outer)
+        c_inner = cond(seg.while_cond or "", inner)
         self.autogen_bottom = "while"
         return (
             f"(\n  -- WHILE Qlik : jusqu'a la premiere iteration fausse "

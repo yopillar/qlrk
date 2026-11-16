@@ -385,6 +385,12 @@ class IoConf:
         stem = io_key(qlik_path)
         pool = self.inputs if kind == "input" else self.outputs
         found = [e for e in pool if stem in (io_key(e.name), io_key(e.location))]
+        # airports.csv et airports.xlsx : celle qui a la meme extension
+        ext = Path(qlik_path.replace("\\", "/")).suffix.lower()
+        if len(found) > 1 and ext:
+            found = [
+                e for e in found if Path(e.location).suffix.lower() in (ext, "")
+            ] or found
         if kind != "input" or produced is None:
             return found[0] if found else None
         same = [e for e in found if self.rereads_output(e) == produced]

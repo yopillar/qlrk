@@ -296,7 +296,12 @@ prend les types de la requete Spark qui ecrit la sortie.
 Un fichier lu n'est rattache a une sortie que par son chemin, ou par son nom
 avec la meme extension : `commandes.csv`, la source brute, et
 `commandes.qvd`, ecrit par un autre script, restent deux entrees
-differentes (`commandes` et `commandes_relue`).
+differentes (`commandes` et `commandes_relue`). Deux fichiers du meme nom
+mais d'extensions differentes (`airports.csv`, `airports.xlsx`) donnent
+`airports_csv` et `airports_xlsx`. Une table sans STORE presente dans
+plusieurs scripts prend une sortie par script (`<script>_<table>`), que
+`fill_conf.py` soit lance seul ou par `migrate.py`. Dans un CSV, une valeur a
+zero en tete (`001`) reste du texte, comme dans un `INLINE`.
 
 `fill_conf.py` ne modifie jamais une entree existante : une ancienne entree
 qui relit une sortie avec sa propre location (et souvent le meme nom que la
@@ -466,6 +471,12 @@ relit avec ce format.
   une comparaison a un nombre, `Sum`, `Avg`, `Round`, `RangeSum`... est lue
   comme Qlik la lit. Sans cela, Spark donnait NULL. Une simple copie garde le
   texte d'origine.
+- **Les valeurs formatees** : `Num(x, '00')` ou `Date(d, 'YYYY-MM')` donnent
+  leur texte affiche dans une concatenation (`'W' & Num(Week(d), '00')`
+  donne `W05`) ou comme texte d'un `Dual`, et restent un nombre ou une date
+  dans un calcul.
+- **`Even`**, **`Odd`**, **`DayNumberOfYear`**, **`QuarterStart`**, et un
+  alias entre apostrophes (`AS 'Nom'`), que Qlik accepte.
 - **`TextBetween`** (premiere occurrence), **`SubStringCount`**,
   **`CROSSTABLE (attribut, donnee[, n])`** quand les colonnes sont connues, et
   **`RENAME FIELD a TO b`** (pas `USING`, qui depend d'un mapping).

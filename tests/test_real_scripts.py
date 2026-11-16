@@ -212,3 +212,98 @@ def test_crosstable_and_text_functions(project: Project) -> None:
     tables = run_sections(project / "work/divers")
     assert tables["Obj"] == [("RH", "T1", 10), ("RH", "T2", 12)]
     assert tables["Emp"] == [("Bob [IT] foo", "IT", 3, "4000 <= x < 5000")]
+
+
+def test_apostrophe_in_comment_keeps_variables_expanded() -> None:
+    """Une apostrophe dans un commentaire ("today's") ne fait plus croire
+    que la suite est une chaine : $(vToday) est remplace partout."""
+    loads = insts_of(
+        "LET vToday = Today();\nT:\nLOAD d,\n"
+        "  // same day as today's date\n"
+        "  If(d = $(vToday), 1, 0) AS IsToday\nFROM [lib://d/t.csv] (txt);\n"
+    )
+    assert "$(vToday)" not in loads[0].text and "(Today())" in loads[0].text
+
+
+def test_alias_in_single_quotes() -> None:
+    """AS 'Nom' : Qlik nomme la colonne Nom, sans les apostrophes."""
+    loads = insts_of("T:\nLOAD a AS 'Nom', b AS [Autre] FROM [lib://d/t.csv] (txt);\n")
+    assert loads[0].fields == ["Nom", "Autre"]
+
+
+def test_csv_code_with_leading_zero_stays_text() -> None:
+    """001 dans un CSV est un code : il reste du texte, comme dans un INLINE."""
+    from fill_conf import value_kind
+
+    assert [value_kind(v) for v in ("001", "0", "12", "007.5", "0.5")] == [
+        "string",
+        "bigint",
+        "bigint",
+        "string",
+        "double",
+    ]
+
+
+def test_fill_conf_alone_names_shared_model_tables(project: Project) -> None:
+    """Deux scripts ont une table Airports sans STORE : fill_conf.py, meme
+    lance seul, leur donne deux sorties (<script>_airports), comme
+    prepare.py ; et airports.csv et airports.xlsx, deux entrees."""
+    (project / "data/input/airports.csv").write_text("Id,Nom\n1,a\n", encoding="utf-8")
+    (project / "script_qvd/a.qvs").write_text(
+        "Airports:\nLOAD Id, Nom FROM [lib://data/airports.csv] "
+        "(txt, utf8, embedded labels, delimiter is ',');\n",
+        encoding="utf-8",
+    )
+    (project / "script_qvd/b.qvs").write_text(
+        "Airports:\nLOAD * FROM [lib://data/airports.xlsx] "
+        "(ooxml, embedded labels, table is Airports);\n",
+        encoding="utf-8",
+    )
+    project.run("fill_conf.py", "script_qvd/")
+    text = (project / "conf/io.yml").read_text(encoding="utf-8")
+    for name in ("a_airports:", "b_airports:", "airports_csv:", "airports_xlsx:"):
+        assert name in text
+
+
+@pytest.mark.spark
+def test_formatted_values_and_calendar_functions() -> None:
+    """Num(x, '00') et Date(d, fmt) donnent leur texte dans une
+    concatenation ou un Dual, et restent des valeurs dans un calcul ;
+    Even, Odd, DayNumberOfYear et QuarterStart sont traduits."""
+    from check import get_parser
+
+    spark = get_parser().spark
+    ctx = ExprCtx(column_types={"d": "DATE"})
+    cases = {
+        "Year(d) & '-W' & Num(Week(d), '00')": "2024-W05",
+        "Dual(Date(MonthStart(d), 'YYYY-MM'), 1)": "2024-01",
+        "Num(Week(d), '00') + 1": 6,
+        "If(Even(Day(d)), 'pair', 'impair')": "pair",
+        "Odd(3)": -1,
+        "DayNumberOfYear(d)": 30,
+        "QuarterStart(d) = MakeDate(2024, 1, 1)": -1,
+    }
+    for qlik, expected in cases.items():
+        sql = expr(qlik, ctx)
+        got = spark.sql(f"SELECT {sql} FROM VALUES (DATE'2024-01-30') AS t(d)")
+        assert got.collect()[0][0] == expected, qlik
+
+
+@pytest.mark.spark
+def test_calendar_bounds_read_with_peek_in_while(project: Project) -> None:
+    """Le calendrier classique : bornes lues par Peek('Min', 0, 'Bornes')
+    dans un AUTOGENERATE ... WHILE, la table des bornes supprimee avant."""
+    (project / "script_qvd/cal.qvs").write_text(
+        "F:\nLOAD * INLINE [\nd\n2024-01-30\n2024-02-02\n];\n"
+        "Bornes:\nLOAD Min(Date#(d, 'YYYY-MM-DD')) AS Mn, "
+        "Max(Date#(d, 'YYYY-MM-DD')) AS Mx RESIDENT F;\n"
+        "LET vMin = Peek('Mn', 0, 'Bornes');\nLET vMax = Peek('Mx', 0, 'Bornes');\n"
+        "DROP TABLE Bornes;\n"
+        "Cal:\nLOAD Date($(vMin) + IterNo() - 1) AS Jour\n"
+        "AUTOGENERATE 1 WHILE $(vMin) + IterNo() - 1 <= $(vMax);\n"
+        "STORE Cal INTO [lib://out/cal.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    project.run("prepare.py", "script_qvd/cal.qvs")
+    tables = run_sections(project / "work/cal")
+    assert len(tables["Cal"]) == 4

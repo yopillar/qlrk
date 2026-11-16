@@ -479,14 +479,29 @@ class Env:
 
 def _in_quotes(text: str, pos: int) -> bool:
     """Dit si la position tombe dans une chaine '...' ou dans un nom [...] ou
-    "..."."""
+    "...".
+
+    Les commentaires // et /* */ sont sautes : une apostrophe dans
+    "// today's date" faisait croire que tout le reste etait une chaine, et
+    les $(v) qui suivaient n'etaient plus remplaces."""
     quote = None
-    for ch in text[:pos]:
+    i = 0
+    while i < pos:
+        ch = text[i]
         if quote:
             if (quote == "[" and ch == "]") or (quote != "[" and ch == quote):
                 quote = None
+        elif text.startswith("//", i) and not text[max(0, i - 4) : i].endswith(":"):
+            end = text.find("\n", i)
+            i = pos if end == -1 or end >= pos else end
+            continue
+        elif text.startswith("/*", i):
+            end = text.find("*/", i)
+            i = pos if end == -1 or end >= pos else end + 2
+            continue
         elif ch in "'\"[":
             quote = ch
+        i += 1
     return quote is not None
 
 
@@ -825,8 +840,12 @@ def run_if(
 
 
 def strip_name(n: str) -> str:
-    """Nom sans crochets ni guillemets autour."""
-    return n.strip().strip('[]"').strip()
+    """Nom sans crochets ni guillemets autour. Qlik accepte aussi les
+    apostrophes autour d'un alias (AS 'Nom')."""
+    n = n.strip()
+    if len(n) >= 2 and n[0] == n[-1] == "'":
+        return n[1:-1].strip()
+    return n.strip('[]"').strip()
 
 
 def clean_path(path: str) -> str:
@@ -986,7 +1005,12 @@ def analyze(inst: Inst) -> None:
     if inst.label is None:
         # etiquette ecrite apres les prefixes : "LEFT KEEP (A) T: LOAD ..."
         late = re.search(r"(?:^|[\s)])" + NAME + r"\s*:\s*$", head)
-        if late and first_word(late.group(1)) not in PREFIX_WORDS:
+        # avant elle, il ne doit y avoir que des prefixes : LEFT KEEP (A)...
+        before = re.sub(r"\([^()]*\)", " ", head[: late.start(1)]) if late else ""
+        only_prefixes = bool(before.split()) and all(
+            w.upper() in PREFIX_WORDS or w.isdigit() for w in before.split()
+        )
+        if late and only_prefixes and first_word(late.group(1)) not in PREFIX_WORDS:
             inst.label = strip_name(late.group(1))
             head = head[: late.start(1)]
             inst.warnings.append(
@@ -1217,7 +1241,8 @@ def _segment_fields(body: str, masked: str, start: int) -> list[str]:
     seg = body[start : start + end.start()] if end else body[start:]
     out = []
     for part in split_top(seg):
-        alias = re.search(r"\bAS\s+" + NAME + r"\s*$", part, re.I)
+        # AS [Nom], AS "Nom", AS Nom, ou AS 'Nom' que Qlik accepte aussi
+        alias = re.search(r"\bAS\s+('[^']+'|" + NAME[1:] + r"\s*$", part, re.I)
         if alias:
             out.append(strip_name(alias.group(1)))
         elif part.strip() == "*":
@@ -2482,6 +2507,31 @@ def analyze_script(
     return text, env, insts, notes, tables, schemas
 
 
+def write_stores(scripts: list[Path], stores_path: Path) -> int:
+    """Recense les fichiers lus et ecrits par les scripts dans
+    work/stores.json, en gardant les autres scripts deja recenses.
+
+    Args:
+        scripts: les scripts a recenser.
+        stores_path: work/stores.json.
+
+    Returns:
+        Le nombre de scripts recenses en tout.
+    """
+    data = (
+        json.loads(stores_path.read_text(encoding="utf-8"))
+        if stores_path.exists()
+        else {}
+    )
+    for script in scripts:
+        data[script.name] = collect_io(script)
+    stores_path.parent.mkdir(parents=True, exist_ok=True)
+    stores_path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return len(data)
+
+
 def collect_io(script: Path) -> dict:
     """Fichiers lus et ecrits par un script (chemins normalises), plus les
     colonnes connues des fichiers ecrits. Un autre script qui fait un
@@ -3017,18 +3067,8 @@ def main(argv: list[str] | None = None) -> int:
     out_root = args.out or Path("work")
     stores_path = out_root / "stores.json"
     if args.collect:
-        data = (
-            json.loads(stores_path.read_text(encoding="utf-8"))
-            if stores_path.exists()
-            else {}
-        )
-        for script in args.scripts:
-            data[script.name] = collect_io(script)
-        out_root.mkdir(parents=True, exist_ok=True)
-        stores_path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-        print(f"{len(data)} script(s) recense(s) -> {stores_path}")
+        n = write_stores(args.scripts, stores_path)
+        print(f"{n} script(s) recense(s) -> {stores_path}")
         return 0
     conf = IoConf()
     for p_ in conf.problems:
