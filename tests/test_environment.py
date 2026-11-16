@@ -24,8 +24,31 @@ def test_opencode_runs_on_host_from_distrobox(monkeypatch: pytest.MonkeyPatch) -
     qu'il est installe dans la box."""
     monkeypatch.setenv("CONTAINER_ID", "box")
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
-    assert translate.opencode_command(options()) == ["host-spawn", "opencode"]
+    monkeypatch.setattr(translate, "host_env_names", lambda: ["ORNITH_API_KEY"])
+    assert translate.opencode_command(options()) == [
+        "host-spawn",
+        "-env=TERM,ORNITH_API_KEY",
+        "opencode",
+    ]
     assert translate.opencode_command(options(opencode_in_box=True)) == ["opencode"]
+
+
+def test_host_env_names(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """On transmet les variables lues par la conf d'opencode et celles d'un
+    modele, si elles sont definies ; jamais les autres."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "opencode.json").write_text(
+        '{"provider": {"o": {"options": {"baseURL": "{env:ORNITH_URL}"}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ORNITH_URL", "http://serveur")
+    monkeypatch.setenv("MISTRAL_API_KEY", "x")
+    monkeypatch.setenv("SANS_RAPPORT", "y")
+    monkeypatch.delenv("ABSENTE", raising=False)
+    names = translate.host_env_names()
+    assert "ORNITH_URL" in names and "MISTRAL_API_KEY" in names
+    assert "SANS_RAPPORT" not in names
 
 
 def test_opencode_direct_outside_distrobox(monkeypatch: pytest.MonkeyPatch) -> None:

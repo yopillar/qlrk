@@ -308,21 +308,54 @@ def in_distrobox() -> bool:
     return inside and shutil.which("host-spawn") is not None
 
 
+# Variable lue par la conf d'opencode ({env:NOM}), et variables qui
+# ressemblent a un reglage de modele.
+ENV_REF = re.compile(r"\{env:(\w+)\}")
+MODEL_VAR = re.compile(r"OPENCODE_\w+|\w+_(API_KEY|API_BASE|BASE_URL|TOKEN)")
+
+
+def host_env_names() -> list[str]:
+    """Variables a transmettre a opencode lance sur l'hote.
+
+    host-spawn ne transmet que TERM : sans le reste, la conf d'opencode
+    trouve vides ses {env:...} (cle, URL du serveur du modele) et opencode
+    plante sur une "unexpected server error".
+
+    Returns:
+        Les noms des variables definies ici que la conf d'opencode lit, ou
+        qui ressemblent a un reglage de modele, tries.
+    """
+    files = [
+        *Path.home().glob(".config/opencode/opencode.json*"),
+        *Path().glob("opencode.json*"),
+        *Path(".opencode").rglob("*"),
+    ]
+    names = {n for n in os.environ if MODEL_VAR.fullmatch(n)}
+    for f in files:
+        if f.is_file():
+            names.update(
+                ENV_REF.findall(f.read_text(encoding="utf-8", errors="ignore"))
+            )
+    return sorted(n for n in names if n in os.environ)
+
+
 def opencode_command(args: argparse.Namespace) -> list[str]:
     """Debut de la commande qui lance opencode.
 
     Le kit tourne dans la distrobox (pyspark, pyarrow), mais opencode est
-    installe sur l'hote : depuis la box, on passe par host-spawn.
+    installe sur l'hote : depuis la box, on passe par host-spawn, avec les
+    variables dont la conf d'opencode a besoin.
 
     Args:
         args: les options de translate.py (--opencode-bin, --opencode-in-box).
 
     Returns:
-        [opencode] ou [host-spawn, opencode].
+        [opencode] ou [host-spawn, -env=TERM,..., opencode].
     """
     if args.opencode_in_box or not in_distrobox():
         return [args.opencode_bin]
-    return ["host-spawn", args.opencode_bin]
+    names = ",".join(["TERM", *host_env_names()])
+    return ["host-spawn", f"-env={names}", args.opencode_bin]
 
 
 def run_opencode(message: str, args: argparse.Namespace) -> tuple[bool, str, dict]:
