@@ -30,12 +30,13 @@ import datetime as dt
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from compare import compare_files  # noqa: E402
-from conf import resolve_location, work_dir  # noqa: E402
+from conf import query_sha, resolve_location, work_dir  # noqa: E402
 from job_template import function_name, job_path  # noqa: E402
 
 QLIK_DIR = Path("data") / "qlik_outputs"
@@ -53,6 +54,20 @@ def find_reference(name: str) -> Path | None:
         ):
             return f
     return None
+
+
+def written_since(path: Path, start: float) -> bool:
+    """Dit si une sortie a ete ecrite apres le lancement du job.
+
+    Args:
+        path: le fichier, ou le dossier d'un Parquet.
+        start: l'heure de lancement du job.
+
+    Returns:
+        True si au moins un de ses fichiers est plus recent.
+    """
+    files = [path] if path.is_file() else [f for f in path.rglob("*") if f.is_file()]
+    return any(f.stat().st_mtime >= start for f in files)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -103,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     date_formats = [manifest.get("date_format"), manifest.get("timestamp_format")]
 
     job_failed = False
+    started = time.time()
     if not args.no_run:
         if not job.exists():
             print(
@@ -154,6 +170,14 @@ def main(argv: list[str] | None = None) -> int:
             elif not Path(out_path).exists():
                 verdict, detail = "sortie absente", f"{out_path} n'existe pas"
                 n_ko += 1
+            elif not args.no_run and not written_since(Path(out_path), started):
+                # l'etape en echec ne l'a pas reecrite : c'est celle d'un
+                # lancement precedent, elle ne dit rien de la requete actuelle
+                verdict, detail = (
+                    "sortie non regeneree",
+                    f"{out_path} date d'un lancement precedent du job",
+                )
+                n_ko += 1
             else:
                 # Les cles AutoNumber / Hash ne peuvent pas avoir les memes
                 # valeurs que dans Qlik, on les sort de la comparaison.
@@ -178,8 +202,13 @@ def main(argv: list[str] | None = None) -> int:
                 n_ok += ok
                 n_ko += not ok
             sec["compare"] = verdict
-            # le contenu suffit, que l'ordre des lignes soit le bon ou non
-            if verdict.startswith("identique"):
+            # Le contenu suffit, que l'ordre des lignes soit le bon ou non.
+            # Une requete retouchee a la main depuis la traduction ne dit
+            # rien des reponses du modele : on ne les valide pas. Une
+            # traduction plus ancienne que l'empreinte (query_sha) passe.
+            query = args.workdir / sec["id"] / "query.sql"
+            untouched = sec.get("query_sha") in (None, query_sha(query))
+            if verdict.startswith("identique") and untouched:
                 verified.update(sec.get("hole_answers", {}))
             print(f"  {sec['id']:<35} {table:<25} {verdict}")
             report += [f"## {sec['id']} - {table} : {verdict}", "", detail, ""]

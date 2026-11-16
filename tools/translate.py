@@ -883,11 +883,13 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             sec["status"] = status
             sec.pop("auto_retry", None)
-            if args.auto_retry:
-                sec["auto_retried"] = True  # un seul tour automatique
             if status == "ok":
                 # pour reconnaitre plus tard une correction faite a la main
                 sec["query_sha"] = query_sha(args.workdir / sec["id"] / "query.sql")
+                # reussie : un refus plus tard aura de nouveau droit a son tour
+                sec.pop("auto_retried", None)
+            elif args.auto_retry:
+                sec["auto_retried"] = True  # un seul tour automatique
             if status == "ok" and answers:
                 # On met en cache les reponses du modele aux expressions, mais
                 # marquees non verifiees tant qu'une comparaison avec Qlik ne

@@ -543,8 +543,20 @@ Parquet. A la retraduction, le modele recoit la liste des vraies colonnes
 que donne Spark et peut corriger le nom. Quand une table amont a ses
 colonnes deduites d'un autre script (`RESIDENT`, `STORE`), elles peuvent
 etre incompletes : la colonne introuvable est seulement signalee
-("non bloquant"). `fill_conf.py`, lance avec les vrais fichiers dans
-`data/`, remplit les schemas et rend ces colonnes sures.
+("non bloquant"). La regle est la meme pendant la traduction : une
+reponse du modele n'y est pas refusee pour une colonne que le controle
+accepterait. `fill_conf.py`, lance avec les vrais fichiers dans `data/`,
+remplit les schemas et rend ces colonnes sures.
+
+Si les colonnes d'une table lue sont inconnues (ni schema, ni fichier, ni
+script qui l'ecrit), Spark ne peut pas analyser la requete. Le controle le
+dit ("non analysee par Spark"), au lieu de laisser croire que la table est
+validee : ses erreurs n'apparaitront qu'au lancement du job, et ses types
+de sortie ne sont pas calcules.
+
+Un script dont une table n'est pas validee sort du job jusqu'a sa
+correction : le job ne garde pas une ancienne version de ses requetes. Le
+resume de `migrate.py` le signale ("retire du job").
 
 Une table bloquee ici perd ses reponses du modele non verifiees dans
 `work/expressions.json` : sans cela, la retraduction les lui redonnerait
@@ -575,7 +587,10 @@ de son fait.
 Chaque expression traduite par le modele y est enregistree comme non
 verifiee. Elle passe en verifiee quand la comparaison de sa table avec Qlik
 est identique : elle est alors reutilisee telle quelle, sans modele, dans
-les scripts suivants. Avant cela, elle est juste proposee au modele comme
+les scripts suivants. Une sortie que le job n'a pas reecrite (etape en
+echec) n'est pas comparee : elle date d'un lancement precedent. Une
+requete retouchee a la main depuis la traduction ne valide pas les
+reponses du modele. Avant cela, elle est juste proposee au modele comme
 piste. Le fichier se corrige a la main ; attention a ne pas le supprimer en
 vidant `work/`.
 

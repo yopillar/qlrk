@@ -84,8 +84,9 @@ def test_refused_table_is_retranslated_once(project: Project, tmp_path: Path) ->
         str(fake_opencode(tmp_path)),
     )
     done = table(mpath, sec["id"])
-    assert done["status"] == "ok" and done["auto_retried"]
-    assert "auto_retry" not in done
+    # reussie : un refus plus tard aura de nouveau droit a son tour
+    assert done["status"] == "ok"
+    assert "auto_retry" not in done and "auto_retried" not in done
     query = (project / "work/codes" / sec["id"] / "query.sql").read_text(
         encoding="utf-8"
     )
