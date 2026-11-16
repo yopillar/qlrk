@@ -417,10 +417,8 @@ relit avec ce format.
 
 ## Ce que le traducteur sait faire sans modele
 
-- **Les expressions** : `If`, `&`, arithmetique, comparaisons, `like`,
-  decalages de bits `>>` et `<<` (`shiftright`, `shiftleft` : Spark 3.5 n'a
-  pas les operateurs), texte (`Index` avec n-ieme occurrence, `SubField`,
-  `KeepChar`, `PurgeChar` meme avec une liste calculee...), dates
+- **Les expressions** : `If`, `&`, arithmetique, comparaisons, `like`, texte
+  (`Index` avec n-ieme occurrence, `SubField`, `KeepChar`...), dates
   (`Date#` avec conversion du format, `WeekYear`, `MakeDate`, `AddMonths`
   avec ses deux modes...), nombres, `IsNum`, `Match`, `WildMatch`, `Pick`,
   `RangeSum`, agregations.

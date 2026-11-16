@@ -229,7 +229,7 @@ TOKEN = re.compile(
   | (?P<num>\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)
   | (?P<field>\[[^\]]*\]|"[^"]*")
   | (?P<var>\$\()
-  | (?P<op><<|>>|<=|>=|<>|=|<|>|\+|-|\*|/|&|\(|\)|,)
+  | (?P<op><=|>=|<>|=|<|>|\+|-|\*|/|&|\(|\)|,)
   | (?P<word>[^\W\d][\w.#%@$]*|[%@#][\w.#%@$]*)
 """,
     re.X,
@@ -443,11 +443,11 @@ class ExprParser:
 
     def p_cmp(self) -> str:
         """Comparaisons et LIKE."""
-        left = self.p_shift()
+        left = self.p_concat()
         kind, v = self.peek()
         if kind == "op" and v in ("=", "<>", "<", ">", "<=", ">="):
             self.take()
-            right = self.p_shift()
+            right = self.p_concat()
             # date comparee a un texte : Qlik lit le texte comme une date
             if isinstance(left, DateSql) and isinstance(right, StrField):
                 right = parse_date(right, self.ctx)
@@ -470,22 +470,6 @@ class ExprParser:
             return Bool(f"(lower({as_value(left)}) LIKE lower({sql_string(pat)}))")
         if kind == "kw" and v in ("PRECEDES", "FOLLOWS"):
             raise Untranslatable(f"operateur {v}")
-        return left
-
-    def p_shift(self) -> str:
-        """Decalages de bits >> et <<, sur des entiers.
-
-        Spark 3.5 n'a pas les operateurs (ils arrivent en 4.0), seulement
-        shiftright et shiftleft.
-        """
-        left = self.p_concat()
-        while self.peek() in (("op", ">>"), ("op", "<<")):
-            func = "shiftright" if self.take()[1] == ">>" else "shiftleft"
-            right = self.p_concat()
-            left = (
-                f"{func}(CAST({as_value(left)} AS BIGINT), "
-                f"CAST({as_value(right)} AS INT))"
-            )
         return left
 
     def p_concat(self) -> str:
@@ -892,10 +876,6 @@ def _translate_function(
     if n in ("purgechar", "keepchar"):
         need(2)
         chars = literal(raw[1])
-        if chars is None and n == "purgechar":
-            # liste calculee : translate retire les caracteres de la liste
-            # qui n'ont pas de remplacant
-            return f"translate({a[0]}, {a[1]}, '')"
         if chars is None or chars == "":
             raise Untranslatable(f"{name} avec liste non litterale")
         neg = "^" if n == "keepchar" else ""
