@@ -66,3 +66,18 @@ def test_job_template_has_spark_submit() -> None:
     compile(code, "job_demo.py", "exec")
     head = code.split('"""')[1]
     assert "spark-submit" in head and "src/job_demo.py" in head
+
+
+def test_bit_shifts_without_spark4_operators() -> None:
+    """>> et << de Qlik : shiftright et shiftleft, Spark 3.5 n'a pas les
+    operateurs."""
+    assert expr("Code >> 2", ExprCtx()) == (
+        "shiftright(CAST(Code AS BIGINT), CAST(2 AS INT))"
+    )
+    assert expr("Code << 1", ExprCtx()).startswith("shiftleft(")
+
+
+def test_purgechar_with_computed_list() -> None:
+    """PurgeChar avec une liste calculee : translate, qui retire les
+    caracteres sans remplacant."""
+    assert expr("PurgeChar(Lib, Liste)", ExprCtx()) == "translate(Lib, Liste, '')"

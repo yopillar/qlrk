@@ -155,7 +155,10 @@ class SparkChecker:
             self.parser.parsePlan(sql)
             return None
         except Exception as exc:
-            return "syntaxe SQL : " + str(exc).splitlines()[0][:300]
+            # le message de Spark commence par une ligne vide : on prend la
+            # premiere qui dit quelque chose, sinon le modele n'a rien
+            lines = [x for x in str(exc).splitlines() if x.strip()]
+            return "syntaxe SQL : " + (lines[0] if lines else "")[:300]
 
     def analyze(self, section: dict, sql: str) -> str | None:
         """Erreur de l'analyse Spark sur des vues vides, ou None.

@@ -59,3 +59,11 @@ def test_no_library_stops_parquet_types(
     hide(monkeypatch, "pyarrow", "pyarrow.parquet", "pyspark", "pyspark.sql")
     with pytest.raises(SystemExit, match="pyarrow et pyspark absent"):
         fill_conf.parquet_types(tmp_path / "t.parquet")
+
+
+@pytest.mark.spark
+def test_syntax_error_says_what_is_wrong() -> None:
+    """Le message de Spark commence par une ligne vide : le controle garde la
+    premiere ligne utile, sinon le modele ne sait pas quoi corriger."""
+    error = check.get_parser().parse("SELECT (a FROM t")
+    assert error and "PARSE_SYNTAX_ERROR" in error
