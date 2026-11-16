@@ -14,6 +14,7 @@ l'une des deux rangee sous une cle columns, fields ou schema.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -182,6 +183,20 @@ def _stem(text: str) -> str:
 def io_key(text: str) -> str:
     """Cle de rapprochement d'un nom de fichier ou d'entree."""
     return re.sub(r"[\W_]+", "_", _stem(text), flags=re.ASCII).strip("_")
+
+
+def query_sha(path: Path) -> str:
+    """Empreinte d'une requete, pour savoir si elle a ete corrigee a la main.
+
+    Args:
+        path: le query.sql.
+
+    Returns:
+        Son empreinte, ou "" s'il n'existe pas.
+    """
+    if not path.exists():
+        return ""
+    return hashlib.sha1(path.read_bytes()).hexdigest()[:12]
 
 
 def missing_library(library: str, need: str) -> SystemExit:

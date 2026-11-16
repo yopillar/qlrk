@@ -2613,6 +2613,12 @@ def prepare(
         sec["draft_hash"] = draft_hash
         old = previous.get(sec["id"], {})
         unchanged = old.get("draft_hash") == draft_hash and (d / "query.sql").exists()
+        if todos:
+            # le brouillon avec ses trous : translate.py en repart quand il
+            # refait une table deja completee
+            (d / "draft.sql").write_text(sql, encoding="utf-8")
+        else:
+            (d / "draft.sql").unlink(missing_ok=True)
         if not todos:
             (d / "query.sql").write_text(sql, encoding="utf-8")
             (d / "prompt.md").unlink(missing_ok=True)
@@ -2620,6 +2626,12 @@ def prepare(
         elif unchanged and old.get("status") in ("ok", "escalade"):
             # deja completee et pas modifiee depuis
             sec["status"] = old["status"]
+            # ce que la traduction a laisse : les reponses du modele (que le
+            # controle retire du cache s'il refuse la table), l'empreinte de
+            # la requete et le tour automatique deja fait
+            for key in ("hole_answers", "query_sha", "auto_retried"):
+                if key in old:
+                    sec[key] = old[key]
         else:
             (d / "query.sql").write_text(sql, encoding="utf-8")
             statement_todos = [t for t in todos if "(expression h" not in t]

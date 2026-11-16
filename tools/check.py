@@ -35,7 +35,7 @@ if TYPE_CHECKING:  # pyspark est facultatif pour les controles statiques
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
-from conf import missing_library, work_dir  # noqa: E402
+from conf import missing_library, query_sha, work_dir  # noqa: E402
 from qlik2sql import FILE_VIEW_SUFFIX  # noqa: E402
 
 FORBIDDEN = (
@@ -623,6 +623,16 @@ def main(argv: list[str] | None = None) -> int:
             # La requete avait ete acceptee mais Spark la refuse. C'est souvent
             # un cas que le traducteur gere mal : on la repasse en escalade
             # avant qu'elle n'arrive dans le job.
+            # Completee par le modele et pas retouchee depuis : migrate.py la
+            # fera retraduire une fois. Une requete corrigee a la main, ou
+            # deja relancee, attend une correction.
+            query = args.workdir / sec["id"] / "query.sql"
+            if (
+                sec["status"] == "ok"
+                and sec.get("query_sha") == query_sha(query)
+                and not sec.get("auto_retried")
+            ):
+                sec["auto_retry"] = True
             sec["status"] = "escalade"
             sec.setdefault("todos", []).append("controle : " + errors[0][:200])
             changed = True

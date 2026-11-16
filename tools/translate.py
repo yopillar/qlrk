@@ -47,7 +47,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from check import SparkChecker, check_section, get_parser  # noqa: E402
-from conf import work_dir  # noqa: E402
+from conf import query_sha, work_dir  # noqa: E402
 from prepare import fill_holes, hole_key, load_cache  # noqa: E402
 
 # Le prompt est passe en argument d'opencode run, pas dans un fichier, donc le
@@ -770,6 +770,12 @@ def main(argv: list[str] | None = None) -> int:
         "--force", action="store_true", help="retraduire meme les sections deja ok"
     )
     p.add_argument(
+        "--auto-retry",
+        action="store_true",
+        help="retraduire, une fois, les tables que le controle vient de "
+        "refuser (utilise par migrate.py)",
+    )
+    p.add_argument(
         "--retry-escalated",
         action="store_true",
         help="retraduire aussi les sections en escalade (ecrase leur query.sql)",
@@ -823,6 +829,7 @@ def main(argv: list[str] | None = None) -> int:
             s["status"] in ("todo", "erreur_modele")
             or (args.retry_escalated and s["status"] == "escalade")
             or (args.force and s["status"] == "ok")
+            or (args.auto_retry and s["status"] == "escalade" and s.get("auto_retry"))
         )
     ]
     if args.limit:
@@ -854,6 +861,11 @@ def main(argv: list[str] | None = None) -> int:
 
     def work(sec: dict) -> tuple[dict, tuple[str, int, str, dict], int]:
         """Traduit une table et mesure le temps pris."""
+        draft = args.workdir / sec["id"] / "draft.sql"
+        if draft.exists() and not args.dry_run:
+            # on repart du brouillon et de ses trous : une requete deja
+            # completee n'a plus de trou ou mettre les nouvelles reponses
+            shutil.copyfile(draft, args.workdir / sec["id"] / "query.sql")
         t0 = time.perf_counter()
         result = translate_section(args.workdir, sec, args, parser)
         return sec, result, round(time.perf_counter() - t0)
@@ -870,6 +882,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.dry_run:
                 continue
             sec["status"] = status
+            sec.pop("auto_retry", None)
+            if args.auto_retry:
+                sec["auto_retried"] = True  # un seul tour automatique
+            if status == "ok":
+                # pour reconnaitre plus tard une correction faite a la main
+                sec["query_sha"] = query_sha(args.workdir / sec["id"] / "query.sql")
             if status == "ok" and answers:
                 # On met en cache les reponses du modele aux expressions, mais
                 # marquees non verifiees tant qu'une comparaison avec Qlik ne
