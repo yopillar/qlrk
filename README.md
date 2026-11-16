@@ -419,11 +419,6 @@ relit avec ce format.
   et les LOAD empiles.
 - **Les sources** : fichier, `RESIDENT`, `INLINE`, `SQL SELECT` simple et
   `AUTOGENERATE` (voir plus bas).
-- **Les colonnes d'un `INLINE`** sont typees comme Qlik les lit : que des
-  entiers donnent `BIGINT`, des nombres a point `DOUBLE`. Une valeur a zero
-  en tete (`007`, `01000`) ou une colonne mixte reste du texte. Laissees en
-  texte, elles faisaient passer en `string` la colonne a laquelle on les
-  ajoutait (`CONCATENATE`) et tout `ApplyMap` qui s'en servait.
 - **Tout ce qui depend de l'ordre de chargement** : `RowNo`, `RecNo`,
   `Previous`, `Peek` (champ simple, ou `Peek('f', n, 'T')` sur une autre
   table), `FirstValue`, `LastValue`, `NoOfRows`, et les mappings, qui gardent
@@ -525,10 +520,7 @@ un prompt de 2 000 a 45 000 tokens.
 
 Avant d'assembler un script, `migrate.py` fait analyser toutes ses requetes
 par Spark (`check.py --parse --mark`), sans donnees, sur des vues vides qui
-ont les bonnes colonnes. Une table lue par `RESIDENT` depuis une section
-precedente y garde les types que Spark a calcules pour elle : ce sont ceux
-qu'elle aura dans le job, et ceux que le script suivant recoit quand il
-relit la sortie. Une erreur certaine (syntaxe, `GROUP BY`,
+ont les bonnes colonnes. Une erreur certaine (syntaxe, `GROUP BY`,
 reference ambigue...) bloque la table avant le job. Une colonne introuvable
 est seulement signalee quand les colonnes de la table amont ont ete
 deduites du script, faute de schema.
@@ -687,16 +679,6 @@ pyspark, ils sont sautes.
 | `compare.py` | comparaison de deux tables |
 | `conf.py` | lecture de `conf/io.yml` et des schemas |
 | `journal.py` | tenue de `work/journal.csv` |
-
-Pour un type qui change d'un script a l'autre (BIGINT ecrit par le
-premier, STRING lu par le second), `diag_types.py`, a la racine, montre pour
-chaque entree de `conf/io.yml` sa forme (`from_output` ou sa propre
-location), les types de son schema, ceux vraiment stockes dans le Parquet,
-et les types que le controle utilise dans chaque script. Il ne modifie rien :
-
-```bash
-python diag_types.py sorties=data/output entrees=data/input
-```
 
 ## Limites connues
 

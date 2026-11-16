@@ -535,26 +535,12 @@ def main(argv: list[str] | None = None) -> int:
     mpath = args.workdir / "manifest.json"
     manifest = json.loads(mpath.read_text(encoding="utf-8"))
     failed, changed = 0, False
-    # Types surs des tables deja calculees (sections precedentes, ou deja
-    # controlees avant un --only) : une table lue par RESIDENT les garde.
-    # Sans eux, ses colonnes etaient toutes STRING dans le controle, et les
-    # types calcules pour la table suivante aussi.
-    known = {
-        s["table"]: s["output_types"]
-        for s in manifest["sections"]
-        if s.get("output_types") and s.get("output_types_sure")
-    }
     for sec in manifest["sections"]:
         if sec["status"] == "skip" or (args.only and sec["id"] != args.only):
             continue
-        for view in sec.get("views", {}).values():
-            if view.get("table") in known:
-                view["types"] = known[view["table"]]
         errors, warnings = check_section(
             sec, args.workdir / sec["id"] / "query.sql", parser
         )
-        if sec.get("output_types") and sec.get("output_types_sure"):
-            known[sec["table"]] = sec["output_types"]
         if (
             not errors
             and sec["status"] in ("escalade", "erreur_modele", "todo")

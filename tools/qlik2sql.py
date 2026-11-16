@@ -1358,46 +1358,8 @@ def inline_values(arg: str) -> tuple[list[str], list[list[str]]]:
     return header, data
 
 
-# Valeur d'INLINE que Qlik lit comme un nombre. Un zero en tete (007, 01000)
-# laisse la valeur en texte : c'est un code, on garde ses zeros.
-INLINE_INT = re.compile(r"-?(0|[1-9]\d{0,17})")
-INLINE_DOUBLE = re.compile(r"-?(0|[1-9]\d*)\.\d+")
-
-
-def inline_type(values: list[str]) -> str | None:
-    """Type d'une colonne d'INLINE d'apres ses valeurs, comme Qlik les lit.
-
-    Args:
-        values: les valeurs de la colonne.
-
-    Returns:
-        BIGINT si toutes sont des entiers, DOUBLE si ce sont des nombres a
-        point, None (texte) sinon, ou si la colonne est vide.
-    """
-    filled = [v for v in values if v != ""]
-    if not filled:
-        return None
-    if all(INLINE_INT.fullmatch(v) for v in filled):
-        return "BIGINT"
-    if all(INLINE_INT.fullmatch(v) or INLINE_DOUBLE.fullmatch(v) for v in filled):
-        return "DOUBLE"
-    return None
-
-
 def values_sql(header: list[str], data: list[list[str]]) -> str:
-    """Requete qui renvoie les lignes d'un INLINE.
-
-    Les colonnes de nombres sont converties : Qlik lit 99 comme un nombre.
-    Laissees en texte, elles passaient en STRING toute colonne a laquelle on
-    les ajoutait (CONCATENATE) et tout ApplyMap qui les utilisait.
-
-    Args:
-        header: les noms des colonnes.
-        data: les lignes, en texte.
-
-    Returns:
-        La requete.
-    """
+    """Requete qui renvoie les lignes d'un INLINE."""
     if not data:  # INLINE avec juste l'en-tete : table vide
         return (
             "SELECT "
@@ -1414,13 +1376,9 @@ def values_sql(header: list[str], data: list[list[str]]) -> str:
         for k, r in enumerate(data)
     )
     cols = ", ".join(ident(h) for h in header)
-    select = []
-    for k, h in enumerate(header):
-        t = inline_type([r[k] for r in data])
-        select.append(f"CAST({ident(h)} AS {t}) AS {ident(h)}" if t else ident(h))
     return (
-        f"SELECT {', '.join(select)}, array(CAST(__n AS BIGINT)) AS {ORD} "
-        f"FROM VALUES\n  {rows}\nAS t({cols}, __n)"
+        f"SELECT {cols}, array(CAST(__n AS BIGINT)) AS {ORD} FROM VALUES\n  "
+        f"{rows}\nAS t({cols}, __n)"
     )
 
 
