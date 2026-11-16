@@ -688,6 +688,16 @@ pyspark, ils sont sautes.
 | `conf.py` | lecture de `conf/io.yml` et des schemas |
 | `journal.py` | tenue de `work/journal.csv` |
 
+Pour un type qui change d'un script a l'autre (BIGINT ecrit par le
+premier, STRING lu par le second), `diag_types.py`, a la racine, montre pour
+chaque entree de `conf/io.yml` sa forme (`from_output` ou sa propre
+location), les types de son schema, ceux vraiment stockes dans le Parquet,
+et les types que le controle utilise dans chaque script. Il ne modifie rien :
+
+```bash
+python diag_types.py sorties=data/output entrees=data/input
+```
+
 ## Limites connues
 
 - **Ce qui reste au modele** : `Peek` recursif (cumuls), `FirstSortedValue`,
