@@ -172,6 +172,19 @@ def main(argv: list[str] | None = None) -> int:
         # bancale se voit ici, et pas au premier lancement du job.
         run("check.py", str(workdir), "--parse", "--mark")
         manifest = json.loads((workdir / "manifest.json").read_text(encoding="utf-8"))
+        retry = [s["id"] for s in manifest["sections"] if s.get("auto_retry")]
+        if retry:
+            # Tables completees par le modele que le controle refuse : une
+            # nouvelle traduction, une seule fois, avec l'erreur de Spark.
+            print(
+                f"\n{len(retry)} table(s) refusee(s) par le controle, "
+                f"retraduite(s) une fois : {', '.join(retry)}"
+            )
+            run("translate.py", str(workdir), "--auto-retry", *extra)
+            run("check.py", str(workdir), "--parse", "--mark")
+            manifest = json.loads(
+                (workdir / "manifest.json").read_text(encoding="utf-8")
+            )
         todo = sum(s["status"] == "todo" for s in manifest["sections"])
         to_fix = [
             s["id"]

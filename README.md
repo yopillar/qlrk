@@ -550,6 +550,14 @@ Une table bloquee ici perd ses reponses du modele non verifiees dans
 `work/expressions.json` : sans cela, la retraduction les lui redonnerait
 comme piste, et il risquerait de recopier sa reponse fausse.
 
+Si le modele l'avait completee et que personne n'a retouche sa requete
+depuis, `migrate.py` la fait retraduire tout de suite, une seule fois, en
+repartant du brouillon (`draft.sql`, avec ses trous) : le modele recoit
+l'erreur de Spark et peut se corriger. Si elle est encore refusee, elle
+reste en escalade et le resume la donne a corriger. Une table traduite
+sans modele, ou dont la requete a ete corrigee a la main (le kit garde
+l'empreinte de chaque requete qu'il ecrit), n'est jamais relancee.
+
 Le controle refuse aussi :
 - un prefixe `x.colonne` qui ne designe ni une CTE, ni une vue, ni un alias
   (le modele a deja ecrit `pos._qlik_order` pour un INLINE aliase `v(...)`) ;
@@ -609,9 +617,10 @@ la table passe en `erreur_modele` et sera reprise au prochain `migrate.py`.
 3. Relancer `migrate.py`, qui assemble et compare.
 4. Noter la cause dans la colonne `resolution` de `work/journal.csv`.
 
-Une table en `escalade` n'est jamais retraduite automatiquement, pour ne
-pas ecraser une correction manuelle (`translate.py --retry-escalated` pour
-la refaire expres).
+En dehors du tour automatique ci-dessus, une table en `escalade` n'est
+jamais retraduite, pour ne pas ecraser une correction manuelle.
+`translate.py --retry-escalated` la refait expres, en repartant du
+brouillon : la correction manuelle de sa `query.sql` est alors perdue.
 
 `check.py`, `translate.py`, `assemble.py` et `verify.py` prennent le
 dossier de travail d'un script (`work/ventes`), mais retrouvent aussi ce
