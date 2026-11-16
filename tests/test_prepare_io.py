@@ -68,3 +68,15 @@ def test_source_format_from_qlik_spec() -> None:
         "lib://s/a.xls", "biff, embedded labels, table is [Feuil 1$]"
     ) == ("xls", {"sheets": "[Feuil 1$]"})
     assert source_format("table_en_base") == (None, {})
+
+
+def test_input_columns_sure_only_with_schema(project: Project) -> None:
+    """Une entree decrite par conf/schema a des colonnes sures ; un CSV sans
+    schema non : le controle n'y bloquera pas une colonne introuvable."""
+    project.run("prepare.py", "script_qvd/ventes.qvs")
+    manifest = json.loads(
+        (project / "work/ventes/manifest.json").read_text(encoding="utf-8")
+    )
+    views = {v: p for s in manifest["sections"] for v, p in s.get("views", {}).items()}
+    assert views["in_ventes"]["columns_sure"] is True
+    assert views["in__ref__sites_2024_f901b7"]["columns_sure"] is False

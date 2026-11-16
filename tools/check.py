@@ -125,8 +125,58 @@ TYPE_ERRORS = (
     "BINARY_OP_DIFF_TYPES",
 )
 # Colonne introuvable : quand il n'y a pas de schema, les colonnes amont sont
-# deduites du script et peuvent etre incompletes. On le signale, sans bloquer.
+# deduites du script et peuvent etre incompletes. On le signale, sans bloquer,
+# sauf si toutes les colonnes lues sont sures (voir columns_sure).
 KNOWLEDGE_ERRORS = ("UNRESOLVED_COLUMN",)
+
+
+def columns_sure(section: dict) -> bool:
+    """Dit si toutes les colonnes que lit la table sont sures.
+
+    Elles le sont quand elles viennent d'un schema de conf/schema ou d'un
+    vrai fichier, pas d'un autre script (RESIDENT, STORE). Une colonne
+    introuvable est alors une vraie erreur, que le modele peut corriger
+    avec la liste que donne Spark.
+
+    Args:
+        section: la table, avec ses vues.
+
+    Returns:
+        True si chaque vue a des colonnes sures.
+    """
+    views = section.get("views", {}).values()
+    return bool(views) and all(v.get("columns_sure") for v in views)
+
+
+def cached_answers_dropped(cache_path: Path, section: dict) -> int:
+    """Retire de work/expressions.json les reponses non verifiees d'une table
+    que le controle refuse.
+
+    Sans cela, la retraduction redonne au modele sa reponse fausse comme
+    piste, et un modele faible la recopie.
+
+    Args:
+        cache_path: work/expressions.json.
+        section: la table refusee.
+
+    Returns:
+        Le nombre de reponses retirees.
+    """
+    if not cache_path.exists():
+        return 0
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    keys = [
+        k
+        for k in section.get("hole_answers", {})
+        if k in cache and not cache[k].get("verified")
+    ]
+    for k in keys:
+        del cache[k]
+    if keys:
+        cache_path.write_text(
+            json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    return len(keys)
 
 
 class SparkChecker:
@@ -558,7 +608,11 @@ def main(argv: list[str] | None = None) -> int:
         ):
             sec["status"] = "ok"  # corrigee a la main, et validee
             changed = True
-        sure = [e for e in errors if not any(k in e for k in KNOWLEDGE_ERRORS)]
+        sure = (
+            errors
+            if columns_sure(sec)
+            else [e for e in errors if not any(k in e for k in KNOWLEDGE_ERRORS)]
+        )
         if errors and not sure and args.mark:
             print(
                 f"[!] {sec['id']} : {errors[0][:160]} (colonnes amont deduites "
@@ -572,6 +626,14 @@ def main(argv: list[str] | None = None) -> int:
             sec["status"] = "escalade"
             sec.setdefault("todos", []).append("controle : " + errors[0][:200])
             changed = True
+            dropped = cached_answers_dropped(
+                args.workdir.parent / "expressions.json", sec
+            )
+            if dropped:
+                print(
+                    f"[!] {sec['id']} : {dropped} reponse(s) du modele retiree(s) "
+                    "de expressions.json"
+                )
             journal.update(
                 args.workdir.parent / "journal.csv",
                 {
