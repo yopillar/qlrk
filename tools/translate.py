@@ -302,27 +302,27 @@ def in_distrobox() -> bool:
 
     Returns:
         True si distrobox a pose sa variable ou son fichier de conteneur, et
-        que distrobox-host-exec est la pour lancer une commande sur l'hote.
+        que host-spawn est la pour lancer une commande sur l'hote.
     """
     inside = bool(os.environ.get("CONTAINER_ID")) or Path("/run/.containerenv").exists()
-    return inside and shutil.which("distrobox-host-exec") is not None
+    return inside and shutil.which("host-spawn") is not None
 
 
 def opencode_command(args: argparse.Namespace) -> list[str]:
     """Debut de la commande qui lance opencode.
 
     Le kit tourne dans la distrobox (pyspark, pyarrow), mais opencode est
-    installe sur l'hote : depuis la box, on passe par distrobox-host-exec.
+    installe sur l'hote : depuis la box, on passe par host-spawn.
 
     Args:
         args: les options de translate.py (--opencode-bin, --opencode-in-box).
 
     Returns:
-        [opencode] ou [distrobox-host-exec, opencode].
+        [opencode] ou [host-spawn, opencode].
     """
     if args.opencode_in_box or not in_distrobox():
         return [args.opencode_bin]
-    return ["distrobox-host-exec", args.opencode_bin]
+    return ["host-spawn", args.opencode_bin]
 
 
 def run_opencode(message: str, args: argparse.Namespace) -> tuple[bool, str, dict]:
@@ -337,7 +337,15 @@ def run_opencode(message: str, args: argparse.Namespace) -> tuple[bool, str, dic
         print("    $", " ".join(cmd[:-1]), repr(message[:80]) + "...")
         return True, "", {}
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
+        # stdin ferme : host-spawn n'ouvre pas de terminal, qui melangerait
+        # la sortie json et les erreurs
+        res = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=args.timeout,
+        )
     except subprocess.TimeoutExpired:
         return False, f"timeout apres {args.timeout}s", {}
     except OSError as exc:
@@ -775,8 +783,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--opencode-in-box",
         action="store_true",
-        help="opencode est installe dans la distrobox : ne pas passer par "
-        "distrobox-host-exec",
+        help="opencode est installe dans la distrobox : ne pas passer par host-spawn",
     )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument(

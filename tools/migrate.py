@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--opencode-in-box",
         action="store_true",
-        help="opencode est dans la distrobox : pas de distrobox-host-exec",
+        help="opencode est dans la distrobox : pas de host-spawn",
     )
     p.add_argument(
         "--skip-selftest",

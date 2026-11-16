@@ -19,11 +19,11 @@ def options(**kwargs: object) -> argparse.Namespace:
 
 
 def test_opencode_runs_on_host_from_distrobox(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Dans une distrobox, opencode passe par distrobox-host-exec, sauf si on
-    dit qu'il est installe dans la box."""
+    """Dans une distrobox, opencode passe par host-spawn, sauf si on dit
+    qu'il est installe dans la box."""
     monkeypatch.setenv("CONTAINER_ID", "box")
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
-    assert translate.opencode_command(options()) == ["distrobox-host-exec", "opencode"]
+    assert translate.opencode_command(options()) == ["host-spawn", "opencode"]
     assert translate.opencode_command(options(opencode_in_box=True)) == ["opencode"]
 
 

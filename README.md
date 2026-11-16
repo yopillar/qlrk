@@ -25,7 +25,7 @@ python src/job_<projet>.py                                # lancer le resultat
 Le kit se lance dans la distrobox, celle qui a pyspark et pyarrow : sans
 eux, il s'arrete au lieu de mettre toutes les colonnes en `string`.
 opencode, lui, reste installe sur l'hote : depuis la distrobox,
-`translate.py` le lance par `distrobox-host-exec`, sans rien a faire
+`translate.py` le lance par `host-spawn opencode`, sans rien a faire
 (`--opencode-in-box` s'il est installe dans la box). Le projet doit donc
 etre dans un dossier que la box partage avec l'hote, le home en general.
 
