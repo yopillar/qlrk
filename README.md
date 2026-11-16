@@ -25,12 +25,10 @@ python src/job_<projet>.py                                # lancer le resultat
 Le kit se lance dans la distrobox, celle qui a pyspark et pyarrow : sans
 eux, il s'arrete au lieu de mettre toutes les colonnes en `string`.
 opencode, lui, reste installe sur l'hote : depuis la distrobox,
-`translate.py` le lance par `host-spawn opencode`, sans rien a faire
-(`--opencode-in-box` s'il est installe dans la box). host-spawn ne
-transmet pas les variables du terminal : le kit lui passe celles que lit la
-conf d'opencode (`{env:NOM}`) et celles d'un modele (`*_API_KEY`,
-`*_BASE_URL`, `OPENCODE_*`...). Elles doivent donc etre definies dans la
-box aussi. Le projet doit donc
+`translate.py` le lance par `host-spawn`, sans rien a faire
+(`--opencode-in-box` s'il est installe dans la box). host-spawn ne reprend
+pas l'environnement du terminal : opencode est donc lance par le shell de
+l'hote, qui charge le profil (`bash -lic`), comme dans un terminal. Le projet doit donc
 etre dans un dossier que la box partage avec l'hote, le home en general.
 
 `migrate.py` est la seule commande a connaitre. Pour chaque script, il
