@@ -33,7 +33,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -296,9 +298,41 @@ def answer_sql(ok: bool, log: str, events: dict) -> tuple[str | None, str | None
     return answer, None, False
 
 
+def in_distrobox() -> bool:
+    """Dit si on tourne dans une distrobox.
+
+    Returns:
+        True si distrobox a pose sa variable ou son fichier de conteneur, et
+        que host-spawn est la pour lancer une commande sur l'hote.
+    """
+    inside = bool(os.environ.get("CONTAINER_ID")) or Path("/run/.containerenv").exists()
+    return inside and shutil.which("host-spawn") is not None
+
+
+def opencode_command(args: argparse.Namespace) -> list[str]:
+    """Debut de la commande qui lance opencode.
+
+    Le kit tourne dans la distrobox (pyspark, pyarrow), mais opencode est
+    installe sur l'hote : depuis la box, on passe par host-spawn. host-spawn
+    ne reprend pas l'environnement du terminal, et opencode plantait sur une
+    "unexpected server error" : on le lance donc par le shell de l'hote,
+    qui charge le profil (bash -lic), dans le dossier courant.
+
+    Args:
+        args: les options de translate.py (--opencode-bin, --opencode-in-box).
+
+    Returns:
+        [opencode] ou [host-spawn, bash, -lic, <script>, _, <dossier>].
+    """
+    if args.opencode_in_box or not in_distrobox():
+        return [args.opencode_bin]
+    script = f'cd "$1" && shift && exec {shlex.quote(args.opencode_bin)} "$@"'
+    return ["host-spawn", "bash", "-lic", script, "_", str(Path.cwd())]
+
+
 def run_opencode(message: str, args: argparse.Namespace) -> tuple[bool, str, dict]:
     """Fait un appel au modele. Renvoie (succes, sortie brute, evenements)."""
-    cmd = [args.opencode_bin, "run", "--agent", args.agent]
+    cmd = [*opencode_command(args), "run", "--agent", args.agent]
     if args.model:
         cmd += ["--model", args.model]
     if not args.text_output:
@@ -308,7 +342,15 @@ def run_opencode(message: str, args: argparse.Namespace) -> tuple[bool, str, dic
         print("    $", " ".join(cmd[:-1]), repr(message[:80]) + "...")
         return True, "", {}
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
+        # stdin ferme : host-spawn n'ouvre pas de terminal, qui melangerait
+        # la sortie json et les erreurs
+        res = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=args.timeout,
+        )
     except subprocess.TimeoutExpired:
         return False, f"timeout apres {args.timeout}s", {}
     except OSError as exc:
@@ -404,7 +446,8 @@ class Calls:
         (self.d / f"model_{self.n}.log").write_text(
             f"# Appel {self.n} - {round(time.perf_counter() - t0)}s, "
             f"code retour {'0' if ok else 'erreur'}\n"
-            f"# Commande : {self.args.opencode_bin} run --agent {self.args.agent}"
+            f"# Commande : {' '.join(opencode_command(self.args))} run "
+            f"--agent {self.args.agent}"
             f"{' --model ' + self.args.model if self.args.model else ''} <message>\n"
             + (f"# Note     : {note}\n" if note else "")
             + "\n## Message envoye\n\n"
@@ -742,6 +785,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", help="provider/model")
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument("--opencode-bin", default="opencode")
+    p.add_argument(
+        "--opencode-in-box",
+        action="store_true",
+        help="opencode est installe dans la distrobox : ne pas passer par host-spawn",
+    )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument(
         "--text-output",
@@ -780,8 +828,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.limit:
         todo = todo[: args.limit]
     print(f"{len(todo)} table(s) a completer par le modele")
-    if todo and not args.dry_run and not shutil.which(args.opencode_bin):
-        print(f"'{args.opencode_bin}' introuvable dans le PATH")
+    command = opencode_command(args)
+    if len(command) > 1:
+        print(f"distrobox : opencode lance sur l'hote ({' '.join(command)})")
+    # sur l'hote, c'est le selftest qui dira si opencode est introuvable
+    if todo and not args.dry_run and not shutil.which(command[0]):
+        print(f"'{command[0]}' introuvable dans le PATH")
         return 1
 
     if todo and not args.dry_run and not args.skip_selftest:

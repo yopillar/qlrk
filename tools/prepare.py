@@ -48,6 +48,7 @@ from conf import (  # noqa: E402
     find_scripts,
     resolve_location,
     safe_name,
+    writer_types,
 )
 from qlik2sql import (
     FEW_COLUMNS,
@@ -1541,20 +1542,24 @@ def file_stem(path: str) -> str:
 
 
 # Format Qlik (1er mot de la specification, sinon extension) -> format du
-# socle. Un QVD est suppose converti en Parquet, sous le meme nom.
+# socle. Un QVD est suppose converti en Parquet, sous le meme nom ; un
+# fichier Excel est lu tel quel.
 QLIK_FORMATS = {
     "txt": "csv",
     "csv": "csv",
     "tsv": "csv",
     "qvd": "parquet",
     "parquet": "parquet",
-    "ooxml": "excel",
-    "biff": "excel",
-    "xlsx": "excel",
-    "xls": "excel",
+    "ooxml": "xlsx",
+    "biff": "xls",
+    "xlsx": "xlsx",
+    "xls": "xls",
     "json": "json",
     "xml": "xml",
 }
+# Formats lus sous leur vrai nom de fichier, extension comprise.
+EXCEL_FORMATS = ("xlsx", "xls")
+KEEP_FILE_NAME = ("csv", *EXCEL_FORMATS)
 CODEPAGES = {
     "utf8": "UTF-8",
     "unicode": "UTF-16",
@@ -1571,9 +1576,12 @@ CODEPAGES = {
 def source_format(
     path: str, spec: str | None = None
 ) -> tuple[str | None, dict[str, str]]:
-    """Format d'un fichier lu par Qlik, et ses options de lecture CSV
-    (sep, header, encoding, quote) d'apres la specification Qlik :
+    """Format d'un fichier lu par Qlik, et ses options de lecture d'apres la
+    specification Qlik :
         (txt, codepage is 28591, embedded labels, delimiter is ';', msq)
+        donne pour un CSV sep, header, encoding, quote ;
+        (ooxml, embedded labels, table is Feuil1)
+        donne pour un fichier Excel la feuille lue, sheets ("*" : toutes).
     Renvoie (None, {}) si on ne sait pas."""
     # decoupage qui respecte les guillemets : delimiter is ','
     parts = split_top(spec or "")
@@ -1581,6 +1589,16 @@ def source_format(
     ext = Path(re.split(r"[\\/]", path)[-1]).suffix.lower()[1:]
     fmt = QLIK_FORMATS.get(words[0] if words else "") or QLIK_FORMATS.get(ext)
     options: dict[str, str] = {}
+    if fmt in EXCEL_FORMATS:
+        sheet = next(
+            (
+                unquote(p.strip()[m.end() :].strip())
+                for p in parts
+                if (m := re.match(r"table\s+is\s+", p.strip(), re.I))
+            ),
+            "*",
+        )
+        return fmt, {"sheets": sheet}
     if fmt != "csv":
         return fmt, options
     for orig in parts:
@@ -1673,10 +1691,10 @@ def resolve_io(
     if output:
         return f"{OUTPUT_DIR}/{file_stem(path)}", "parquet", None
     fmt, _ = source_format(path)
-    if fmt == "csv":
-        # un CSV se lit sous son vrai nom, extension comprise
+    if fmt in KEEP_FILE_NAME:
+        # un CSV ou un fichier Excel se lit sous son vrai nom, extension comprise
         name = re.split(r"[\\/]", path)[-1]
-        return f"{INPUT_DIR}/{name}", "csv", None
+        return f"{INPUT_DIR}/{name}", fmt, None
     return f"{INPUT_DIR}/{file_stem(path)}", fmt or "parquet", None
 
 
@@ -1757,6 +1775,14 @@ helper CTEs before them if needed (new names). Be concise.
    `ORDER BY _qlik_order` for Peek, Previous, FirstValue, LastValue.
 10. Wide tables: only the columns the Qlik code uses are listed. The others
    exist: keep them with `*` (or `alias.*`), never list or invent them.
+11. A prefix `x.col` must be a CTE, a view or an alias defined in the same
+   SELECT: never invent one such as `pos._qlik_order`. For an INLINE, number
+   the rows and build the array in the SELECT:
+   `SELECT c1, c2, array(CAST(__n AS BIGINT)) AS _qlik_order
+    FROM VALUES ('1', 'a', 0), ('2', 'b', 1) AS v(c1, c2, __n)`.
+12. Never use `monotonically_increasing_id()`: Spark refuses it in an
+   aggregate or a join, and it renumbers rows. Take `_qlik_order` from the
+   source instead.
 
 # Draft query (to complete)
 Already translated CTEs are summarised by their columns (`...`): you can
@@ -1859,6 +1885,229 @@ def fill_holes(sql: str, answers: dict[str, str]) -> str:
     return sql
 
 
+def unresolved_variables(insts: list[Inst]) -> list[str]:
+    """Variables $(v) restees telles quelles, hors variables systeme.
+
+    Args:
+        insts: les instructions.
+
+    Returns:
+        Leurs noms, tries.
+    """
+    found = {
+        m
+        for i in insts
+        for m in re.findall(r"\$\(#?([A-Za-z_][\w.]*)", strip_comments(i.text))
+    }
+    return sorted(found - SYSTEM_VARS)
+
+
+def find_global_settings(
+    insts: list[Inst],
+) -> list[tuple[int, str, set[str] | None]]:
+    """Reglages qui changent la facon dont les LOAD suivants chargent les
+    donnees : QUALIFY, NullAsValue, SET NullValue...
+
+    Args:
+        insts: les instructions executees.
+
+    Returns:
+        (numero d'instruction, texte, champs vises ou None pour tous).
+    """
+    found: list[tuple[int, str, set[str] | None]] = []
+    for k, i in enumerate(insts):
+        c = normalize(i.clean_text)
+        m = re.match(r"(UN)?QUALIFY\b|NULLASVALUE\b|NULLASNULL\b", c, re.I)
+        if m:
+            arg = c[m.end() :].strip().rstrip(";")
+            fields = None if arg == "*" else {strip_name(f) for f in split_top(arg)}
+            found.append((k, f"l.{i.stmt.first_line}: {c[:100]}", fields))
+        elif re.match(r"SET\s+(NullValue|NullInterpret)\b", c, re.I):
+            found.append((k, f"l.{i.stmt.first_line}: {c[:100]}", None))
+    return found
+
+
+def path_warnings(insts: list[Inst], stored: dict, conf: IoConf | None) -> list[str]:
+    """Fichiers douteux : lu sous le nom d'une sortie d'un autre script, ou
+    deux fichiers differents qui tombent sur le meme chemin.
+
+    Args:
+        insts: les instructions executees.
+        stored: les fichiers ecrits par un STORE (chemins et noms).
+        conf: conf/io.yml lu.
+
+    Returns:
+        Les remarques pour le rapport.
+    """
+    warnings = []
+    for i in insts:
+        for src in i.sources:
+            other = stored["names"].get(file_stem(src).lower())
+            if other and norm_path(src) not in stored["paths"]:
+                warnings.append(
+                    f"l.{i.stmt.first_line}: {src} lu dans data/output : meme "
+                    f"nom qu'une sortie de {other} (a verifier)"
+                )
+    by_dest: dict[str, set[str]] = {}
+    for i in insts:
+        written = [i.stored[1]] if i.stored else []
+        for path in i.sources + written:
+            dest = map_path(path, stored, conf, path in written)
+            by_dest.setdefault(dest, set()).add(norm_path(path))
+    for dest, paths in by_dest.items():
+        if len(paths) > 1:
+            warnings.append(f"COLLISION : {sorted(paths)} -> meme chemin {dest}")
+    return warnings
+
+
+def use_cache(
+    cache: dict, sql: str, short_sql: str, todos: list[str], holes: list[dict]
+) -> tuple[str, str, list[str], list[dict], int]:
+    """Remplit les trous dont l'expression a deja ete traduite et validee
+    ailleurs : pas besoin du modele pour eux. Une traduction pas encore
+    validee est seulement donnee comme piste (hint).
+
+    Args:
+        cache: work/expressions.json lu.
+        sql: la requete, avec ses trous.
+        short_sql: sa version condensee pour le prompt.
+        todos: ce qui reste a faire.
+        holes: les trous.
+
+    Returns:
+        (sql, short_sql, todos, trous restants, nombre de trous remplis).
+    """
+    known = {
+        h["id"]: cache[hole_key(h)]["sql"]
+        for h in holes
+        if cache.get(hole_key(h), {}).get("verified")
+    }
+    for h in holes:
+        if hole_key(h) in cache and h["id"] not in known:
+            h["hint"] = cache[hole_key(h)]["sql"]
+    if not known:
+        return sql, short_sql, todos, holes, 0
+    todos = [
+        t for t in todos if not any(t.endswith(f"(expression {k})") for k in known)
+    ]
+    holes = [h for h in holes if h["id"] not in known]
+    return (
+        fill_holes(sql, known),
+        fill_holes(short_sql, known),
+        todos,
+        holes,
+        len(known),
+    )
+
+
+def table_prompt(
+    sec: dict[str, Any],
+    sec_insts: list[Inst],
+    statement_todos: list[str],
+    short_sql: str,
+    insts: list[Inst],
+    tables: dict[str, dict[str, Any]],
+    schemas: dict[str, list[str]],
+    env: Env,
+    applicable: list[str],
+    skills_dir: Path,
+) -> str:
+    """Prompt du modele pour les instructions entieres a completer.
+
+    On ne lui montre que les instructions qui restent a traduire, avec les
+    skills et les mappings dont elles se servent.
+
+    Args:
+        sec: la section.
+        sec_insts: ses instructions.
+        statement_todos: les instructions laissees au modele.
+        short_sql: le brouillon condense.
+        insts: toutes les instructions du script (pour les mappings).
+        tables: les tables du graphe.
+        schemas: les colonnes connues de chaque table.
+        env: les variables du script.
+        applicable: les reglages globaux qui touchent la section.
+        skills_dir: les skills de .opencode/skills.
+
+    Returns:
+        Le texte du prompt.
+    """
+    todo_insts = [
+        i
+        for i in sec_insts
+        if any(t.startswith(f"l.{i.stmt.first_line} ") for t in statement_todos)
+    ] or prompt_insts(sec_insts)
+    constructs = set().union(*(i.constructs for i in todo_insts))
+    skill_names = sorted(
+        {SKILL_BY_CONSTRUCT[c] for c in constructs if c in SKILL_BY_CONSTRUCT}
+    )
+    skill_txt = "".join(
+        f"\n# Skill: {name}\n{load_skill(skills_dir, name)}\n"
+        for name in skill_names
+        if load_skill(skills_dir, name)
+    )
+    maps = {a["map"] for i in todo_insts for a in i.applymaps}
+    map_txt = "".join(
+        f"- Mapping `{m}` (do NOT create it: LEFT JOIN on its source, "
+        f"COALESCE with the default):\n```qlik\n"
+        f"{mapping_code([insts[k] for k in tables[m]['insts']])}\n```\n"
+        for m in sorted(maps)
+        if m in tables
+    )
+    return PROMPT.format(
+        draft=short_sql.rstrip(),
+        code=numbered(todo_insts),
+        facts=facts_block(sec, todo_insts, schemas, env, sec["views"], applicable),
+        mappings=("\n# Mappings used\n" + map_txt) if map_txt else "",
+        skills=skill_txt,
+    )
+
+
+def holes_prompt(holes: list[dict], sec_insts: list[Inst], skills_dir: Path) -> str:
+    """Prompt du modele pour les trous d'expression : une question par
+    expression, avec l'instruction Qlik qui la contient.
+
+    Args:
+        holes: les trous de la section.
+        sec_insts: ses instructions.
+        skills_dir: les skills de .opencode/skills.
+
+    Returns:
+        Le texte du prompt.
+    """
+    by_line = {i.stmt.first_line: i for i in sec_insts}
+    by_statement: dict[int, list[dict]] = {}
+    for h in holes:
+        by_statement.setdefault(h["line"], []).append(h)
+    blocks = []
+    for line, hs in by_statement.items():
+        code = numbered([by_line[line]]) if line in by_line else ""
+        if len(code) > 3000 and not any(
+            re.search(r"\b(peek|previous|above)\b", h["qlik"], re.I) for h in hs
+        ):
+            # LOAD enorme : on ne garde que les lignes des expressions
+            first = code.splitlines()[:2]
+            keep = [
+                ln
+                for ln in code.splitlines()
+                if any(h["qlik"].splitlines()[0].strip()[:40] in ln for h in hs)
+            ]
+            code = "\n".join(first + ["  ..."] + keep)
+        blocks.append(
+            f"## Qlik statement l.{line}\n```qlik\n{code}"
+            "\n```\n\n" + "\n\n".join(hole_block(h) for h in hs)
+        )
+    row = any(
+        re.search(r"\b(peek|previous|above|firstsortedvalue)\b", h["qlik"], re.I)
+        for h in holes
+    )
+    skill = load_skill(skills_dir, "qlik-row-functions-sql") if row else ""
+    return HOLE_PROMPT.format(
+        holes="\n\n".join(blocks),
+        skills=f"\n# Skill: qlik-row-functions-sql\n{skill}\n" if skill else "",
+    )
+
+
 def facts_block(
     sec: dict,
     insts: list[Inst],
@@ -1944,14 +2193,7 @@ def facts_block(
                 "SELECT, written by the tool, lists them: keep the "
                 "columns you do not compute with `*`."
             )
-    unresolved = sorted(
-        {
-            m
-            for i in insts
-            for m in re.findall(r"\$\(#?([A-Za-z_][\w.]*)", strip_comments(i.text))
-        }
-        - SYSTEM_VARS
-    )
+    unresolved = unresolved_variables(insts)
     for name in unresolved:
         if name in env.lets:
             hint = f"LET {name} = {env.lets[name]}"
@@ -2080,6 +2322,32 @@ def load_cache(out_root: Path) -> dict:
     return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
 
 
+def upstream_tables(
+    g: str, names: list[str], tables: dict[str, dict[str, Any]], groups: dict
+) -> list[str]:
+    """Tables d'autres sections que la section lit, en passant par les
+    mappings (un mapping n'a pas de vue : on lit ce qu'il lit).
+
+    Args:
+        g: la table livree par la section.
+        names: les tables de la section.
+        tables: les tables du graphe.
+        groups: les tables de chaque section.
+
+    Returns:
+        Les tables amont, triees.
+    """
+    deps = {d for n in names for d in tables[n]["deps"]}
+    for d in list(deps):
+        if tables.get(d, {}).get("mapping"):
+            deps |= tables[d]["deps"]
+    return sorted(
+        d
+        for d in deps
+        if owner_of(d, groups) != g and not tables.get(d, {}).get("mapping")
+    )
+
+
 def prepare(
     script: Path,
     out_root: Path,
@@ -2106,20 +2374,7 @@ def prepare(
     for i in insts:
         i.clean_text = strip_comments(i.text)
 
-    # reglages qui changent la facon dont les LOAD suivants chargent les
-    # donnees
-    global_settings = []  # (no d'instruction, texte, champs ou None)
-    for k, i in enumerate(insts):
-        c = normalize(i.clean_text)
-        m = re.match(r"(UN)?QUALIFY\b|NULLASVALUE\b|NULLASNULL\b", c, re.I)
-        if m:
-            arg = c[m.end() :].strip().rstrip(";")
-            fields = (
-                None if arg.strip() == "*" else {strip_name(f) for f in split_top(arg)}
-            )
-            global_settings.append((k, f"l.{i.stmt.first_line}: {c[:100]}", fields))
-        elif re.match(r"SET\s+(NullValue|NullInterpret)\b", c, re.I):
-            global_settings.append((k, f"l.{i.stmt.first_line}: {c[:100]}", None))
+    global_settings = find_global_settings(insts)
     for _, txt, _ in global_settings:
         notes.append(f"REGLAGE GLOBAL a reproduire : {txt}")
     for name in sorted(set(SKILL_BY_CONSTRUCT.values())):
@@ -2135,27 +2390,7 @@ def prepare(
         | project_stores["paths"],
         "names": project_stores["names"],
     }
-    for i in insts:
-        for src in i.sources:
-            other = stored["names"].get(file_stem(src).lower())
-            if other and norm_path(src) not in stored["paths"]:
-                notes.append(
-                    f"l.{i.stmt.first_line}: {src} lu dans "
-                    f"data/output : meme nom qu'une sortie de "
-                    f"{other} (a verifier)"
-                )
-    by_name: dict[str, set[str]] = {}
-    for i in insts:
-        for path in i.sources + ([i.stored[1]] if i.stored else []):
-            by_name.setdefault(
-                map_path(
-                    path, stored, conf, path in ([i.stored[1]] if i.stored else [])
-                ),
-                set(),
-            ).add(norm_path(path))
-    for dest, paths in by_name.items():
-        if len(paths) > 1:
-            notes.append(f"COLLISION : {sorted(paths)} -> meme chemin {dest}")
+    notes.extend(path_warnings(insts, stored, conf))
 
     base = out_root / script.stem
     base.mkdir(parents=True, exist_ok=True)
@@ -2203,8 +2438,15 @@ def prepare(
             "io": entry.name if entry else None,
             "columns": file_schema(path),
         }
-        if entry and entry.types:
-            inputs[view]["types"] = entry.types
+        types = entry.types if entry else {}
+        writer = project_stores["names"].get(file_stem(path).lower())
+        if entry and entry.from_output and writer:
+            # Relu depuis une sortie : les types de la requete qui l'ecrit.
+            # S'ils ne sont pas surs, un STRING peut n'etre qu'un defaut.
+            found, sure = writer_types(path, writer) or ({}, False)
+            types = {c: t for c, t in found.items() if sure or t != "STRING"}
+        if types:
+            inputs[view]["types"] = types
         return view
 
     def file_schema(path: str) -> list[str] | None:
@@ -2224,49 +2466,22 @@ def prepare(
         ks = sorted(k for k, sg in sec_of.items() if sg == g)
         sec_insts = [insts[k] for k in ks]
         names = [] if g == "__init__" else groups[g]
-        kind = (
-            "init"
-            if g == "__init__"
-            else "mapping"
-            if tables[g]["mapping"]
-            else "final"
-            if g in finals
-            else "shared"
-        )
-        constructs = (
-            set().union(*(i.constructs for i in sec_insts)) if sec_insts else set()
-        )
-        if len([n for n in names if not tables[n]["mapping"]]) > 1:
-            constructs.add("resident_chain")
-        outputs, output_formats, output_io, store_flags = {}, {}, {}, []
+        outputs, output_io = {}, {}
         for n in names:
             for _, path, _fmt, _fields in tables[n]["stored"]:
-                if n == g:
-                    location, out_fmt, entry = resolve_io(
-                        path, stored, conf, store=True
+                if n != g:
+                    notes.append(
+                        f"STORE de la table intermediaire {n} vers {path} : "
+                        "non gere, a traiter a la main"
                     )
-                    if conf and conf.enabled and entry is None:
-                        missing_conf.add(f"sortie {file_stem(path)}")
-                    outputs[n], output_formats[n] = location, out_fmt
-                    # nom de la sortie dans conf/io.yml, pour write_output()
-                    output_io[n] = entry.name if entry else None
-                else:
-                    store_flags.append(
-                        f"STORE de la table intermediaire {n} "
-                        f"vers {path} : non gere, a traiter "
-                        "a la main"
-                    )
-        dep_candidates = {d for n in names for d in tables[n]["deps"]}
-        for d in list(dep_candidates):
-            if tables.get(d, {}).get("mapping"):
-                dep_candidates |= tables[d]["deps"]
-        deps_tables = sorted(
-            {
-                d
-                for d in dep_candidates
-                if owner_of(d, groups) != g and not tables.get(d, {}).get("mapping")
-            }
-        )
+                    continue
+                location, _, entry = resolve_io(path, stored, conf, store=True)
+                if conf and conf.enabled and entry is None:
+                    missing_conf.add(f"sortie {file_stem(path)}")
+                outputs[n] = location
+                # nom de la sortie dans conf/io.yml, pour write_output()
+                output_io[n] = entry.name if entry else None
+        deps_tables = upstream_tables(g, names, tables, groups)
         cols_here = {f for n in names for f in schemas.get(n, [])}
         applicable = [
             txt
@@ -2275,18 +2490,14 @@ def prepare(
         ]
         sec: dict[str, Any] = {
             "id": ids[g],
-            "kind": kind,
             "table": None if g == "__init__" else g,
             "view": table_views.get(g),
             "tables": names,
             "lines": [sec_insts[0].stmt.first_line, sec_insts[-1].stmt.last_line]
             if sec_insts
             else None,
-            "depends_on_tables": deps_tables,
             "outputs": outputs,
-            "output_formats": output_formats,
             "output_io": output_io,
-            "constructs": sorted(c for c in constructs if ":" not in c),
             "statement_lines": sorted(
                 {
                     i.stmt.first_line
@@ -2295,16 +2506,13 @@ def prepare(
                     and "mapping" not in i.constructs
                 }
             ),
-            "flags": sorted(
-                {f"l.{i.stmt.first_line}: {w}" for i in sec_insts for w in i.warnings}
-            )
-            + store_flags,
             "status": "todo",
         }
         d = base / sec["id"]
         d.mkdir(exist_ok=True)
         (d / "source.qvs").write_text(numbered(sec_insts) + "\n", encoding="utf-8")
-        if kind in ("init", "mapping"):
+        # l'init (SET, LET...) et les mappings n'ont pas de requete a eux
+        if g == "__init__" or tables[g]["mapping"]:
             sec["status"] = "skip"
             sections.append(sec)
             continue
@@ -2356,26 +2564,11 @@ def prepare(
         # designe la meme donnee partout.
         for c_, t_ in derived.items():
             conf_types.setdefault(c_, t_)
-        # expression deja traduite et validee ailleurs : pas besoin du modele
-        known = {
-            h["id"]: cache[hole_key(h)]["sql"]
-            for h in holes
-            if cache.get(hole_key(h), {}).get("verified")
-        }
-        for h in holes:
-            if hole_key(h) in cache and h["id"] not in known:
-                # simple piste, pas encore verifiee
-                h["hint"] = cache[hole_key(h)]["sql"]
-        if known:
-            sql = fill_holes(sql, known)
-            short_sql = fill_holes(short_sql, known)
-            todos = [
-                t
-                for t in todos
-                if not any(t.endswith(f"(expression {k})") for k in known)
-            ]
-            holes = [h for h in holes if h["id"] not in known]
-            sec["from_cache"] = len(known)
+        sql, short_sql, todos, holes, from_cache = use_cache(
+            cache, sql, short_sql, todos, holes
+        )
+        if from_cache:
+            sec["from_cache"] = from_cache
         col_types: dict[str, str] = {}
         for v in inputs.values():
             col_types.update(v.get("types") or {})
@@ -2418,36 +2611,17 @@ def prepare(
         else:
             (d / "query.sql").write_text(sql, encoding="utf-8")
             statement_todos = [t for t in todos if "(expression h" not in t]
-            todo_insts = [
-                i
-                for i in sec_insts
-                if any(t.startswith(f"l.{i.stmt.first_line} ") for t in statement_todos)
-            ] or prompt_insts(sec_insts)
-            tc = set().union(*(i.constructs for i in todo_insts))
-            skill_names = sorted(
-                {SKILL_BY_CONSTRUCT[c] for c in tc if c in SKILL_BY_CONSTRUCT}
-            )
-            skill_txt = "".join(
-                f"\n# Skill: {s_}\n{load_skill(skills_dir, s_)}\n"
-                for s_ in skill_names
-                if load_skill(skills_dir, s_)
-            )
-            maps = {a["map"] for i in todo_insts for a in i.applymaps}
-            map_txt = "".join(
-                f"- Mapping `{m}` (do NOT create it: LEFT JOIN on its source, "
-                f"COALESCE with the default):\n```qlik\n"
-                f"{mapping_code([insts[k] for k in tables[m]['insts']])}\n```\n"
-                for m in sorted(maps)
-                if m in tables
-            )
-            prompt = PROMPT.format(
-                draft=short_sql.rstrip(),
-                code=numbered(todo_insts),
-                facts=facts_block(
-                    sec, todo_insts, schemas, env, sec["views"], applicable
-                ),
-                mappings=("\n# Mappings used\n" + map_txt) if map_txt else "",
-                skills=skill_txt,
+            prompt = table_prompt(
+                sec,
+                sec_insts,
+                statement_todos,
+                short_sql,
+                insts,
+                tables,
+                schemas,
+                env,
+                applicable,
+                skills_dir,
             )
             # prompt.md, pour les instructions entieres a completer. Pour une
             # table qui n'a que des trous d'expression, il sert de dernier
@@ -2457,46 +2631,7 @@ def prepare(
             sec["prompt_tokens"] = len(prompt) // 4 if statement_todos else 0
             (d / "draft_condensed.sql").write_text(short_sql, encoding="utf-8")
             if holes:
-                by_line = {i.stmt.first_line: i for i in sec_insts}
-                hole_groups: dict[int, list[dict]] = {}
-                for h in holes:
-                    hole_groups.setdefault(h["line"], []).append(h)
-                blocks = []
-                for line, hs in hole_groups.items():
-                    code = numbered([by_line[line]]) if line in by_line else ""
-                    if len(code) > 3000 and not any(
-                        re.search(r"\b(peek|previous|above)\b", h["qlik"], re.I)
-                        for h in hs
-                    ):
-                        # LOAD enorme : on ne garde que les lignes qui
-                        # contiennent les expressions
-                        first = code.splitlines()[:2]
-                        keep = [
-                            ln
-                            for ln in code.splitlines()
-                            if any(
-                                h["qlik"].splitlines()[0].strip()[:40] in ln for h in hs
-                            )
-                        ]
-                        code = "\n".join(first + ["  ..."] + keep)
-                    blocks.append(
-                        f"## Qlik statement l.{line}\n```qlik\n{code}"
-                        "\n```\n\n" + "\n\n".join(hole_block(h) for h in hs)
-                    )
-                hole_txt = "\n\n".join(blocks)
-                row = any(
-                    re.search(
-                        r"\b(peek|previous|above|firstsortedvalue)\b", h["qlik"], re.I
-                    )
-                    for h in holes
-                )
-                skill = load_skill(skills_dir, "qlik-row-functions-sql") if row else ""
-                hprompt = HOLE_PROMPT.format(
-                    holes=hole_txt,
-                    skills=f"\n# Skill: qlik-row-functions-sql\n{skill}\n"
-                    if skill
-                    else "",
-                )
+                hprompt = holes_prompt(holes, sec_insts, skills_dir)
                 (d / "holes_prompt.md").write_text(hprompt, encoding="utf-8")
                 sec["prompt_tokens"] += len(hprompt) // 4
             else:
@@ -2504,10 +2639,10 @@ def prepare(
             sec["status"] = "todo"
         sections.append(sec)
 
+    # avertissements de l'analyse (auto-concatenation, cle de jointure
+    # incalculable, STORE non rattache...) : ils vont dans le rapport
     for i in insts:
-        for w in i.warnings:
-            if w.startswith("STORE "):
-                notes.append(f"l.{i.stmt.first_line}: {w}")
+        notes.extend(f"l.{i.stmt.first_line}: {w}" for w in i.warnings)
     if missing_conf:
         notes.append(
             "absents de conf/io.yml, a y declarer avant d'assembler "
@@ -2515,14 +2650,7 @@ def prepare(
             "migrate.py les ajoute, sauf avec --no-conf) : "
             + ", ".join(sorted(missing_conf))
         )
-    unresolved = sorted(
-        {
-            m
-            for i in insts
-            for m in re.findall(r"\$\(#?([A-Za-z_][\w.]*)", strip_comments(i.text))
-        }
-        - SYSTEM_VARS
-    )
+    unresolved = unresolved_variables(insts)
     # Les formats de date servent aussi a verify.py : un export Qlik en CSV
     # ecrit les dates dans le DateFormat du script, pas en ISO.
     manifest = {
@@ -2547,11 +2675,17 @@ def _known(cols: list[str] | None) -> list[str] | None:
 
 def parquet_columns(path: str) -> list[str] | None:
     """Colonnes d'un Parquet deja present dans data/, ou None. Ca permet de
-    traduire les "LOAD * FROM fichier" et de calculer leurs cles."""
-    try:
-        import pyarrow.parquet as pq
-    except ImportError:
-        return None
+    traduire les "LOAD * FROM fichier" et de calculer leurs cles.
+
+    Args:
+        path: le chemin du fichier ou du dossier, avec ou sans joker.
+
+    Returns:
+        Les colonnes, ou None si aucun Parquet n'est la. Sans pyarrow ni
+        pyspark, on s'arrete au lieu de continuer sans les colonnes.
+    """
+    from fill_conf import parquet_types  # fill_conf importe ce module
+
     folder, _, name = path.rpartition("/")
     candidates = (
         sorted(Path(folder).glob(name))
@@ -2562,8 +2696,8 @@ def parquet_columns(path: str) -> list[str] | None:
         files = [c] if c.is_file() else sorted(c.rglob("*.parquet"))
         if files:
             try:
-                return list(pq.read_schema(files[0]).names)
-            except Exception:
+                return list(parquet_types(files[0]))
+            except Exception:  # fichier illisible ; SystemExit passe
                 return None
     return None
 

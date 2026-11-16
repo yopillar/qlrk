@@ -31,6 +31,10 @@ if TYPE_CHECKING:
 # existantes et 1 devant les nouvelles, sans renumeroter toute la table.
 ORD = "_qlik_order"
 
+# Vue creee par read_input a cote de chaque entree <vue> : <vue>__file, une
+# ligne, file_time = date de modification du fichier (FileTime() de Qlik).
+FILE_VIEW_SUFFIX = "__file"
+
 
 # Au-dela de ce nombre de colonnes, les prompts ne listent que celles que le
 # code Qlik utilise. Une table de 300 colonnes, repetee dans les faits, le
@@ -309,6 +313,7 @@ class ExprCtx:
     output_field: Callable[..., Any] | None = None
     peek_table: Callable[..., Any] | None = None  # Peek('f', n, 'T')
     noofrows: Callable[..., Any] | None = None  # NoOfRows('T')
+    file_time: Callable[..., Any] | None = None  # FileTime() / FileTime('f')
     aggregate_used: bool = False  # Sum/Min/Max... dans le LOAD
     fieldvalue: str | None = None  # champ lu par FieldValue()
     technical: bool = False  # AutoNumber/Hash utilises
@@ -743,7 +748,7 @@ def translate_function(
             return TsSql(sql)
         if t in DATE_TYPES:
             return DateSql(sql)
-    if n in ("timestamp", "timestamp#", "now"):
+    if n in ("timestamp", "timestamp#", "now", "filetime"):
         return TsSql(sql)
     if n in (
         "date",
@@ -913,6 +918,14 @@ def _translate_function(
         return f"CAST({a[0]} AS TIMESTAMP)"
     if n in ("today", "now"):
         return "current_date()" if n == "today" else "current_timestamp()"
+    if n == "filetime":
+        need(0, 1)
+        path = literal(raw[0]) if k else None
+        if k and path is None:
+            raise Untranslatable("FileTime() avec un chemin non litteral")
+        if ctx.file_time is None:
+            raise Untranslatable("FileTime() hors d'un LOAD ... FROM fichier")
+        return str(ctx.file_time(path))
     if n == "month":
         need(1)
         # [!] en Qlik c'est une valeur duale (texte + nombre)
@@ -1111,9 +1124,9 @@ def _translate_function(
             return ctx.recno
         if ctx.in_where:
             raise Untranslatable(f"{name}() dans un WHERE")
-        # ordre du LOAD ... ORDER BY s'il y en a un, sinon ordre de lecture du
-        # fichier
-        order = ctx.order_by or "monotonically_increasing_id()"
+        # ordre du LOAD ... ORDER BY s'il y en a un, sinon ordre de
+        # chargement de la source
+        order = ctx.order_by or ORD
         return f"row_number() OVER (ORDER BY {order})"
     if n == "fieldvalue":
         need(2)
@@ -1345,21 +1358,69 @@ def inline_values(arg: str) -> tuple[list[str], list[list[str]]]:
     return header, data
 
 
+# Valeur d'INLINE que Qlik lit comme un nombre. Un zero en tete (007, 01000)
+# laisse la valeur en texte : c'est un code, on garde ses zeros.
+INLINE_INT = re.compile(r"-?(0|[1-9]\d{0,17})")
+INLINE_DOUBLE = re.compile(r"-?(0|[1-9]\d*)\.\d+")
+
+
+def inline_type(values: list[str]) -> str | None:
+    """Type d'une colonne d'INLINE d'apres ses valeurs, comme Qlik les lit.
+
+    Args:
+        values: les valeurs de la colonne.
+
+    Returns:
+        BIGINT si toutes sont des entiers, DOUBLE si ce sont des nombres a
+        point, None (texte) sinon, ou si la colonne est vide.
+    """
+    filled = [v for v in values if v != ""]
+    if not filled:
+        return None
+    if all(INLINE_INT.fullmatch(v) for v in filled):
+        return "BIGINT"
+    if all(INLINE_INT.fullmatch(v) or INLINE_DOUBLE.fullmatch(v) for v in filled):
+        return "DOUBLE"
+    return None
+
+
 def values_sql(header: list[str], data: list[list[str]]) -> str:
-    """Requete qui renvoie les lignes d'un INLINE."""
+    """Requete qui renvoie les lignes d'un INLINE.
+
+    Les colonnes de nombres sont converties : Qlik lit 99 comme un nombre.
+    Laissees en texte, elles passaient en STRING toute colonne a laquelle on
+    les ajoutait (CONCATENATE) et tout ApplyMap qui les utilisait.
+
+    Args:
+        header: les noms des colonnes.
+        data: les lignes, en texte.
+
+    Returns:
+        La requete.
+    """
     if not data:  # INLINE avec juste l'en-tete : table vide
         return (
             "SELECT "
             + ", ".join(f"CAST(NULL AS STRING) AS {ident(h)}" for h in header)
             + f", CAST(NULL AS ARRAY<BIGINT>) AS {ORD} WHERE false"
         )
-    rows = ",\n    ".join("(" + ", ".join(sql_string(v) for v in r) + ")" for r in data)
+    # L'ordre de chargement est ecrit en dur sur chaque ligne : on le connait
+    # deja. monotonically_increasing_id() ne convient pas : Spark le refuse
+    # dans un agregat ou une jointure, et peut le recalculer autrement.
+    # Juste un numero sur chaque ligne du VALUES, aucune fonction : l'array
+    # est construit dans le SELECT.
+    rows = ",\n  ".join(
+        "(" + ", ".join([sql_string(v) for v in r] + [str(k)]) + ")"
+        for k, r in enumerate(data)
+    )
     cols = ", ".join(ident(h) for h in header)
-    # VALUES tient sur une seule partition, donc l'identifiant suit l'ordre des
-    # lignes tel qu'il est ecrit.
+    select = []
+    for k, h in enumerate(header):
+        t = inline_type([r[k] for r in data])
+        select.append(f"CAST({ident(h)} AS {t}) AS {ident(h)}" if t else ident(h))
     return (
-        f"SELECT *, array(monotonically_increasing_id()) AS {ORD} FROM VALUES\n  "
-        f"{rows.replace(chr(10) + '    ', chr(10) + '  ')}\nAS t({cols})"
+        f"SELECT {', '.join(select)}, array(CAST(__n AS BIGINT)) AS {ORD} "
+        f"FROM VALUES\n  {rows}\nAS t({cols}, __n)"
     )
 
 
@@ -1420,6 +1481,7 @@ class SectionTranslator:
         self.dedup_field: str | None = None
         self.current_where: str | None = None
         # poses par load() pour l'instruction en cours
+        self.current_file: str | None = None  # fichier du LOAD ... FROM
         self.current_inst: Inst
         self.current_fields: list[tuple[str, str | None]]
         self.in_where: bool
@@ -1760,8 +1822,36 @@ class SectionTranslator:
         ectx = ExprCtx(q, applymap, self.ctx.date_format, self.ctx.timestamp_format)
         ectx.peek_table = self.peek_table_sql
         ectx.noofrows = self.noofrows_sql
+        ectx.file_time = self.file_time_sql
         ectx.column_types = {**self.derived_types, **self.ctx.column_types}
         return ectx
+
+    def file_time_sql(self, path: str | None) -> str:
+        """FileTime() : date de modification du fichier lu par le LOAD.
+
+        read_input la met dans la vue <entree>__file. FileTime('f') n'est
+        traduit que si f est le fichier du LOAD : un autre fichier n'est
+        peut-etre declare nulle part dans conf/io.yml.
+
+        Args:
+            path: le fichier donne a FileTime, ou None.
+
+        Returns:
+            Une sous-requete qui renvoie le TIMESTAMP.
+        """
+        if self.current_file is None:
+            raise Untranslatable("FileTime() hors d'un LOAD ... FROM fichier")
+
+        def stem(p: str) -> str:
+            """Nom du fichier, sans dossier, extension ni casse."""
+            return re.split(r"[\\/]", p)[-1].rsplit(".", 1)[0].lower()
+
+        if path is not None and stem(path) != stem(self.current_file):
+            raise Untranslatable(
+                f"FileTime('{path}') : autre fichier que celui du LOAD"
+            )
+        view = self.ctx.input_view(self.current_file)
+        return f"(SELECT file_time FROM {view}{FILE_VIEW_SUFFIX})"
 
     def table_ref(self, name: str) -> str:
         """CTE ou vue de la table lue par Peek ou NoOfRows."""
@@ -2052,6 +2142,7 @@ class SectionTranslator:
         """LOAD, avec ses LOAD empiles, JOIN, KEEP ou CONCATENATE."""
         segs, sql_text, first = split_statement(text)
         self.current_inst = inst
+        self.current_file = inst.sources[0] if len(inst.sources) == 1 else None
         self.current_fields = [f for sg in segs for f in sg.fields]
         self.current_where, self.in_where = None, False
         self.autogen_bottom, self.autogen_field = None, None

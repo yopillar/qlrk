@@ -62,7 +62,7 @@ def test_job_template_has_spark_submit() -> None:
     """Le job genere compile et rappelle la commande spark-submit."""
     from job_template import render_job
 
-    code = render_job("demo", [("ventes", []), ("synthese", ["ventes"])])
-    compile(code, "job.py", "exec")
+    code = render_job("demo")
+    compile(code, "job_demo.py", "exec")
     head = code.split('"""')[1]
-    assert "spark-submit" in head and "src/demo/job.py" in head
+    assert "spark-submit" in head and "src/job_demo.py" in head

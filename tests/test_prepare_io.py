@@ -59,5 +59,12 @@ def test_source_format_from_qlik_spec() -> None:
         "csv",
         {"header": "false", "sep": "|"},
     )
-    assert source_format("lib://s/a.xlsx", "ooxml, embedded labels")[0] == "excel"
+    # Excel : la feuille lue (table is ...), toutes par defaut
+    assert source_format("lib://s/a.xlsx", "ooxml, embedded labels") == (
+        "xlsx",
+        {"sheets": "*"},
+    )
+    assert source_format(
+        "lib://s/a.xls", "biff, embedded labels, table is [Feuil 1$]"
+    ) == ("xls", {"sheets": "[Feuil 1$]"})
     assert source_format("table_en_base") == (None, {})

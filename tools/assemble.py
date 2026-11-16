@@ -1,7 +1,7 @@
 """Range un script traduit dans le projet.
 
-Les requetes vont dans src/<nom-projet>/sql/, et la description du script
-(entrees, etapes, sorties) dans work/<script>/assembly.json, qu'orchestrate.py
+Les requetes vont dans src/sql/, et la description du script
+(tables et sorties) dans work/<script>/assembly.json, qu'orchestrate.py
 relit ensuite pour ecrire le job.
 
 Le job lit et ecrit par nom, avec read_input() et write_output() de
@@ -10,7 +10,7 @@ etre declare dans conf/io.yml. Sinon on refuse d'assembler, plutot que de
 produire un job qui plantera au premier read_input().
 
 Chaque section validee (statut ok ou deterministic) donne un fichier
-src/<nom-projet>/sql/<script>__NN_<table>.sql, numerote dans l'ordre du
+src/sql/<script>__NN_<table>.sql, numerote dans l'ordre du
 script. Le prefixe <script>__ est la parce que tous les scripts partagent le
 meme dossier sql/ et que deux scripts peuvent tres bien avoir une table du
 meme nom. Le modele n'intervient pas ici, ce n'est que de la copie.
@@ -67,13 +67,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # On verifie tout avant de copier quoi que ce soit, pour ne pas laisser
     # un script a moitie assemble dans sql/.
-    inputs, read_paths, undeclared = {}, set(), []
+    inputs: dict[str, str] = {}
+    undeclared: list[str] = []
     for s in secs:
         if s["id"] in pending:
             continue
         for view, src in s.get("views", {}).items():
             if "path" in src:
-                read_paths.add(src["path"])
                 if src.get("io"):
                     inputs[view] = src["io"]
                 else:
@@ -82,6 +82,15 @@ def main(argv: list[str] | None = None) -> int:
             s["table"]
         ):
             undeclared.append(f"sortie {Path(s['outputs'][s['table']]).name}")
+    # Le socle charge tout seul l'entree que lit une requete, d'apres le nom
+    # de sa vue : in_<nom de l'entree dans conf/io.yml>. Une cle de io.yml
+    # avec d'autres caracteres que lettres, chiffres et _ ne le permet pas.
+    for view, name in inputs.items():
+        if view != f"in_{name}":
+            undeclared.append(
+                f"entree '{name}' (vue {view} au lieu de in_{name} : renommer "
+                "la cle dans conf/io.yml avec lettres, chiffres et _)"
+            )
     if undeclared:
         print(
             f"{stem} : pas declares dans conf/io.yml, assemblage annule : "
@@ -103,17 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         k += 1
         name = f"{stem}__{k:02d}_{s['id'].split('_', 1)[1]}.sql"
         shutil.copyfile(args.workdir / s["id"] / "query.sql", out / name)
-        output = s.get("outputs", {}).get(s["table"])
-        # Le script relit-il le fichier qu'il ecrit ? Le job devra alors
-        # couper la lignee avant d'ecrire.
-        steps.append(
-            [
-                name,
-                s["view"],
-                s.get("output_io", {}).get(s["table"]),
-                output in read_paths,
-            ]
-        )
+        steps.append([name, s["view"], s.get("output_io", {}).get(s["table"])])
 
     if not any(st[2] for st in steps):
         print(
@@ -124,7 +123,6 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             {
                 "script": manifest["script"],
-                "inputs": dict(sorted(inputs.items())),
                 "steps": steps,
                 "partial": bool(pending),
             },

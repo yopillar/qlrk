@@ -4,12 +4,13 @@ Le vrai socle n'est pas installe ici. Cette doublure reprend son API
 publique (celle qu'importe le code genere) en s'appuyant sur core/ et
 commons/ du depot, qui ont servi de base au socle :
     spark_foundation            pipeline, Pipeline, read_input,
-                                write_output, run_scripts
-    spark_foundation.runner     Pipeline, pipeline, run_scripts
-    spark_foundation.tables     read_input, write_output, run_sql
+                                write_output, script
+    spark_foundation.runner     Pipeline, pipeline, script
+    spark_foundation.datasets   read_input, write_output
+    spark_foundation.tables     run_sql
 """
 
-from spark_foundation.runner import Pipeline, pipeline, run_scripts
-from spark_foundation.tables import read_input, write_output
+from spark_foundation.datasets import read_input, write_output
+from spark_foundation.runner import Pipeline, pipeline, script
 
-__all__ = ["Pipeline", "pipeline", "read_input", "run_scripts", "write_output"]
+__all__ = ["Pipeline", "pipeline", "read_input", "script", "write_output"]

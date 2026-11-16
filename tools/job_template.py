@@ -1,26 +1,36 @@
-"""Gabarits du code genere pour un projet : job.py et un fichier par script.
+"""Gabarits du code genere pour un projet : le job et l'etape 010.
 
 Ce code est lu par des developpeurs Qlik qui ne connaissent pas PySpark. Il
 ne contient donc que des appels aux fonctions du socle spark_foundation :
-    spark_foundation            pipeline, run_scripts (runner.py)
-    spark_foundation.tables     read_input, run_sql, write_output
-Tout ce qui est technique (session, io.yml, lecture, ecriture, tables pour
-OpenLineage, reprise) est dans spark_foundation/internal/, et les
-transformations dans pyspark_commons.
+    spark_foundation            pipeline (runner.py) : le job
+    spark_foundation.runner     script : un script Qlik, vise par --from
+    spark_foundation.datasets   write_output : ecrire une sortie
+    spark_foundation.tables     run_sql : calculer une table Qlik
+Tout ce qui est technique (session, io.yml, lecture des entrees, tables
+pour OpenLineage, reprise, logs) est dans les autres fichiers du socle, et
+les transformations dans pyspark_commons.
 
-    src/<projet>/job.py                le job : les scripts, dans l'ordre
-    src/<projet>/scripts/<script>.py   un script Qlik : ses LOAD, ses tables,
-                                       ses STORE
-    src/<projet>/sql/                  une requete par table Qlik
+    src/job_<projet>.py                       le job, le seul a lancer
+    src/scripts/__init__.py
+    src/scripts/<projet>_step_010_run_sql.py  les scripts Qlik (genere)
+    src/scripts/<projet>_step_020_<nom>.py    vos etapes (ecrites a la main)
+    src/sql/                                  une requete par table Qlik
+
+Le job n'est cree que s'il n'existe pas : on y ajoute ses propres etapes.
+L'etape 010 est reecrite a chaque migration.
 """
 
 from __future__ import annotations
 
+import json
 import keyword
 import os
 import re
-import textwrap
 from pathlib import Path
+
+# Numero et nom de l'etape generee. Les numeros vont de 10 en 10 pour
+# pouvoir inserer une etape plus tard (step_005, step_015...).
+STEP = "step_010_run_sql"
 
 
 def project_name() -> str:
@@ -29,7 +39,7 @@ def project_name() -> str:
     mon_projet).
 
     Returns:
-        Le nom, qui sert de nom de package (src/<nom>/) et de nom de job.
+        Le nom, qui sert dans les noms de fichiers et de job.
     """
     name = os.environ.get("QLIK_PROJECT") or Path.cwd().name
     name = re.sub(r"\W", "_", name.strip().lower(), flags=re.ASCII)
@@ -38,17 +48,40 @@ def project_name() -> str:
 
 
 def project_dir() -> Path:
-    """Dossier du projet genere.
+    """Dossier du code du projet.
 
     Returns:
-        src/<nom-projet>/, qui contient job.py, scripts/ et sql/.
+        src/, qui contient le job, scripts/ et sql/.
     """
-    return Path("src") / project_name()
+    return Path("src")
 
 
-def module_name(script_stem: str) -> str:
-    """Nom du module Python d'un script Qlik, celui qu'on passe a --from et
-    --only.
+def job_path() -> Path:
+    """Le job du projet, le seul fichier a lancer.
+
+    Returns:
+        src/job_<projet>.py.
+    """
+    return project_dir() / f"job_{project_name()}.py"
+
+
+def step_module() -> str:
+    """Nom du module de l'etape generee.
+
+    Returns:
+        <projet>_step_010_run_sql, dans src/scripts/.
+    """
+    return f"{project_name()}_{STEP}"
+
+
+# Noms deja pris dans le fichier de l'etape : un script Qlik qui s'appelle
+# ainsi prend le suffixe _qlik.
+RESERVED = {"run", "script", "run_sql", "write_output", "run_tables"}
+
+
+def function_name(script_stem: str) -> str:
+    """Nom de la fonction d'un script Qlik dans l'etape 010, celui qu'on
+    passe a --from et --only.
 
     Args:
         script_stem: le nom du script sans extension (ventes).
@@ -59,148 +92,183 @@ def module_name(script_stem: str) -> str:
     name = re.sub(r"\W", "_", script_stem.lower(), flags=re.ASCII)
     if not name or name[0].isdigit():
         name = f"s_{name}"
-    return f"{name}_" if keyword.iskeyword(name) else name
+    if keyword.iskeyword(name) or name in RESERVED:
+        name += "_qlik"
+    return name
 
 
 JOB = '''"""Job du projet {project}.
 
-Fichier genere par tools/orchestrate.py : ne pas le modifier a la main.
+Cree par tools/orchestrate.py, qui ne le reecrit jamais : c'est ici qu'on
+ajoute ses propres etapes, dans l'ordre (scripts/{project}_step_020_<nom>.py...).
+L'etape 010 rejoue les scripts Qlik ; ses requetes sont dans sql/. Le job
+s'arrete au premier script en echec, et le dit dans les logs.
 
-Il fait tourner les scripts Qlik du projet, dans l'ordre ou Qlik les
-rechargeait : un script qui lit un fichier ecrit par un autre passe apres
-lui. Le detail de chaque script est dans scripts/, ses requetes dans sql/.
-Le job s'arrete au premier script en echec.
-
-    python src/{project}/job.py                  # tout
-    python src/{project}/job.py --from ventes    # reprendre a un script
-    python src/{project}/job.py --only ventes    # un seul script
+    python src/job_{project}.py                  # tout
+    python src/job_{project}.py --from ventes    # reprendre a un script
+    python src/job_{project}.py --only ventes    # un seul script
 
 Sur le cluster, depuis la racine du projet :
 
     spark-submit --name {project} --deploy-mode client \\\\
         --py-files <spark_foundation et pyspark_commons, s'ils ne sont
                     pas installes> \\\\
-        src/{project}/job.py [--from <script> | --only <script>]
+        src/job_{project}.py [--from <script> | --only <script>]
 """
 
 from __future__ import annotations
 
 from pyspark.sql import SparkSession
+from spark_foundation import pipeline
 
-{imports}from spark_foundation import pipeline, run_scripts
+from scripts import {step}
 
 
 @pipeline("{project}")
 def run(spark: SparkSession, args: list[str]) -> None:
-    """Fait tourner les scripts du projet, dans l'ordre.
+    """Fait tourner les etapes du projet, dans l'ordre.
 
     Args:
         spark: la session Spark, ouverte par @pipeline.
-        args: les arguments de la ligne de commande (--from, --only).
+        args: les arguments de la ligne de commande (--from, --only), deja
+            pris en compte par @pipeline.
     """
-    run_scripts(
-        args,
-{calls}    )
+    {step}.run()
 
 
 if __name__ == "__main__":
     raise SystemExit(run())
 '''
 
-SCRIPT = '''"""Script Qlik {script}, traduit en Spark SQL.
+SCRIPTS_INIT = '"""Etapes du projet {project}, une par fichier, dans l\'ordre."""\n'
 
-Fichier genere par tools/orchestrate.py : ne pas le modifier a la main.
-Chaque ligne est une etape du script Qlik, dans l'ordre :
-    read_input    LOAD ... FROM un fichier de conf/io.yml
-    run_sql       une table Qlik, calculee par sa requete du dossier sql/
-    write_output  STORE de la table dans un fichier de conf/io.yml
+STEP_HEADER = '''"""Etape 010 du projet {project} : les scripts Qlik, traduits en Spark SQL.
+
+Fichier genere par tools/orchestrate.py : ne pas le modifier a la main, il
+est reecrit a chaque migration. Vos etapes vont dans d'autres fichiers
+({project}_step_020_<nom>.py...).
+
+Une liste par script Qlik : ses tables dans l'ordre, chacune avec sa
+requete du dossier sql/ et, si le script Qlik la stockait (STORE), sa
+sortie dans conf/io.yml. Les fichiers que lisent les requetes sont trouves
+dans conf/io.yml : il n'y a rien a declarer ici.
 """
 
 from __future__ import annotations
-{imports}
 
-def run() -> None:
-    """Rejoue le script {script}.
+from spark_foundation.datasets import write_output
+from spark_foundation.runner import script
+from spark_foundation.tables import run_sql
+'''
 
-{summary}
+STEP_LOOP = '''
+
+def run_tables(tables: list[tuple[str, str, str | None]]) -> None:
+    """Calcule les tables dans l'ordre, et ecrit celles qui ont une sortie.
+
+    Args:
+        tables: (requete du dossier sql/, table, sortie dans conf/io.yml ou
+            None) pour chaque table.
     """
-{body}
+    for sql_file, table, output in tables:
+        run_sql(sql_file, table=table)
+        if output:
+            write_output(output, table=table)
 '''
 
 
-def _summary_line(label: str, names: list[str]) -> str:
-    """Une ligne de la docstring d'un script : "Lit : a, b.", repliee.
-
-    Args:
-        label: Lit, Calcule ou Ecrit.
-        names: les noms a lister, dans l'ordre, sans doublon.
-
-    Returns:
-        Le texte indente pour la docstring, ou "" s'il n'y a rien.
-    """
-    if not names:
-        return ""
-    return textwrap.fill(
-        f"{label} : {', '.join(dict.fromkeys(names))}.",
-        width=84,
-        initial_indent="    ",
-        subsequent_indent="        ",
-        break_on_hyphens=False,
-    )
-
-
-def render_job(project: str, scripts: list[tuple[str, list[str]]]) -> str:
-    """Code de job.py.
+def render_job(project: str) -> str:
+    """Code de src/job_<projet>.py.
 
     Args:
         project: le nom du projet.
-        scripts: (module, modules dont il depend) pour chaque script, dans
-            l'ordre ou ils tournent.
 
     Returns:
         Le code du job.
     """
-    names = sorted(m for m, _ in scripts)
-    imports = f"from scripts import {', '.join(names)}\n" if names else ""
-    calls = "".join(
-        f"        {m},"
-        + (f"  # apres {', '.join(deps)}, dont il lit les sorties" if deps else "")
-        + "\n"
-        for m, deps in scripts
-    )
-    return JOB.format(project=project, imports=imports, calls=calls)
+    return JOB.format(project=project, step=f"{project}_{STEP}")
 
 
-def render_script(script: str, inputs: dict[str, str], steps: list[list]) -> str:
-    """Code de scripts/<script>.py.
+def render_scripts_init(project: str) -> str:
+    """Code de src/scripts/__init__.py.
 
     Args:
-        script: le nom du fichier du script Qlik (ventes.qvs).
-        inputs: table (vue SQL) -> nom de l'entree dans conf/io.yml.
-        steps: [fichier sql, table, nom de la sortie ou None, ...] dans
-            l'ordre du script.
+        project: le nom du projet.
+
+    Returns:
+        Une simple docstring : le dossier devient un package.
+    """
+    return SCRIPTS_INIT.format(project=project)
+
+
+def _literal(value: str | None) -> str:
+    """Valeur Python ecrite dans le code genere : "texte" ou None."""
+    return "None" if value is None else json.dumps(value)
+
+
+def _table_line(sql_file: str, table: str, output: str | None) -> str:
+    """Une ligne d'une liste de tables, mise en forme comme ruff format.
+
+    Args:
+        sql_file: la requete.
+        table: le nom de la table.
+        output: la sortie, ou None.
+
+    Returns:
+        La ligne, ou le tuple sur plusieurs lignes s'il depasse 88 caracteres.
+    """
+    values = [_literal(sql_file), _literal(table), _literal(output)]
+    line = f"    ({', '.join(values)}),"
+    if len(line) <= 88:
+        return line
+    inner = "".join(f"        {v},\n" for v in values)
+    return f"    (\n{inner}    ),"
+
+
+def render_step(
+    project: str, scripts: list[tuple[str, str, list[list], list[str]]]
+) -> str:
+    """Code de src/scripts/<projet>_step_010_run_sql.py.
+
+    Une liste de tables et une fonction par script Qlik, une seule boucle
+    pour tous, et run() qui appelle les scripts dans l'ordre.
+
+    Args:
+        project: le nom du projet.
+        scripts: pour chaque script, dans l'ordre ou ils tournent : (nom de
+            la fonction, fichier du script Qlik, ses tables [fichier sql,
+            table, sortie ou None], fonctions dont il depend).
 
     Returns:
         Le code du module.
     """
-    lines = [f'    read_input("{io}", table="{view}")' for view, io in inputs.items()]
-    for sql_file, table, output, *_ in steps:
-        lines.append(f'    run_sql("{sql_file}", table="{table}")')
-        if output:
-            lines.append(f'    write_output("{output}", table="{table}")')
-    used = ["read_input"] if inputs else []
-    used += ["run_sql"] if steps else []
-    used += ["write_output"] if any(st[2] for st in steps) else []
-    summary = [
-        _summary_line("Lit", list(inputs.values())),
-        _summary_line("Calcule", [st[1] for st in steps]),
-        _summary_line("Ecrit", [st[2] for st in steps if st[2]]),
-    ]
-    return SCRIPT.format(
-        script=script,
-        imports=f"\nfrom spark_foundation.tables import {', '.join(used)}\n"
-        if used
-        else "",
-        summary="\n".join(x for x in summary if x) or "    Rien a faire.",
-        body="\n".join(lines) or "    pass",
+    parts = [STEP_HEADER.format(project=project)]
+    for func, _, steps, _ in scripts:
+        lines = "".join(
+            _table_line(sql_file, table, output or None) + "\n"
+            # *_ : les anciens assembly.json ont une 4e valeur, ignoree
+            for sql_file, table, output, *_ in steps
+        )
+        parts.append(
+            f"\n{func.upper()}: list[tuple[str, str, str | None]] = ["
+            + (f"\n{lines}" if lines else "")
+            + "]\n"
+        )
+    parts.append(STEP_LOOP)
+    for func, qlik_file, _, _ in scripts:
+        parts.append(
+            f"\n\n@script\ndef {func}() -> None:\n"
+            f'    """Script Qlik {qlik_file}."""\n'
+            f"    run_tables({func.upper()})\n"
+        )
+    calls = "".join(
+        f"    {func}()"
+        + (f"  # apres {', '.join(deps)}, dont il lit les sorties" if deps else "")
+        + "\n"
+        for func, _, _, deps in scripts
     )
+    parts.append(
+        '\n\ndef run() -> None:\n    """Fait tourner les scripts Qlik du projet, '
+        'dans l\'ordre."""\n' + (calls or "    pass\n")
+    )
+    return "".join(parts)

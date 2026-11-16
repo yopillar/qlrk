@@ -4,6 +4,7 @@ script en .txt et un sans extension, un io.yml a 3 espaces commente, une
 entree CSV et une sortie avec "#" dans leur nom, une table du modele de
 donnees sans STORE."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -27,8 +28,12 @@ def test_migrate_demo_identical_to_qlik(project: Project) -> None:
         assert (
             f"- {script} : assemble dans src/, donnees identiques a Qlik" in summary
         ), res.stdout
-    # ventes passe avant synthese, qui lit ce qu'il ecrit
+    # ventes passe avant synthese, qui lit ce qu'il ecrit, et relit cette
+    # sortie par un from_output
     assert summary.index("ventes.qvs") < summary.index("synthese.txt")
+    conf = (project / "conf/io.yml").read_text(encoding="utf-8")
+    assert "ventes_enrichies_v2_relue:" in conf
+    assert "from_output: ventes_enrichies_v2" in conf
 
     # l'ordre de chargement est garde, jusque dans la sortie ecrite
     project.run(
@@ -58,7 +63,7 @@ def test_migrate_demo_identical_to_qlik(project: Project) -> None:
         "--var",
         "sorties=data/output",
     )
-    job = (project / "src/demo/job.py").read_text(encoding="utf-8")
+    job = (project / "src/job_demo.py").read_text(encoding="utf-8")
     assert "spark-submit" in job
 
 
@@ -103,29 +108,49 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
     project.run(
         "migrate.py", "script_qvd/", "--skip-selftest", "--var", "sorties=data/output"
     )
-    job = (project / "src/demo/job.py").read_text(encoding="utf-8")
-    # rien de technique dans le job : pipeline, run_scripts, les scripts
-    assert "from spark_foundation import pipeline, run_scripts" in job
-    assert "SCRIPTS = " not in job and "def " in job and len(job.splitlines()) < 60
-    # l'ordre des scripts est l'ordre des appels
-    calls = job[job.index("run_scripts(\n") :]
+    src = project / "src"
+    # src/ : le job, scripts/ (un package) et sql/
+    assert (src / "job_demo.py").is_file() and (src / "scripts/__init__.py").is_file()
+    assert sorted((src / "sql").glob("ventes__*.sql"))
+    job = (src / "job_demo.py").read_text(encoding="utf-8")
+    # rien de technique dans le job : pipeline et l'appel de l'etape 010
+    assert "from scripts import demo_step_010_run_sql\n" in job
+    assert "from spark_foundation import pipeline" in job
+    assert "    demo_step_010_run_sql.run()\n" in job and len(job.splitlines()) < 60
+    step = (src / "scripts/demo_step_010_run_sql.py").read_text(encoding="utf-8")
+    # une liste par script Qlik, une seule boucle, rien sur les entrees
+    assert '("ventes__01_ventes.sql", "Ventes", "ventes_enrichies_v2"),' in step
+    assert step.count("run_sql(") == 1 and "read_input" not in step
+    assert "@script\ndef ventes() -> None:" in step
+    # l'ordre des scripts est l'ordre des appels dans run()
+    calls = step[step.index("def run() -> None:") :]
     assert (
-        calls.index("calendrier,") < calls.index("ventes,") < calls.index("synthese,")
+        calls.index("calendrier()")
+        < calls.index("ventes()")
+        < calls.index("synthese()")
     )
-    ventes = (project / "src/demo/scripts/ventes.py").read_text(encoding="utf-8")
-    assert (
-        "from spark_foundation.tables import read_input, run_sql, write_output"
-        in ventes
-    )
-    assert 'read_input("ventes", table="in_ventes")' in ventes
-    assert 'write_output("ventes_enrichies_v2", table="Ventes")' in ventes
-    assert "Lit : ref_sites_2024, ventes." in ventes
     check_generated_code(project)
+    # le job n'est jamais reecrit : on peut y ajouter ses etapes
+    (src / "job_demo.py").write_text(job + "# mon etape\n", encoding="utf-8")
+    project.run("orchestrate.py")
+    assert (src / "job_demo.py").read_text(encoding="utf-8").endswith("# mon etape\n")
     # le metastore local garde les tables d'un lancement a l'autre ; on
     # relance ventes pour verifier qu'une table existante est bien remplacee
-    project.run_job("--only", "ventes")
+    res = project.run_job("--only", "ventes")
+    # des logs lisibles : projet, etape, script, et ce qui est fait
+    for line in (
+        "[demo] step_010_run_sql > calendrier : saute (--from / --only)",
+        "[demo] step_010_run_sql > ventes : lecture ventes <- ",
+        "[demo] step_010_run_sql > ventes : sql ventes__01_ventes.sql -> Ventes ",
+        "[demo] step_010_run_sql > ventes : ecriture Ventes -> ventes_enrichies_v2 ",
+    ):
+        assert line in res.stderr, res.stderr[-3000:]
+    # reprise a un script, et nom de script inconnu
+    project.run_job("--from", "synthese")
+    with pytest.raises(AssertionError, match="Script inconnu : ventess"):
+        project.run_job("--only", "ventess")
     check = (
-        "from core.internal.session import get_session\n"
+        "from core.session import get_session\n"
         "spark = get_session('demo')\n"
         "print(sorted(t.name for t in spark.catalog.listTables('demo_qlik')))\n"
     )
@@ -137,18 +162,35 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
         text=True,
     )
     assert "ventes__ventes" in res.stdout, res.stderr[-2000:]
+    # une requete cassee : le log dit quel fichier, quelle table, et comment
+    # reprendre
+    sql = project / "src/sql/ventes__01_ventes.sql"
+    sql.write_text(
+        sql.read_text(encoding="utf-8").replace("s.Montant", "s.Montantt", 1),
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError) as failed:
+        project.run_job("--only", "ventes")
+    message = str(failed.value)
+    assert (
+        "[demo] step_010_run_sql > ventes : ECHEC pendant "
+        "sql/ventes__01_ventes.sql (table Ventes)"
+    ) in message
+    assert "Montantt" in message and "relancer le job avec --from ventes" in message
 
 
 def check_generated_code(project: Project) -> None:
     """Le code genere passe les memes controles que le kit : docstrings et
     annotations de type partout (ruff D1, ANN), types coherents (mypy)."""
-    src = project / "src/demo"
+    src = project / "src"
     config = str(ROOT / "pyproject.toml")
     ruff = shutil.which("ruff")
     if ruff:
         for cmd in (["format", "--check"], ["check", "--no-cache"]):
+            # depuis la racine du projet, comme on lance ruff en vrai
             res = subprocess.run(
-                [ruff, *cmd, "--config", config, str(src)],
+                [ruff, *cmd, "--config", config, "src"],
+                cwd=project.path,
                 capture_output=True,
                 text=True,
             )
@@ -157,10 +199,120 @@ def check_generated_code(project: Project) -> None:
     if mypy:
         res = subprocess.run(
             [mypy, "--config-file", config, "--cache-dir", os.devnull]
-            + ["--explicit-package-bases", "job.py", "scripts"],
+            + ["job_demo.py", "scripts"],
             cwd=src,
             env=dict(os.environ, MYPYPATH=JOB_PATH),
             capture_output=True,
             text=True,
         )
         assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_read_input_gives_a_dataframe_and_optionally_a_table(
+    project: Project,
+) -> None:
+    """read_input renvoie le DataFrame ; avec table, il cree aussi la vue."""
+    code = (
+        "from core.session import get_session\n"
+        "from core import context\n"
+        "from spark_foundation.datasets import read_input\n"
+        "spark = get_session('demo')\n"
+        "context.start_job('demo')\n"
+        "df = read_input('ventes')\n"
+        "print('cols', df.columns)\n"
+        "print('vue', spark.catalog.tableExists('in_ventes'))\n"
+        "df = read_input('ventes', table='in_ventes')\n"
+        "print('cols', df.columns)\n"
+        "print('vue', spark.table('in_ventes').columns[-1])\n"
+        "t = spark.sql('SELECT file_time FROM in_ventes__file').first()[0]\n"
+        "print('fichier', type(t).__name__)\n"
+    )
+    res = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=project.path,
+        env=dict(os.environ, PYTHONPATH=JOB_PATH, entrees="data/input"),
+        capture_output=True,
+        text=True,
+    )
+    out = res.stdout.splitlines()
+    assert out[1] == "vue False", res.stderr[-2000:]
+    # meme DataFrame dans les deux cas ; la vue a en plus l'ordre Qlik
+    assert out[0] == out[2] and "_qlik_order" not in out[0]
+    assert out[3] == "vue _qlik_order"
+    # FileTime() : date du fichier, dans la vue in_ventes__file
+    assert out[4] == "fichier datetime"
+
+
+def test_excel_input_read_by_the_socle(project: Project) -> None:
+    """Un fichier Excel est lu feuille par feuille, aux types du schema."""
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("openpyxl")
+    with pd.ExcelWriter(project / "data/input/tarifs.xlsx") as writer:
+        pd.DataFrame({"Code": [1, 2], "Jour": ["2024-01-01", "2024-02-01"]}).to_excel(
+            writer, sheet_name="A", index=False
+        )
+        pd.DataFrame({"Code": [3], "Jour": ["2024-03-01"]}).to_excel(
+            writer, sheet_name="B", index=False
+        )
+    (project / "conf/schemas/tarifs.yml").write_text(
+        "columns:\n  Code: INT\n  Jour: DATE\n", encoding="utf-8"
+    )
+    io_yml = project / "conf/io.yml"
+    io_yml.write_text(
+        io_yml.read_text(encoding="utf-8").replace(
+            "inputs:\n",
+            "inputs:\n"
+            "   tarifs:\n"
+            "       format: xlsx\n"
+            "       schema_file: schemas/tarifs.yml\n"
+            "       location: ${entrees}/tarifs.xlsx\n"
+            "       options:\n"
+            '           sheets: "*"\n'
+            "   tarifs_b:\n"
+            "       format: xlsx\n"
+            "       location: ${entrees}/tarifs.xlsx\n"
+            '       options: {sheets: "B"}\n',
+        ),
+        encoding="utf-8",
+    )
+    code = (
+        "from core.session import get_session\n"
+        "from core import context\n"
+        "from spark_foundation.datasets import read_input\n"
+        "get_session('demo').sparkContext.setLogLevel('ERROR')\n"
+        "context.start_job('demo')\n"
+        "df = read_input('tarifs', table='in_tarifs')\n"
+        "print('schema', df.schema.simpleString())\n"
+        "print('codes', [r.Code for r in df.collect()])\n"
+        "print('b', [r.Code for r in read_input('tarifs_b').collect()])\n"
+    )
+    res = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=project.path,
+        env=dict(os.environ, PYTHONPATH=JOB_PATH, entrees="data/input"),
+        capture_output=True,
+        text=True,
+    )
+    out = [line for line in res.stdout.splitlines() if " " in line]
+    assert out == [
+        "schema struct<Code:int,Jour:date>",
+        "codes [1, 2, 3]",
+        "b ['3']",
+    ], res.stderr[-2000:]
+
+
+def test_inline_numbers_keep_bigint_columns(project: Project) -> None:
+    """Un INLINE de nombres ajoute a une table ne fait pas passer ses
+    colonnes en texte."""
+    (project / "script_qvd/codes.qvs").write_text(
+        "Base:\nLOAD * INLINE [\nId, Qte\n1, 10\n2, 20\n];\n"
+        "Concatenate (Base)\nLOAD * INLINE [\nId, Qte\n99, 0\n];\n"
+        "STORE Base INTO [lib://out/base.qvd] (qvd);\n"
+    )
+    project.run("prepare.py", "script_qvd/codes.qvs")
+    project.run("check.py", "work/codes", "--parse")
+    manifest = json.loads(
+        (project / "work/codes/manifest.json").read_text(encoding="utf-8")
+    )
+    types = {s["table"]: s.get("output_types") for s in manifest["sections"]}
+    assert types["Base"] == {"Id": "BIGINT", "Qte": "BIGINT"}
