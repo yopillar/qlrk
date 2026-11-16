@@ -374,6 +374,13 @@ class Inst:
     applymaps: list[dict] = field(default_factory=list)
     functions: set[str] = field(default_factory=set)
     dropped: list[str] = field(default_factory=list)
+    # RENAME FIELD a TO b, c TO d : [(a, b), (c, d)]
+    renames: list[tuple[str, str]] = field(default_factory=list)
+    # DROP FIELD, RENAME FIELD : les versions des tables touchees
+    keys: list[str] = field(default_factory=list)
+    # CROSSTABLE (attribut, donnee, n) : les noms et le nombre de colonnes
+    # gardees telles quelles
+    crosstable: tuple[str, str, int] | None = None
     # Peek('f', n, 'T') / NoOfRows('T') et Exists() : tables lues a ce moment
     table_refs: dict[str, str] = field(default_factory=dict)
     exists_tables: dict[str, list[str]] = field(default_factory=dict)
@@ -948,8 +955,20 @@ def analyze(inst: Inst) -> None:
         if m:
             inst.target = strip_name(m.group(1))
             inst.label = strip_name(m.group(2))
-        else:
-            inst.warnings.append("RENAME FIELD : renommage de colonnes")
+            return
+        m = re.match(r"RENAME\s+FIELDS?\s+(.*?);?$", c, re.I | re.S)
+        if m and not re.match(r"USING\b", m.group(1).strip(), re.I):
+            for pair in split_top(m.group(1)):
+                parts = re.split(
+                    r"\s+TO\s+", mask_strings(pair), maxsplit=1, flags=re.I
+                )
+                if len(parts) == 2:
+                    cut = len(parts[0])
+                    old_name, new_name = pair[:cut], pair[cut:]
+                    new_name = re.sub(r"^\s+TO\s+", "", new_name, flags=re.I)
+                    inst.renames.append((strip_name(old_name), strip_name(new_name)))
+        if not inst.renames:
+            inst.warnings.append("RENAME FIELD non reconnu (USING : a la main)")
         return
 
     body = c
@@ -964,6 +983,16 @@ def analyze(inst: Inst) -> None:
     inst.kind = "load"
     head = body[: lm.start()]
     masked = mask_strings(body)
+    if inst.label is None:
+        # etiquette ecrite apres les prefixes : "LEFT KEEP (A) T: LOAD ..."
+        late = re.search(r"(?:^|[\s)])" + NAME + r"\s*:\s*$", head)
+        if late and first_word(late.group(1)) not in PREFIX_WORDS:
+            inst.label = strip_name(late.group(1))
+            head = head[: late.start(1)]
+            inst.warnings.append(
+                f"etiquette {inst.label} ecrite apres le prefixe : Qlik "
+                "l'attend avant (T: LEFT KEEP (A) LOAD ...), a corriger"
+            )
 
     if re.search(r"\bMAPPING\b", head, re.I):
         inst.constructs.add("mapping")
@@ -997,7 +1026,19 @@ def analyze(inst: Inst) -> None:
     ):
         if re.search(rf"\b{kw}\b", head, re.I):
             inst.constructs.add(kw.lower())
-            inst.warnings.append(f"{kw} : construction rare, a verifier de pres")
+            if kw != "CROSSTABLE":
+                inst.warnings.append(f"{kw} : construction rare, a verifier de pres")
+    xm = re.search(
+        r"\bCROSSTABLE\s*\(\s*" + NAME + r"\s*,\s*" + NAME + r"\s*(?:,\s*(\d+)\s*)?\)",
+        head,
+        re.I,
+    )
+    if xm:
+        inst.crosstable = (
+            strip_name(xm.group(1)),
+            strip_name(xm.group(2)),
+            int(xm.group(3) or 1),
+        )
     if inst.target is None:
         inst.target = inst.label
 
@@ -1103,7 +1144,7 @@ def analyze(inst: Inst) -> None:
         "firstsortedvalue",
     }:
         inst.constructs.add("row_functions")
-    inst.fields = extract_fields(body)
+    inst.fields = extract_fields(body, strip_comments(inst.text))
     for name in filter(None, (inst.label, inst.target, inst.resident)):
         if "$(" in name:
             inst.warnings.append(f"nom de table dynamique non resolu : {name}")
@@ -1128,24 +1169,52 @@ def _balanced(s: str, open_idx: int) -> str:
     return s[open_idx + 1 :]
 
 
-def extract_fields(body: str) -> list[str]:
+def extract_fields(body: str, raw: str | None = None) -> list[str]:
     """Colonnes produites par le dernier LOAD, c'est-a-dire celui du haut
-    dans un LOAD empile."""
+    dans un LOAD empile.
+
+    raw est le texte d'origine, avec ses retours a la ligne : l'en-tete d'un
+    INLINE est sa premiere ligne, que le texte normalise (sur une seule
+    ligne) ne permet plus d'isoler.
+
+    Un "LOAD *" du haut reprend les champs du LOAD du dessous : sans cela,
+    "LOAD *, Year(d) AS Annee; LOAD a, b, d FROM ..." restait inconnu, et
+    avec lui la cle des jointures, les colonnes ecrites et leurs types.
+    """
     masked = mask_strings(body)
-    m = re.search(r"\bLOAD\b(?:\s+DISTINCT\b)?", masked, re.I)
-    if not m:
+    starts = [m.end() for m in re.finditer(r"\bLOAD\b(?:\s+DISTINCT\b)?", masked, re.I)]
+    if not starts:
         return []
+    levels = [_segment_fields(body, masked, start) for start in starts]
+    if re.search(r"\bINLINE\b", masked, re.I) and levels[-1] in (["*"], []):
+        im = re.search(r"\bINLINE\s*\[\s*([^\n\]]*)", raw or body, re.I)
+        if im:
+            levels[-1] = [strip_name(f) for f in split_top(im.group(1))]
+    out = levels[-1]
+    for fields in reversed(levels[:-1]):
+        out = list(dict.fromkeys(c for f in fields for c in (out if f == "*" else [f])))
+    return out
+
+
+def _segment_fields(body: str, masked: str, start: int) -> list[str]:
+    """Colonnes d'un seul LOAD, celui qui commence a start.
+
+    Args:
+        body: le texte de l'instruction.
+        masked: le meme, chaines masquees.
+        start: la position juste apres son mot LOAD.
+
+    Returns:
+        Les noms des colonnes, "*" pour un LOAD *, "?" pour une
+        expression sans nom.
+    """
     end = re.search(
         r"\bFROM\b|\bRESIDENT\b|\bINLINE\b|\bAUTOGENERATE\b|"
         r"\bWHERE\b|\bGROUP\s+BY\b|;|\bLOAD\b|\bSQL\b|\bSELECT\b",
-        masked[m.end() :],
+        masked[start:],
         re.I,
     )
-    seg = body[m.end() : m.end() + end.start()] if end else body[m.end() :]
-    if re.search(r"\bINLINE\b", masked, re.I) and seg.strip() in ("*", ""):
-        im = re.search(r"\bINLINE\s*\[\s*([^\n\]]*)", body, re.I)
-        if im:
-            return [strip_name(f) for f in split_top(im.group(1))]
+    seg = body[start : start + end.start()] if end else body[start:]
     out = []
     for part in split_top(seg):
         alias = re.search(r"\bAS\s+" + NAME + r"\s*$", part, re.I)
@@ -1155,7 +1224,7 @@ def extract_fields(body: str) -> list[str]:
             out.append("*")
         elif re.fullmatch(NAME, part.strip()):
             out.append(strip_name(part))
-        else:
+        elif part.strip():
             out.append("?")
     return out
 
@@ -1167,6 +1236,27 @@ def resolve_path(path: str, directory: str) -> str:
         return path
     sep = "" if directory.endswith(("/", "\\")) else "/"
     return directory + sep + path
+
+
+# Prefixes d'un LOAD : jamais pris pour une etiquette.
+PREFIX_WORDS = {
+    "LEFT",
+    "RIGHT",
+    "INNER",
+    "OUTER",
+    "JOIN",
+    "KEEP",
+    "CONCATENATE",
+    "NOCONCATENATE",
+    "MAPPING",
+    "CROSSTABLE",
+    "GENERIC",
+    "INTERVALMATCH",
+    "FIRST",
+    "SAMPLE",
+    "DISTINCT",
+    "BUFFER",
+}
 
 
 # ==========================================================================
@@ -1181,12 +1271,44 @@ def build_graph(
 
     Une table supprimee (DROP) puis rechargee sous le meme nom est une
     autre table pour nous : elle prend la cle "NOM__2", puis "NOM__3",
-    etc."""
+    etc. De meme pour une table lue par une autre puis modifiee (JOIN,
+    CONCATENATE, DROP FIELD, RENAME FIELD) : la lecture voit la table
+    d'avant, comme dans Qlik, et la suite repart de cette version
+    ("base")."""
     tables: dict[str, dict] = {}
     schemas: dict[str, list[str]] = {}
     live: dict[str, str] = {}  # nom Qlik -> cle de la version en cours
     versions: dict[str, int] = {}
+    read: set[str] = set()  # versions lues par une autre table depuis leur creation
     last = None
+
+    def fork(key: str, inst: Inst) -> str:
+        """Version a modifier : une nouvelle si key a deja ete lue par une
+        autre table, sinon key elle-meme."""
+        if key not in read or key not in tables:
+            return key
+        name = tables[key]["name"]
+        versions[name] = versions.get(name, 1) + 1
+        new = f"{name}__{versions[name]}"
+        tables[new] = {
+            "insts": [],
+            "deps": {key},
+            "mapping": False,
+            "dropped": False,
+            "stored": [],
+            "name": name,
+            "base": key,
+        }
+        schemas[new] = list(schemas.get(key, []))
+        # remplacee : plus livree (sauf STORE deja fait), mais toujours lue
+        tables[key]["dropped"] = True
+        live[name] = new
+        inst.warnings.append(
+            f"{name} est lue plus haut puis modifiee ici : la lecture garde "
+            "la table d'avant, comme dans Qlik"
+        )
+        return new
+
     anon = 0
 
     @overload
@@ -1237,6 +1359,12 @@ def build_graph(
                     inst.warnings.append("LOAD sans nom")
             inst.resident = ref(inst.resident)
             for a in inst.applymaps:
+                if a["map"] not in live:
+                    inst.warnings.append(
+                        f"ApplyMap('{a['map']}') avant le chargement de ce "
+                        "mapping : Qlik s'arrete (mapping introuvable). Le "
+                        "mapping charge plus loin est utilise, a verifier"
+                    )
                 a["map"] = ref(a["map"])
             # Peek('f', n, 'T') / NoOfRows('T') : depend de l'etat de T a ce
             # moment-la
@@ -1271,8 +1399,13 @@ def build_graph(
                     new += schemas.get(inst.resident, ["*"]) if inst.resident else ["*"]
                 else:
                     new.append(f)
+            if inst.crosstable and "*" not in new and "?" not in new:
+                # les n premieres colonnes, puis l'attribut et la donnee
+                attr, data, n = inst.crosstable
+                new = new[:n] + [attr, data]
             # auto-concatenation de Qlik : memes champs qu'une table deja
-            # chargee
+            # chargee, quelle que soit l'etiquette (une boucle FOR qui
+            # recharge "Stocks:" ajoute ses lignes a Stocks)
             if (
                 not explicit
                 and "noconcatenate" not in inst.constructs
@@ -1283,8 +1416,7 @@ def build_graph(
                 for name, key in live.items():
                     t = tables[key]
                     if (
-                        name != inst.target
-                        and not t["dropped"]
+                        not t["dropped"]
                         and not t["mapping"]
                         and set(schemas.get(key, [])) == set(new)
                     ):
@@ -1297,8 +1429,28 @@ def build_graph(
                         inst.constructs.add("concatenate")
                         explicit = {"concatenate"}
                         break
+            if (
+                not explicit
+                and "keep" not in inst.constructs
+                and inst.target in live
+                and not tables[live[inst.target]]["dropped"]
+            ):
+                # Etiquette deja prise par une table aux champs differents :
+                # Qlik cree une autre table, A-1, et A reste la premiere.
+                n = 1
+                while f"{inst.target}-{n}" in live:
+                    n += 1
+                inst.warnings.append(
+                    f"table {inst.target} deja chargee avec d'autres champs : "
+                    f"Qlik nomme celle-ci {inst.target}-{n}"
+                )
+                inst.target = f"{inst.target}-{n}"
             if explicit and "keep" not in inst.constructs:
-                key = ref(inst.target) if inst.target in live else create(inst.target)
+                key = (
+                    fork(ref(inst.target), inst)
+                    if inst.target in live
+                    else create(inst.target)
+                )
             elif "keep" in inst.constructs:
                 # La table entre parentheses filtre celle qu'on charge. C'est
                 # donc une dependance : elle compte pour l'ordre des sections
@@ -1324,6 +1476,12 @@ def build_graph(
                             "AUCUN champ commun : Qlik fait un PRODUIT CARTESIEN"
                         )
             inst.target = key
+            # ce que ce LOAD lit d'autres tables : les modifier ensuite cree
+            # une nouvelle version
+            sources: list[str | None] = [inst.resident, inst.keep_other]
+            sources += list(inst.table_refs.values())
+            sources += [x for keys in inst.exists_tables.values() for x in keys]
+            read.update(o for o in sources if o and o != key)
             if {"join", "concatenate"} & inst.constructs:
                 cur = schemas.setdefault(key, [])
                 cur += [f for f in new if f not in cur]
@@ -1378,11 +1536,27 @@ def build_graph(
                     if set(inst.fields) & set(schemas.get(key, []))
                 ]
             )
+            inst.keys = []
             for key in targets:
+                key = fork(key, inst)
+                inst.keys.append(key)
                 if key in schemas:
                     schemas[key] = [f for f in schemas[key] if f not in inst.fields]
                 if key in tables:
                     tables[key]["insts"].append(k)
+        elif inst.kind == "rename" and inst.renames:
+            # RENAME FIELD : toutes les tables qui ont le champ
+            olds = {a for a, _ in inst.renames}
+            inst.keys = []
+            for key in list(live.values()):
+                cols = schemas.get(key, [])
+                if tables[key]["dropped"] or not olds & set(cols):
+                    continue
+                key = fork(key, inst)
+                inst.keys.append(key)
+                names = dict(inst.renames)
+                schemas[key] = [names.get(c, c) for c in cols]
+                tables[key]["insts"].append(k)
         elif inst.kind == "rename" and inst.target and inst.label:
             old = ref(inst.target)
             if old in tables:
@@ -1656,12 +1830,43 @@ def add_model_outputs(script: Path, tables: dict) -> list[str]:
     return added
 
 
+def file_ext(path: str) -> str:
+    """Extension d'un fichier, en minuscules (".qvd", ".csv"...)."""
+    name = re.split(r"[\\/]", path.replace("\\", "/"))[-1]
+    return "." + name.rsplit(".", 1)[1].lower() if "." in name else ""
+
+
+def written_elsewhere(path: str, stored: dict) -> str | None:
+    """Script qui ecrit un fichier du meme nom et de la meme extension a un
+    autre chemin (lib://QVD/x.qvd lu, lib://Qvd/x.qvd ecrit).
+
+    Le nom seul ne suffit pas : commandes.csv, la source brute, n'est pas
+    commandes.qvd, la sortie d'un autre script.
+
+    Args:
+        path: le fichier lu.
+        stored: les fichiers ecrits du projet.
+
+    Returns:
+        Le script qui l'ecrit, ou None.
+    """
+    other = stored.get("names", {}).get(file_stem(path).lower())
+    if not other:
+        return None
+    same = any(
+        file_stem(p).lower() == file_stem(path).lower()
+        and file_ext(p) == file_ext(path)
+        for p in stored.get("paths", ())
+    )
+    return other if same else None
+
+
 def is_output(path: str, stored: dict) -> bool:
     """Vrai si le fichier est ecrit par un STORE, de ce script ou d'un autre
     script du projet."""
-    return norm_path(path) in stored.get("paths", ()) or file_stem(
-        path
-    ).lower() in stored.get("names", ())
+    return norm_path(path) in stored.get("paths", ()) or bool(
+        written_elsewhere(path, stored)
+    )
 
 
 def resolve_io(
@@ -1678,7 +1883,13 @@ def resolve_io(
     # Une lecture se cherche dans la section inputs, une ecriture dans
     # outputs : read_input() ne lit que ce qui est declare en entree, meme
     # si le fichier est produit par un autre script du projet.
-    entry = conf.find(path, "output" if store else "input") if conf else None
+    entry = (
+        conf.find(
+            path, "output" if store else "input", produced=None if store else output
+        )
+        if conf
+        else None
+    )
     if entry:
         return entry.location, entry.format, entry
     if conf and not store and output:
@@ -1942,7 +2153,7 @@ def path_warnings(insts: list[Inst], stored: dict, conf: IoConf | None) -> list[
     warnings = []
     for i in insts:
         for src in i.sources:
-            other = stored["names"].get(file_stem(src).lower())
+            other = written_elsewhere(src, stored)
             if other and norm_path(src) not in stored["paths"]:
                 warnings.append(
                     f"l.{i.stmt.first_line}: {src} lu dans data/output : meme "
@@ -2562,6 +2773,9 @@ def prepare(
             column_types=conf_types,
             date_format=env.vars.get("DateFormat"),
             timestamp_format=env.vars.get("TimestampFormat"),
+            decimal_sep=env.vars.get("DecimalSep"),
+            thousand_sep=env.vars.get("ThousandSep"),
+            table_base=lambda t: tables.get(t, {}).get("base"),
         )
         header = (
             f"-- Section {sec['id']} : table {g}"

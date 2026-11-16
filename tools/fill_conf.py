@@ -64,6 +64,7 @@ from prepare import (
     INPUT_DIR,
     KEEP_FILE_NAME,
     analyze_script,
+    file_ext,
     file_stem,  # noqa: E402
     mask_strings,
     norm_path,
@@ -221,6 +222,15 @@ def columns_read(text: str) -> tuple[list[str], bool]:
             continue
         for k, (kind, val) in enumerate(toks):
             nxt = toks[k + 1] if k + 1 < len(toks) else None
+            # Exists(champ, expr) : champ est deja charge, pas lu dans la
+            # source. Avec un seul argument, il est bien lu dans la source.
+            if (
+                k >= 2
+                and toks[k - 1] == ("op", "(")
+                and str(toks[k - 2][1]).lower() == "exists"
+                and nxt == ("op", ",")
+            ):
+                continue
             if kind == "field":
                 cols.append(val[1:-1])
             elif kind == "word" and nxt != ("op", "("):
@@ -827,8 +837,10 @@ def collect_io(
                     )
                     cols, star = [], False
                 for src in i.sources[:1]:
+                    # par chemin : commandes.csv et commandes.qvd sont deux
+                    # fichiers, meme s'ils ont le meme nom
                     r = reads.setdefault(
-                        io_name(src),
+                        norm_path(src),
                         {
                             "path": src,
                             "columns": [],
@@ -1040,14 +1052,18 @@ def main(argv: list[str] | None = None) -> int:
 
     new_outputs = output_entries(writes, conf, out_prefix)
 
-    for name, r in sorted(reads.items()):
-        entry = conf.find(r["path"], "input")
-        # Produit par un STORE : meme chemin, ou meme nom ecrit par un AUTRE
-        # script. Un script qui lit Sources/produits.qvd et ecrit
-        # QVD/produits.qvd lit bien la source, pas sa propre sortie.
+    for _, r in sorted(reads.items()):
+        name = io_name(r["path"])
+        # Produit par un STORE : meme chemin, ou meme nom et meme extension
+        # ecrit par un AUTRE script. Un script qui lit Sources/produits.qvd
+        # et ecrit QVD/produits.qvd lit bien la source, pas sa propre sortie ;
+        # commandes.csv, la source brute, n'est pas commandes.qvd.
         is_produced = norm_path(r["path"]) in produced or bool(
-            name in writes and writes[name]["scripts"] - r["scripts"]
+            name in writes
+            and writes[name]["scripts"] - r["scripts"]
+            and file_ext(writes[name]["path"]) == file_ext(r["path"])
         )
+        entry = conf.find(r["path"], "input", produced=is_produced, strict=True)
         if entry and entry.from_output:
             continue  # relit une sortie : rien a decrire, le Parquet a ses types
         if is_produced and entry:

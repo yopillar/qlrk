@@ -1,0 +1,214 @@
+"""Cas releves en traduisant de vrais scripts Qlik, plus ou moins bien ecrits."""
+
+import json
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from conf import IoConf
+from conftest import Project
+from fill_conf import columns_read
+from prepare import analyze_script, extract_fields, is_output
+from qlik2sql import ExprCtx, expr
+
+
+def insts_of(text: str) -> list[Any]:
+    """Les LOAD d'un script, apres analyse."""
+    path = Path(tempfile.mkdtemp()) / "s.qvs"
+    path.write_text(text, encoding="utf-8")
+    return [i for i in analyze_script(path)[2] if i.kind == "load"]
+
+
+def test_loop_with_same_label_appends_rows() -> None:
+    """Une boucle FOR qui recharge "Stocks:" avec les memes champs ajoute ses
+    lignes a Stocks ; elle ne la remplace pas."""
+    loads = insts_of(
+        "FOR EACH v IN 'a','b'\nStocks:\nLOAD x, y FROM [lib://d/$(v).csv] (txt);\n"
+        "NEXT v\nSTORE Stocks INTO [lib://o/s.qvd] (qvd);\n"
+    )
+    assert "concatenate" in loads[1].constructs and loads[1].target == "Stocks"
+
+
+def test_same_label_other_fields_is_a_new_table() -> None:
+    """Meme etiquette, autres champs : Qlik cree A-1, A reste la premiere."""
+    loads = insts_of(
+        "A:\nLOAD x, y FROM [lib://d/a.csv] (txt);\n"
+        "A:\nLOAD x, z FROM [lib://d/b.csv] (txt);\n"
+    )
+    assert loads[1].target == "A-1" and "concatenate" not in loads[1].constructs
+
+
+def test_label_after_prefix_is_kept() -> None:
+    """ "LEFT KEEP (E) P: LOAD" : l'etiquette n'est pas perdue (la table se
+    fondait dans E), et l'ecriture est signalee."""
+    loads = insts_of(
+        "E:\nLOAD m, s FROM [lib://d/e.csv] (txt);\n"
+        "LEFT KEEP (E)\nP:\nLOAD m, p FROM [lib://d/p.csv] (txt);\n"
+    )
+    assert loads[1].target == "P" and loads[1].keep_other == "E"
+    assert any("apres le prefixe" in w for w in loads[1].warnings)
+
+
+def test_applymap_before_its_mapping_is_reported() -> None:
+    """Qlik s'arrete sur un mapping utilise avant d'etre charge."""
+    loads = insts_of(
+        "T:\nLOAD k, ApplyMap('M', k, 0) AS v FROM [lib://d/t.csv] (txt);\n"
+        "M:\nMAPPING LOAD k, v FROM [lib://d/m.csv] (txt);\n"
+    )
+    assert any("avant le chargement de ce mapping" in w for w in loads[0].warnings)
+
+
+def test_stacked_load_star_takes_fields_from_below() -> None:
+    """ "LOAD *, x; LOAD a, b FROM" : les champs sont connus (cle de jointure,
+    colonnes ecrites, types). L'en-tete d'un INLINE est sa premiere ligne."""
+    assert extract_fields(
+        "LOAD *, Year(d) AS An;\nLOAD a, d FROM [lib://x/c.csv];"
+    ) == [
+        "a",
+        "d",
+        "An",
+    ]
+    raw = "T:\nLOAD * INLINE [\nId, Nom\n1, a\n2, b\n];"
+    assert extract_fields(" ".join(raw.split()), raw) == ["Id", "Nom"]
+
+
+def test_raw_csv_is_not_the_output_of_the_same_name() -> None:
+    """commandes.csv, la source brute, n'est pas commandes.qvd, ecrit par un
+    autre script ; un QVD du meme nom a un autre chemin l'est."""
+    stored = {"paths": {"lib://out/commandes.qvd"}, "names": {"commandes": "a.qvs"}}
+    assert not is_output("lib://data/commandes.csv", stored)
+    assert is_output("lib://qvd/commandes.qvd", stored)
+
+
+def test_find_prefers_the_reread_for_a_produced_file(tmp_path: Path) -> None:
+    """Deux entrees repondent a "commandes" : la relecture de la sortie pour
+    le fichier produit, le CSV brut pour la source."""
+    conf = tmp_path / "conf"
+    conf.mkdir()
+    (conf / "io.yml").write_text(
+        "inputs:\n"
+        "  commandes:\n    format: csv\n    location: ${entrees}/commandes.csv\n"
+        "  commandes_relue:\n    from_output: commandes\n"
+        "outputs:\n  commandes:\n    location: ${sorties}/commandes\n",
+        encoding="utf-8",
+    )
+    io = IoConf(conf / "io.yml")
+    produced = io.find("lib://out/commandes.qvd", "input", produced=True)
+    raw = io.find("lib://data/commandes.csv", "input", produced=False)
+    assert produced is not None and produced.name == "commandes_relue"
+    assert raw is not None and raw.name == "commandes"
+
+
+def test_exists_field_is_not_read_from_the_file() -> None:
+    """Exists(champ, expr) : champ est deja charge, pas lu dans le fichier."""
+    cols, _ = columns_read(
+        "LOAD [Code] AS C, P FROM [lib://d/p.csv] (txt) WHERE Exists(C, [Code]);"
+    )
+    assert cols == ["Code", "P"]
+
+
+def test_fill_conf_rereads_an_output_named_like_an_input(project: Project) -> None:
+    """Un script lit commandes.csv et ecrit commandes.qvd, un autre relit
+    commandes.qvd : la relecture passe par from_output, pas par le CSV."""
+    (project / "data/input/commandes.csv").write_text("Id;M\n1;2\n", encoding="utf-8")
+    (project / "script_qvd/a.qvs").write_text(
+        "C:\nLOAD Id, M FROM [lib://data/commandes.csv] "
+        "(txt, utf8, embedded labels, delimiter is ';');\n"
+        "STORE C INTO [lib://out/commandes.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    (project / "script_qvd/b.qvs").write_text(
+        "R:\nLOAD Id, M FROM [lib://out/commandes.qvd] (qvd);\n"
+        "STORE R INTO [lib://out/relu.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    project.run("fill_conf.py", "script_qvd/")
+    text = (project / "conf/io.yml").read_text(encoding="utf-8")
+    assert "commandes_relue:" in text and "from_output: commandes" in text
+
+
+def test_text_numbers_use_the_script_separators() -> None:
+    """Avec DecimalSep=',', un texte "1 200,50" utilise dans un calcul est
+    lu comme un nombre ; une copie ou une comparaison a un texte ne change
+    pas, ni un script aux separateurs par defaut."""
+    ctx = ExprCtx("", decimal_sep=",", thousand_sep=" ")
+    ctx.column_types = {"M": "STRING", "S": "STRING"}
+    assert "try_cast(" in expr("M * 1.2", ctx)
+    assert "try_cast(" in expr("M >= 200", ctx)
+    assert "try_cast(" in expr("Sum(M)", ctx)
+    assert expr("M", ctx) == "M"
+    assert "try_cast(" not in expr("S <> 'test'", ctx)
+    plain = ExprCtx("", column_types={"M": "STRING"})
+    assert "try_cast(" not in expr("M * 1.2", plain)
+
+
+def run_sections(workdir: Path) -> dict[str, list[tuple]]:
+    """Execute les requetes d'un script dans l'ordre, chaque table declaree
+    en vue comme le fait le job.
+
+    Returns:
+        Les lignes de chaque table livree, sans _qlik_order, triees.
+    """
+    from check import get_parser
+
+    spark = get_parser().spark
+    manifest = json.loads((workdir / "manifest.json").read_text(encoding="utf-8"))
+    out = {}
+    for sec in manifest["sections"]:
+        if sec["status"] == "skip":
+            continue
+        df = spark.sql((workdir / sec["id"] / "query.sql").read_text(encoding="utf-8"))
+        df.createOrReplaceTempView(sec["view"])
+        rows = df.drop("_qlik_order").collect()
+        out[sec["table"]] = sorted(tuple(r) for r in rows)
+    return out
+
+
+@pytest.mark.spark
+def test_read_then_modified_table_keeps_its_state(project: Project) -> None:
+    """Un agregat lu avant un CONCATENATE, un JOIN et un DROP FIELD de sa
+    source les ignore, comme dans Qlik ; la source finale les a tous."""
+    (project / "script_qvd/ordre.qvs").write_text(
+        "V:\nLOAD * INLINE [\nId, M, Tag\n1, 10, x\n2, 20, y\n];\n"
+        "Tot:\nLOAD Sum(M) AS S, Count(Tag) AS NbTag RESIDENT V;\n"
+        "CONCATENATE (V) LOAD * INLINE [\nId, M, Tag\n3, 1000, z\n];\n"
+        "LEFT JOIN (V) LOAD * INLINE [\nId, Lib\n1, a\n1, b\n];\n"
+        "DROP FIELD Tag FROM V;\n"
+        "STORE Tot INTO [lib://out/tot.qvd] (qvd);\n"
+        "STORE V INTO [lib://out/v.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    project.run("prepare.py", "script_qvd/ordre.qvs")
+    tables = run_sections(project / "work/ordre")
+    assert tables["Tot"] == [(30, 2)]
+    final = next(rows for name, rows in tables.items() if name.startswith("V__"))
+    assert sorted(r[0] for r in final) == [1, 1, 2, 3]
+
+
+@pytest.mark.spark
+def test_crosstable_and_text_functions(project: Project) -> None:
+    """CROSSTABLE depivote les colonnes ; RENAME FIELD renomme ;
+    TextBetween, SubStringCount et Class sont traduits sans modele."""
+    (project / "script_qvd/divers.qvs").write_text(
+        "Obj:\nCROSSTABLE (Trimestre, Objectif)\n"
+        "LOAD * INLINE [\nService, T1, T2\nRH, 10, 12\n];\n"
+        "Emp:\nLOAD Nom, TextBetween(Nom, '[', ']') AS Tag, "
+        "SubStringCount(Nom, 'o') AS NbO, Class(Sal, 1000) AS Tranche "
+        "INLINE [\nNom, Sal\nBob [IT] foo, 4100\n];\n"
+        "RENAME FIELD Tranche TO Classe;\n"
+        "STORE Obj INTO [lib://out/obj.qvd] (qvd);\n"
+        "STORE Emp INTO [lib://out/emp.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    project.run("prepare.py", "script_qvd/divers.qvs")
+    manifest = json.loads(
+        (project / "work/divers/manifest.json").read_text(encoding="utf-8")
+    )
+    assert {s["status"] for s in manifest["sections"]} <= {"skip", "deterministic"}
+    emp = next(s for s in manifest["sections"] if s["table"] == "Emp")
+    assert emp["columns"] == ["Nom", "Tag", "NbO", "Classe"]
+    tables = run_sections(project / "work/divers")
+    assert tables["Obj"] == [("RH", "T1", 10), ("RH", "T2", 12)]
+    assert tables["Emp"] == [("Bob [IT] foo", "IT", 3, "4000 <= x < 5000")]

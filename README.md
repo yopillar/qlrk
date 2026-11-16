@@ -293,6 +293,11 @@ a ecrire). Elle ne peut pas porter le meme nom que la sortie : Spark refuse
 une entree et une sortie du meme nom. Le controle des requetes qui la lisent
 prend les types de la requete Spark qui ecrit la sortie.
 
+Un fichier lu n'est rattache a une sortie que par son chemin, ou par son nom
+avec la meme extension : `commandes.csv`, la source brute, et
+`commandes.qvd`, ecrit par un autre script, restent deux entrees
+differentes (`commandes` et `commandes_relue`).
+
 `fill_conf.py` ne modifie jamais une entree existante : une ancienne entree
 qui relit une sortie avec sa propre location (et souvent le meme nom que la
 sortie) est a supprimer a la main, il ecrira alors le `from_output`.
@@ -454,7 +459,25 @@ relit avec ce format.
   Qlik le fait au chargement.
 - **La casse des noms de champs** est respectee, comme dans Qlik.
 - **`Dual(texte, nombre)`** : on garde le texte, Parquet n'ayant qu'un type
-  par colonne (choix a valider).
+  par colonne (choix a valider). Pareil pour `Class(x, pas)`, qui donne
+  `3000 <= x < 4000`.
+- **Les nombres ecrits en texte** : avec `SET DecimalSep=','` (et
+  `ThousandSep`), une colonne texte comme `1 200,50` utilisee dans un calcul,
+  une comparaison a un nombre, `Sum`, `Avg`, `Round`, `RangeSum`... est lue
+  comme Qlik la lit. Sans cela, Spark donnait NULL. Une simple copie garde le
+  texte d'origine.
+- **`TextBetween`** (premiere occurrence), **`SubStringCount`**,
+  **`CROSSTABLE (attribut, donnee[, n])`** quand les colonnes sont connues, et
+  **`RENAME FIELD a TO b`** (pas `USING`, qui depend d'un mapping).
+- **Une table lue par une autre puis modifiee** (`JOIN`, `CONCATENATE`,
+  `DROP FIELD`, `RENAME FIELD`) : la lecture voit la table d'avant, comme
+  dans Qlik. Un agregat calcule avant un `CONCATENATE` ne compte pas les
+  lignes ajoutees ensuite.
+- **Les etiquettes repetees** : une boucle `FOR` qui recharge `Stocks:` avec
+  les memes champs ajoute ses lignes a `Stocks` ; avec d'autres champs, Qlik
+  cree `Stocks-1`. Un mapping utilise avant d'etre charge, ou une etiquette
+  ecrite apres le prefixe (`LEFT KEEP (A) T: LOAD`), est signale dans le
+  rapport.
 - **`JOIN`** (cles implicites, ordre des colonnes de Qlik), **`KEEP`**,
   **`CONCATENATE`**, l'auto-concatenation et **`DROP FIELD`**.
 - **`ApplyMap`**, traduit en `LEFT JOIN` sur la source du mapping, avec un
@@ -745,6 +768,10 @@ pyspark, ils sont sautes.
 - **`FieldValue('F', RecNo())`** numerote les valeurs dans l'ordre trie,
   alors que Qlik suit l'ordre de chargement.
 - **`Date(x)` sur un nombre** (date Qlik en jours) n'est pas converti.
+- **Une valeur vide dans un CSV** est une chaine vide pour Qlik, NULL pour
+  Spark : `IsText`, `Len(x) = 0` ou `x = ''` peuvent donner un autre
+  resultat. Ecrire `IsNull(x) or Len(Trim(x)) = 0`, ou le traiter dans la
+  conf de lecture.
 - **Le typage des dates repose sur `conf/schema`.** Une colonne de dates
   sans type declare n'est pas reconnue comme date par `Min`, `Max` ou
   `Peek`, et c'est le job qui plantera sur `date - date`.
