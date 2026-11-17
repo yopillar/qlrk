@@ -758,7 +758,7 @@ pyspark, ils sont sautes.
 | `assemble.py` | copie des requetes d'un script dans `src/sql/` |
 | `orchestrate.py` | ordonne les scripts, ecrit l'etape 010 (et le job s'il manque) |
 | `job_template.py` | texte du job et de l'etape 010 |
-| `verify.py` | lance le job et compare avec `data/qlik_outputs/` |
+| `verify.py` | lance le job en entier (sans `--only`) et compare avec `data/qlik_outputs/` ; `migrate.py` lance le job une seule fois puis compare chaque script |
 | `compare.py` | comparaison de deux tables |
 | `conf.py` | lecture de `conf/io.yml` et des schemas |
 | `journal.py` | tenue de `work/journal.csv` |

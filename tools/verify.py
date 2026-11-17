@@ -12,6 +12,9 @@ n'a pas pu tourner, 3 si aucune sortie n'avait d'export Qlik pour comparer.
 Un ecart dans l'ordre des lignes est signale ("identique, ordre
 different") mais ne compte comme ecart qu'avec --strict-order.
 
+Le job est lance en entier, comme avec spark-submit, sans --only : la
+facon dont le socle nomme les scripts n'entre pas en jeu.
+
 Usage :
     python tools/verify.py work/ventes            # lance le job puis compare
     python tools/verify.py work/ventes --no-run   # compare seulement
@@ -37,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from compare import compare_files  # noqa: E402
 from conf import query_sha, resolve_location, work_dir  # noqa: E402
-from job_template import function_name, job_path  # noqa: E402
+from job_template import job_path  # noqa: E402
 
 QLIK_DIR = Path("data") / "qlik_outputs"
 EXTENSIONS = (".qvd", ".csv", ".txt", ".parquet")
@@ -102,6 +105,12 @@ def main(argv: list[str] | None = None) -> int:
         "l'environnement",
     )
     p.add_argument(
+        "--started",
+        type=float,
+        help="avec --no-run : heure (epoch) du lancement du job, pour ne pas "
+        "comparer une sortie qu'il n'a pas reecrite (utilise par migrate.py)",
+    )
+    p.add_argument(
         "--strict-order",
         action="store_true",
         help="un ecart dans l'ordre des lignes compte comme un ecart",
@@ -118,7 +127,8 @@ def main(argv: list[str] | None = None) -> int:
     date_formats = [manifest.get("date_format"), manifest.get("timestamp_format")]
 
     job_failed = False
-    started = time.time()
+    started = args.started or time.time()
+    check_age = not args.no_run or args.started is not None
     if not args.no_run:
         if not job.exists():
             print(
@@ -127,7 +137,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         print(f"Execution de {job} ...")
-        res = subprocess.run([sys.executable, str(job), "--only", function_name(stem)])
+        # le job en entier, comme spark-submit : --only depend de la facon dont
+        # le socle nomme les scripts, qui n'est pas la meme partout
+        res = subprocess.run([sys.executable, str(job)])
         if res.returncode:
             # Le script s'est arrete a l'etape en echec, mais il a pu ecrire
             # les sorties d'avant : on compare quand meme ce qui existe.
@@ -170,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
             elif not Path(out_path).exists():
                 verdict, detail = "sortie absente", f"{out_path} n'existe pas"
                 n_ko += 1
-            elif not args.no_run and not written_since(Path(out_path), started):
+            elif check_age and not written_since(Path(out_path), started):
                 # l'etape en echec ne l'a pas reecrite : c'est celle d'un
                 # lancement precedent, elle ne dit rien de la requete actuelle
                 verdict, detail = (
