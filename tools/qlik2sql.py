@@ -370,6 +370,97 @@ def parse_date(sql: str, ctx: ExprCtx) -> DateSql:
     )
 
 
+ROUNDING = ("floor", "ceil", "round", "frac")
+QLIK_DAY_ZERO = "DATE'1899-12-30'"  # le jour 0 des dates Qlik
+
+
+def const_number(tokens: list[Token]) -> float | None:
+    """La valeur d'un nombre constant ecrit n ou n/m (1/24 pour une heure).
+
+    Args:
+        tokens: les jetons de l'argument.
+
+    Returns:
+        Le nombre, None s'il n'est pas constant.
+    """
+    text = "".join(str(v) for _, v in tokens).replace(" ", "")
+    m = re.fullmatch(r"\(?(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?\)?", text)
+    if not m or (m.group(2) is not None and float(m.group(2)) == 0):
+        return None
+    return float(m.group(1)) / float(m.group(2) or 1)
+
+
+def round_date(n: str, x: DateSql, step: float | None) -> str:
+    """Floor, Ceil, Round et Frac d'une date ou d'un horodatage. En Qlik une
+    date est un nombre de jours, l'heure en est la partie decimale : Floor
+    garde le jour, Floor(x, 1/24) l'heure, Frac l'heure seule.
+
+    Args:
+        n: floor, ceil, round ou frac.
+        x: la date ou l'horodatage.
+        step: le pas en jours (1 sans 2e argument).
+
+    Returns:
+        Une date, un horodatage, ou un nombre pour Frac.
+    """
+    ts = isinstance(x, TsSql)
+    secs = f"(hour({x}) * 3600 + minute({x}) * 60 + second({x}))"
+    if n == "frac":
+        return NumSql(f"({secs} / 86400.0)" if ts else "0")
+    if step is None or step <= 0:
+        raise Untranslatable(f"{n}() d'une date avec un pas non constant")
+    day = f"CAST({x} AS DATE)" if ts else str(x)
+    if step == 1:
+        if not ts:
+            return DateSql(x)
+        if n == "floor":
+            return DateSql(day)
+        if n == "round":
+            return DateSql(f"CAST({x} + INTERVAL 12 HOURS AS DATE)")
+        return DateSql(
+            f"CASE WHEN {x} = CAST({day} AS TIMESTAMP) "
+            f"THEN {day} ELSE date_add({day}, 1) END"
+        )
+    if step > 1 and step == int(step):
+        # pas en jours, compte depuis le jour 0 de Qlik
+        k = int(step)
+        days = f"datediff({day}, {QLIK_DAY_ZERO})"
+        if ts:
+            days = f"({days} + {secs} / 86400.0)"
+        return DateSql(
+            f"date_add({QLIK_DAY_ZERO}, CAST({n}({days} / {k}) * {k} AS INT))"
+        )
+    s = round(step * 86400)
+    if s < 1 or abs(s - step * 86400) > 1e-6:
+        raise Untranslatable(f"{n}() d'une date avec un pas de {step} jour")
+    if not ts:
+        return DateSql(x)
+    # pas en heures, minutes ou secondes, compte depuis minuit
+    return TsSql(
+        f"timestampadd(SECOND, CAST({n}({secs} / {s}) * {s} AS BIGINT), "
+        f"CAST({day} AS TIMESTAMP))"
+    )
+
+
+def dated(sql: str, ctx: ExprCtx) -> str:
+    """Floor(x) d'un x au type inconnu, quand le contexte dit que c'est une
+    date (Date(), comparaison avec une date) : x est lu comme horodatage puis
+    arrondi au jour. Toute autre valeur est rendue telle quelle.
+
+    Args:
+        sql: la valeur.
+        ctx: le contexte.
+
+    Returns:
+        La date, ou sql.
+    """
+    rounded = getattr(sql, "rounded", None)
+    if rounded is None:
+        return sql
+    func, x = rounded
+    return round_date(func, as_timestamp(x, ctx), 1.0)
+
+
 def as_timestamp(sql: str, ctx: ExprCtx) -> TsSql:
     """Une valeur lue comme horodatage, pour Date(Floor(x)) : texte au format
     du script (TimestampFormat, sinon DateFormat), ou date et horodatage.
@@ -574,6 +665,11 @@ class ExprParser:
                 left = as_number(left, self.ctx)
             elif isinstance(right, StrField) and is_numeric(left):
                 right = as_number(right, self.ctx)
+            # Floor(x) compare a une date : x est une date
+            if isinstance(right, DateSql):
+                left = dated(left, self.ctx)
+            if isinstance(left, DateSql):
+                right = dated(right, self.ctx)
             # date comparee a un texte : Qlik lit le texte comme une date
             if isinstance(left, DateSql) and isinstance(right, StrField):
                 right = parse_date(right, self.ctx)
@@ -616,6 +712,10 @@ class ExprParser:
         while self.peek() in (("op", "+"), ("op", "-")):
             op = self.take()[1]
             right = self.p_mul()
+            if op == "-" and isinstance(left, DateSql):
+                right = dated(right, self.ctx)
+            if op == "-" and isinstance(right, DateSql):
+                left = dated(left, self.ctx)
             if op == "-" and isinstance(left, DateSql) and isinstance(right, StrField):
                 right = parse_date(right, self.ctx)
             if op == "-" and isinstance(left, StrField) and isinstance(right, DateSql):
@@ -891,26 +991,14 @@ def translate_function(
     original = list(a)
     if n in NUMBER_ARG_FUNCTIONS:
         a = [as_number(x, ctx) for x in a]
-    if n in ("floor", "ceil") and len(a) == 1 and isinstance(a[0], DateSql):
-        # En Qlik une date est un nombre, et Floor garde le jour. Spark, lui,
-        # refuse floor() sur une date.
-        x = a[0]
-        if not isinstance(x, TsSql):
-            return DateSql(x)
-        if n == "floor":
-            return DateSql(f"CAST({x} AS DATE)")
-        return DateSql(
-            f"CASE WHEN {x} = CAST(CAST({x} AS DATE) AS TIMESTAMP) "
-            f"THEN CAST({x} AS DATE) ELSE date_add(CAST({x} AS DATE), "
-            f"1) END"
-        )
-    rounded = getattr(a[0], "rounded", None) if len(a) == 1 else None
-    if n == "date" and rounded is not None:
+    if n in ROUNDING and 1 <= len(a) <= 2 and isinstance(a[0], DateSql):
+        # Spark refuse floor() sur une date : on dit ce que Qlik fait
+        step = const_number(raw[1]) if len(a) == 2 and len(raw) == 2 else 1.0
+        return round_date(n, a[0], step)
+    if n in ("date", "timestamp") and len(a) == 1:
         # Date(Floor(x)) : le type de x n'est pas toujours connu (colonne lue
-        # par RESIDENT) et floor() de Spark refuse une date. x est donc lu
-        # comme horodatage, puis arrondi au jour comme plus haut.
-        func, x = rounded
-        return translate_function(func, [as_timestamp(x, ctx)], [], False, ctx)
+        # par RESIDENT), mais Date() dit que x est une date
+        a = [dated(a[0], ctx)]
     if n == "date" and a and isinstance(a[0], StrField):
         return parse_date(a[0], ctx)
     if n == "date" and a and isinstance(a[0], DateSql):
@@ -918,7 +1006,7 @@ def translate_function(
     sql = _translate_function(name, a, raw, distinct, ctx)
     if n in NUMBER_ARG_FUNCTIONS:
         out = NumSql(sql)
-        if n in ("floor", "ceil") and len(original) == 1:
+        if n in ROUNDING and len(original) == 1:
             if not isinstance(original[0], NumSql):
                 # retenu pour Date(Floor(x)), qui garde le jour de x
                 out.rounded = (n, original[0])  # type: ignore[attr-defined]
@@ -1235,6 +1323,18 @@ def _translate_function(
             return f"{n}({a[0]})"
         # en Qlik le 2e argument est le pas
         return f"({n}({a[0]} / {a[1]}) * {a[1]})"
+    if n in ("daystart", "dayend"):
+        need(1)
+        x = a[0] if isinstance(a[0], DateSql) else as_timestamp(a[0], ctx)
+        start = f"CAST(CAST({x} AS DATE) AS TIMESTAMP)"
+        if n == "daystart":
+            return TsSql(start)
+        # comme Qlik : la derniere milliseconde du jour
+        return TsSql(f"({start} + INTERVAL 1 DAY - INTERVAL 1 MILLISECOND)")
+    if n == "frac":
+        need(1)
+        # Frac(-1.4) vaut 0.6 en Qlik
+        return f"({a[0]} - floor({a[0]}))"
     if n == "rangesum":
         # RangeSum ignore les nulls (comptes comme 0)
         return "(" + " + ".join(f"COALESCE({x}, 0)" for x in a) + ")"

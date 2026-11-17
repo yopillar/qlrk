@@ -471,3 +471,75 @@ def test_date_of_floor_keeps_the_day() -> None:
     ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
     ctx.column_types = {"m": "DOUBLE"}
     assert expr("Date(Floor(m))", ctx).lower().count("floor(") == 1
+
+
+@pytest.mark.spark
+def test_qlik_day_rounding_of_timestamps() -> None:
+    """Floor, Ceil, Round et Frac d'un horodatage disent ce que Qlik fait :
+    une date y est un nombre de jours, l'heure sa partie decimale."""
+    from check import get_parser
+
+    spark = get_parser().spark
+    expected = {
+        "Floor(d)": "2024-01-30",
+        "Round(d)": "2024-01-31",
+        "Floor(d, 1/24)": "2024-01-30 15:00:00",
+        "Ceil(d, 1/24)": "2024-01-30 16:00:00",
+        "Round(d, 1/96)": "2024-01-30 15:45:00",
+        "Floor(d, 7)": "2024-01-27",
+        "DayStart(d)": "2024-01-30 00:00:00",
+        "Frac(d) * 24": "15.75",
+        "Floor(d) - Floor(e)": "2",
+        "Frac(m)": "0.6",
+    }
+    for typ in ("TIMESTAMP", None):
+        ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
+        ctx.column_types = {"d": typ, "e": typ, "m": "DOUBLE"} if typ else {}
+        for text, value in expected.items():
+            if typ is None and text not in ("DayStart(d)", "Frac(m)"):
+                continue
+            sql = expr(text, ctx)
+            rows = spark.sql(
+                f"SELECT {sql} FROM VALUES (TIMESTAMP'2024-01-30 15:45:00', "
+                "TIMESTAMP'2024-01-28 08:00:00', -1.4) AS t(d, e, m)"
+            ).collect()
+            assert str(rows[0][0]).rstrip("0").rstrip(".") == value.rstrip("0").rstrip(
+                "."
+            ), (typ, text, sql)
+    # type inconnu, mais compare a une date : d est une date
+    ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
+    sql = expr("If(Floor(d) >= MakeDate(2024, 1, 30), 1, 0)", ctx)
+    rows = spark.sql(
+        f"SELECT {sql} FROM VALUES (TIMESTAMP'2024-01-30 15:45:00') AS t(d)"
+    ).collect()
+    assert rows[0][0] == 1, sql
+
+
+def test_spark_types_reach_the_next_tables(project: Project) -> None:
+    """Le type qu'a calcule Spark pour une table est connu des tables qui la
+    relisent au passage suivant : Floor d'un horodatage n'y est plus floor()
+    d'un nombre."""
+    (project / "script_qvd/jours.qvs").write_text(
+        "Src:\nLOAD * INLINE [\nd\n2024-01-30 15:45:00\n];\n"
+        "STORE Src INTO [lib://o/src.qvd] (qvd);\n"
+        "T:\nNoConcatenate LOAD Floor(d) AS Jour RESIDENT Src;\n"
+        "STORE T INTO [lib://o/t.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    project.run("prepare.py", "script_qvd/jours.qvs")
+    mpath = project / "work/jours/manifest.json"
+    manifest = json.loads(mpath.read_text(encoding="utf-8"))
+    t_id = next(s["id"] for s in manifest["sections"] if s["table"] == "T")
+    query = project / "work/jours" / t_id / "query.sql"
+    assert "floor(d)" in query.read_text(encoding="utf-8")  # type encore inconnu
+    src = next(s for s in manifest["sections"] if s["table"] == "Src")
+    src["output_types"], src["output_types_sure"] = {"d": "TIMESTAMP"}, True
+    mpath.write_text(json.dumps(manifest), encoding="utf-8")
+
+    project.run("prepare.py", "script_qvd/jours.qvs")
+    again = json.loads(mpath.read_text(encoding="utf-8"))
+    sec = next(s for s in again["sections"] if s["table"] == "T")
+    draft = (project / "work/jours" / sec["id"] / "query.sql").read_text(
+        encoding="utf-8"
+    )
+    assert "CAST(d AS DATE)" in draft and "floor(" not in draft

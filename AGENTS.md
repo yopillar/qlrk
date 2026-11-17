@@ -23,6 +23,10 @@ never write files. Think in English; SQL comments in French. Answer with one
 - `AddMonths(d, n)` is `add_months(d, n)` (plural). `add_month`, `month_add`
   and `dateadd` do not exist in Spark. `AddYears(d, n)` is
   `add_months(d, 12 * n)`.
+- A Qlik date is a number of days, the time is its decimal part. Spark
+  `floor()` refuses a date or timestamp: `Floor(d)` / `Date(Floor(d))` is
+  `CAST(d AS DATE)`, `DayStart(d)` is `CAST(CAST(d AS DATE) AS TIMESTAMP)`,
+  `Floor(d, 1/24)` keeps the hour, `Frac(d)` is the time as a day fraction.
 - An empty string `''` is not null in Qlik.
 
 ## Spark SQL 3.5.8 (not Databricks, not Spark 4)

@@ -2734,6 +2734,10 @@ def prepare(
             types = {c: t for c, t in found.items() if sure or t != "STRING"}
         if types:
             inputs[view]["types"] = types
+            # connus aussi du traducteur : Floor(d) d'une date relue n'est
+            # pas floor() d'un nombre
+            for c_, t_ in types.items():
+                conf_types.setdefault(c_, t_)
         return view
 
     def file_schema(path: str) -> list[str] | None:
@@ -2962,6 +2966,12 @@ def prepare(
             for key in ("output_types", "output_types_sure"):
                 if key in old:
                     sec[key] = old[key]
+        # Types calcules par Spark au passage precedent : les tables
+        # suivantes les connaissent (une colonne au type inconnu est lue par
+        # RESIDENT, et Floor d'une date n'est pas floor d'un nombre).
+        for c_, t_ in (old.get("output_types") or {}).items():
+            if old.get("output_types_sure") or str(t_).upper() != "STRING":
+                conf_types.setdefault(c_, str(t_).lower())
         sections.append(sec)
 
     # avertissements de l'analyse (auto-concatenation, cle de jointure
