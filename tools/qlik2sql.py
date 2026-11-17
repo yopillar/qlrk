@@ -1659,6 +1659,8 @@ class SectionContext:
     thousand_sep: str | None = None
     # version d'une table dont celle-ci repart (lue puis modifiee)
     table_base: Callable[[str], str | None] = lambda t: None
+    # tables calculees dans cette section (vide : toutes)
+    section_tables: set[str] = field(default_factory=set)
 
 
 class SectionTranslator:
@@ -2645,12 +2647,18 @@ class SectionTranslator:
             self.ctx.graph_schema(base),
         )
 
+    def own_keys(self, inst: Inst) -> list[str]:
+        """Tables touchees par l'instruction qui sont calculees dans cette
+        section (un DROP FIELD peut en toucher d'autres, ailleurs)."""
+        mine = self.ctx.section_tables
+        return [k for k in inst.keys if not mine or k in mine]
+
     def drop_field(self, inst: Inst, line: int) -> None:
         """DROP FIELD : nouvelle CTE sans les champs supprimes."""
-        for key in inst.keys:
+        for key in self.own_keys(inst):
             self.seed(key)
         targets = (
-            [k for k in inst.keys if k in self.cur]
+            [k for k in self.own_keys(inst) if k in self.cur]
             if inst.keys
             else [inst.target]
             if inst.target
@@ -2679,7 +2687,7 @@ class SectionTranslator:
         """RENAME FIELD : nouvelle CTE ou les champs changent de nom, dans
         chaque table qui les a."""
         names = dict(inst.renames)
-        for key in inst.keys:
+        for key in self.own_keys(inst):
             self.seed(key)
         targets = [
             t for t in self.cur if set(names) & set(self.cols[self.cur[t]] or [])

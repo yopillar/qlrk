@@ -307,3 +307,27 @@ def test_calendar_bounds_read_with_peek_in_while(project: Project) -> None:
     project.run("prepare.py", "script_qvd/cal.qvs")
     tables = run_sections(project / "work/cal")
     assert len(tables["Cal"]) == 4
+
+
+def test_drop_field_on_several_read_tables(project: Project) -> None:
+    """DROP FIELD sans FROM sur deux tables lues avant : chaque nouvelle
+    version recoit l'instruction (une section restait vide et prepare.py
+    plantait sur ses lignes)."""
+    (project / "script_qvd/deux.qvs").write_text(
+        "A:\nLOAD * INLINE [\nk, x, Tmp\n1, 2, a\n];\n"
+        "B:\nLOAD * INLINE [\nk, y, Tmp\n1, 3, b\n];\n"
+        "C:\nLOAD k, Tmp AS t1 RESIDENT A;\n"
+        "D:\nLOAD k, Tmp AS t2 RESIDENT B;\n"
+        "DROP FIELD Tmp;\n"
+        "STORE C INTO [lib://o/c.qvd] (qvd);\n"
+        "STORE D INTO [lib://o/d.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    project.run("prepare.py", "script_qvd/deux.qvs")
+    manifest = json.loads(
+        (project / "work/deux/manifest.json").read_text(encoding="utf-8")
+    )
+    by_table = {s["table"]: s for s in manifest["sections"]}
+    for name in ("A__2", "B__2"):
+        assert by_table[name]["status"] == "deterministic"
+        assert "Tmp" not in by_table[name]["columns"]

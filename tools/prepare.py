@@ -2736,9 +2736,16 @@ def prepare(
     sections = []
     produced: list[str] = []  # tables deja calculees (vues SQL)
     for g in (["__init__"] if has_init else []) + order:
-        ks = sorted(k for k, sg in sec_of.items() if sg == g)
-        sec_insts = [insts[k] for k in ks]
         names = [] if g == "__init__" else groups[g]
+        # Une instruction qui touche plusieurs tables (DROP FIELD sans FROM,
+        # RENAME FIELD, DROP TABLES A, B) va dans chacune de leurs sections,
+        # pas seulement dans la premiere : sinon une section restait sans
+        # elle, voire vide.
+        ks = sorted(
+            {k for k, sg in sec_of.items() if sg == g}
+            | {k for n in names for k in tables[n]["insts"]}
+        )
+        sec_insts = [insts[k] for k in ks]
         outputs, output_io = {}, {}
         for n in names:
             for _, path, _fmt, _fields in tables[n]["stored"]:
@@ -2826,6 +2833,7 @@ def prepare(
             decimal_sep=env.vars.get("DecimalSep"),
             thousand_sep=env.vars.get("ThousandSep"),
             table_base=lambda t: tables.get(t, {}).get("base"),
+            section_tables=set(names),
         )
         header = (
             f"-- Section {sec['id']} : table {g}"
