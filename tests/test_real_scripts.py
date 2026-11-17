@@ -439,3 +439,35 @@ def test_two_argument_if_from_the_model_is_completed() -> None:
     spark = get_parser().spark
     rows = spark.sql(f"SELECT {answer} FROM VALUES (2), (0) AS t(n)").collect()
     assert [r[0] for r in rows] == ["grand", None]
+
+
+@pytest.mark.spark
+def test_date_of_floor_keeps_the_day() -> None:
+    """Date(Floor(d)) garde le jour de d, Date(Ceil(d)) le jour suivant s'il
+    y a une heure : floor() de Spark refuse une date ou un horodatage, quel
+    que soit le type de d (connu ou non)."""
+    from check import get_parser
+
+    spark = get_parser().spark
+    values = {
+        "DATE": ("DATE'2024-01-30'", "2024-01-30"),
+        "TIMESTAMP": ("TIMESTAMP'2024-01-30 15:45:00'", "2024-01-31"),
+        "STRING": ("'30/01/2024 15:45:00'", "2024-01-31"),
+        "text": ("'30/01/2024'", "2024-01-30"),
+        None: ("TIMESTAMP'2024-01-30 23:59:00'", "2024-01-31"),
+    }
+    for typ, (value, ceil) in values.items():
+        ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
+        known = "STRING" if typ == "text" else typ
+        ctx.column_types = {"d": known} if known else {}
+        for text, day in (
+            ("Date(Floor(d))", "2024-01-30"),
+            ("Date(Ceil(d), 'DD/MM/YYYY')", ceil),
+        ):
+            sql = expr(text, ctx)
+            assert "floor(" not in sql.lower() and "ceil(" not in sql.lower()
+            rows = spark.sql(f"SELECT {sql} FROM VALUES ({value}) AS t(d)").collect()
+            assert str(rows[0][0]) == day, (typ, text, sql)
+    ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
+    ctx.column_types = {"m": "DOUBLE"}
+    assert expr("Date(Floor(m))", ctx).lower().count("floor(") == 1

@@ -350,6 +350,7 @@ class NumSql(str):
 DATE_TYPES = ("date",)
 TS_TYPES = ("timestamp", "datetime")
 STR_TYPES = ("string", "str", "text", "varchar", "char")
+NUM_TYPES = ("double", "float", "decimal", "bigint", "int", "integer", "smallint")
 
 
 def parse_date(sql: str, ctx: ExprCtx) -> DateSql:
@@ -367,6 +368,29 @@ def parse_date(sql: str, ctx: ExprCtx) -> DateSql:
         f"COALESCE(CAST(try_to_timestamp(CAST({sql} AS STRING), "
         f"{sql_string(fmt)}) AS DATE), try_cast({sql} AS DATE))"
     )
+
+
+def as_timestamp(sql: str, ctx: ExprCtx) -> TsSql:
+    """Une valeur lue comme horodatage, pour Date(Floor(x)) : texte au format
+    du script (TimestampFormat, sinon DateFormat), ou date et horodatage.
+
+    Args:
+        sql: la valeur, de type inconnu ou texte.
+        ctx: le contexte, avec les formats du script.
+
+    Returns:
+        Un horodatage.
+    """
+    if not isinstance(sql, StrField):
+        return TsSql(f"CAST({sql} AS TIMESTAMP)")
+    day = f"CAST({parse_date(sql, ctx)} AS TIMESTAMP)"
+    try:
+        fmt = sql_string(qlik_format_to_spark(ctx.timestamp_format or ""))
+    except Untranslatable:
+        return TsSql(day)
+    if not ctx.timestamp_format:
+        return TsSql(day)
+    return TsSql(f"COALESCE(try_to_timestamp(CAST({sql} AS STRING), {fmt}), {day})")
 
 
 def as_date(sql: str, ctx: ExprCtx) -> str:
@@ -667,6 +691,8 @@ class ExprParser:
             return DateSql(sql)
         if t in STR_TYPES:
             return StrField(sql)
+        if t in NUM_TYPES:
+            return NumSql(sql)
         return sql
 
     def call(self, name: str) -> str:
@@ -862,6 +888,7 @@ def translate_function(
         return with_display(value, text) if text else value
     if n in DATE_ARG_FUNCTIONS and a:
         a = [as_date(a[0], ctx)] + a[1:]
+    original = list(a)
     if n in NUMBER_ARG_FUNCTIONS:
         a = [as_number(x, ctx) for x in a]
     if n in ("floor", "ceil") and len(a) == 1 and isinstance(a[0], DateSql):
@@ -877,13 +904,25 @@ def translate_function(
             f"THEN CAST({x} AS DATE) ELSE date_add(CAST({x} AS DATE), "
             f"1) END"
         )
+    rounded = getattr(a[0], "rounded", None) if len(a) == 1 else None
+    if n == "date" and rounded is not None:
+        # Date(Floor(x)) : le type de x n'est pas toujours connu (colonne lue
+        # par RESIDENT) et floor() de Spark refuse une date. x est donc lu
+        # comme horodatage, puis arrondi au jour comme plus haut.
+        func, x = rounded
+        return translate_function(func, [as_timestamp(x, ctx)], [], False, ctx)
     if n == "date" and a and isinstance(a[0], StrField):
         return parse_date(a[0], ctx)
     if n == "date" and a and isinstance(a[0], DateSql):
         return DateSql(a[0] if not isinstance(a[0], TsSql) else f"CAST({a[0]} AS DATE)")
     sql = _translate_function(name, a, raw, distinct, ctx)
     if n in NUMBER_ARG_FUNCTIONS:
-        return NumSql(sql)
+        out = NumSql(sql)
+        if n in ("floor", "ceil") and len(original) == 1:
+            if not isinstance(original[0], NumSql):
+                # retenu pour Date(Floor(x)), qui garde le jour de x
+                out.rounded = (n, original[0])  # type: ignore[attr-defined]
+        return out
     # Min, Max, FirstValue... d'une date restent des dates. Sans ce typage,
     # le calendrier classique (Min/Max d'une date, LET vMin = Peek(...), puis
     # AUTOGENERATE vMax - vMin + 1) faisait date - date en Spark, qui donne
