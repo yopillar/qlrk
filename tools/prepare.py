@@ -53,6 +53,7 @@ from conf import (  # noqa: E402
 from qlik2sql import (
     FEW_COLUMNS,
     SectionContext,  # noqa: E402
+    ident,
     translate_section,
     used_columns,
     view_name,
@@ -2055,9 +2056,13 @@ If information is missing to translate an expression safely, answer
 - A string with an apostrophe uses double quotes: "l'ete" (never '').
 - `_qlik_order` is the Qlik load order (array<bigint>): use it in
   `OVER (ORDER BY ...)` for Peek, Previous, RowNo and running totals.
-- Use only the columns listed for each expression; types in parentheses
-  come from conf/schema (a column without type: see the Qlik statement).
-  On wide tables only the columns the expression uses are listed.
+- Use only the columns listed for each expression, written exactly as
+  listed: a name with a special character (#, space, dot...) keeps its
+  backticks, e.g. `TST#TEST`. Types in parentheses come from conf/schema
+  (a column without type: see the Qlik statement). On wide tables only the
+  columns the expression uses are listed.
+- Qlik functions do not exist in Spark: IsNum(x) is `try_cast(x AS DOUBLE)
+  IS NOT NULL`, Len is length, Trim is trim. Never invent a function name.
 
 # Expressions
 {holes}
@@ -2075,7 +2080,9 @@ def hole_block(h: dict) -> str:
             if len(h["columns"]) <= FEW_COLUMNS
             else used_columns(h["columns"], h["qlik"])
         )
-        cols = ", ".join(f"{c} ({types[c]})" if c in types else c for c in shown)
+        cols = ", ".join(
+            f"{ident(c)} ({types[c]})" if c in types else ident(c) for c in shown
+        )
         if len(shown) < len(h["columns"]):
             cols += (
                 f" (+ {len(h['columns']) - len(shown)} other columns, "

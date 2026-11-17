@@ -102,3 +102,35 @@ def test_hand_edited_query_is_never_retranslated(project: Project) -> None:
     project.run("check.py", "work/codes", "--parse", "--mark", check=False)
     refused = table(mpath, sec["id"])
     assert refused["status"] == "escalade" and "auto_retry" not in refused
+
+
+def test_accepted_answer_reused_without_the_model(
+    project: Project, tmp_path: Path
+) -> None:
+    """Une table retraduite (son brouillon a change) reprend d'abord la
+    reponse deja acceptee du cache : si Spark l'accepte, le modele n'est pas
+    appele, meme s'il ne repond que des betises."""
+    (project / "script_qvd/codes.qvs").write_text(SCRIPT, encoding="utf-8")
+    key = "condition||" + "PurgeChar(Code, Liste) = 'a'"
+    (project / "work").mkdir(exist_ok=True)
+    (project / "work/expressions.json").write_text(
+        json.dumps({key: {"sql": RIGHT, "verified": False, "tables": []}}),
+        encoding="utf-8",
+    )
+    project.run("prepare.py", "script_qvd/codes.qvs")
+    bad = tmp_path / "opencode"
+    bad.write_text(f"#!{sys.executable}\nprint('rien a voir')\n", encoding="utf-8")
+    bad.chmod(0o755)
+    project.run(
+        "translate.py", "work/codes", "--skip-selftest", "--opencode-bin", str(bad)
+    )
+    mpath = project / "work/codes/manifest.json"
+    sec = next(
+        s
+        for s in json.loads(mpath.read_text(encoding="utf-8"))["sections"]
+        if s["table"] == "T"
+    )
+    assert sec["status"] == "ok"
+    assert RIGHT in (project / "work/codes" / sec["id"] / "query.sql").read_text(
+        encoding="utf-8"
+    )

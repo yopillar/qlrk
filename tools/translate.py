@@ -532,6 +532,31 @@ def holes_phase(
     errors: list[str] = []
     previous, more = "", False
     baseline = set(translator_errors(sec, out, parser))
+    # Reponses deja acceptees pour ces memes expressions (cache, ou passage
+    # precedent de cette table avant que son brouillon ne change) : on les
+    # essaie d'abord telles quelles. Si Spark accepte, pas d'appel au modele.
+    hints = {h["id"]: h["hint"] for h in sec.get("holes", []) if h.get("hint")}
+    if hints and not args.dry_run:
+        out.write_text(fill_holes(base, hints), encoding="utf-8")
+        problems, _ = check_section(sec, out, parser)
+        problems = [
+            p
+            for p in problems
+            if "TODO(model)" not in p
+            and p not in baseline
+            and not (statement_left and p.startswith("colonnes de sortie"))
+        ]
+        if problems:
+            out.write_text(base, encoding="utf-8")
+        else:
+            answers.update(hints)
+            pending = [k for k in pending if k not in answers]
+            print(
+                f"    {sec['id']} : {len(hints)} expression(s) reprise(s) des "
+                "reponses deja acceptees, sans le modele"
+            )
+            if not pending:
+                return answers, []
     # +1 pour la passe avec plus de contexte
     for _ in range(args.retries + 2):
         msg = prompt + (MORE_CONTEXT.format(draft=condensed) if more else "")
