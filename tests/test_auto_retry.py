@@ -134,3 +134,35 @@ def test_accepted_answer_reused_without_the_model(
     assert RIGHT in (project / "work/codes" / sec["id"] / "query.sql").read_text(
         encoding="utf-8"
     )
+
+
+def test_model_answer_repaired_without_a_new_call(
+    project: Project, tmp_path: Path
+) -> None:
+    """Le modele ecrit un nom avec # sans backticks et un if a deux
+    arguments : le kit repare en Python, la table passe au premier appel."""
+    (project / "script_qvd/diese.qvs").write_text(
+        "Src:\nLOAD * INLINE [\nCode#X, Liste\na1, 1\n];\n"
+        "T:\nNoConcatenate LOAD [Code#X] RESIDENT Src "
+        "WHERE PurgeChar([Code#X], Liste) = 'a';\n"
+        "STORE T INTO [lib://out/t.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    project.run("prepare.py", "script_qvd/diese.qvs")
+    answer = "h1: if(translate(Code#X, Liste, '') = 'a', true)"
+    event = json.dumps({"type": "text", "part": {"type": "text", "text": answer}})
+    fake = tmp_path / "opencode"
+    fake.write_text(f"#!{sys.executable}\nprint({event!r})\n", encoding="utf-8")
+    fake.chmod(0o755)
+    project.run(
+        "translate.py", "work/diese", "--skip-selftest", "--opencode-bin", str(fake)
+    )
+    manifest = json.loads(
+        (project / "work/diese/manifest.json").read_text(encoding="utf-8")
+    )
+    sec = next(s for s in manifest["sections"] if s["table"] == "T")
+    assert sec["status"] == "ok"
+    query = (project / "work/diese" / sec["id"] / "query.sql").read_text(
+        encoding="utf-8"
+    )
+    assert "translate(`Code#X`, Liste, '') = 'a', true, NULL" in query

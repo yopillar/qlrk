@@ -49,6 +49,7 @@ import journal  # noqa: E402
 from check import SparkChecker, check_section, get_parser  # noqa: E402
 from conf import query_sha, work_dir  # noqa: E402
 from prepare import fill_holes, hole_key, load_cache  # noqa: E402
+from repair import fix_spark_if, repair  # noqa: E402
 
 # Le prompt est passe en argument d'opencode run, pas dans un fichier, donc le
 # modele n'a rien a lire et aucune permission a demander. Limite : un argument
@@ -84,68 +85,6 @@ def extract_sql(text: str) -> str | None:
     if m and re.search(r"\bSELECT\b", text[m.start() :], re.I):
         return text[m.start() :].strip()
     return None
-
-
-def _skip_quoted(sql: str, i: int) -> int:
-    """Position juste apres une chaine '...', un nom `...` ou un
-    commentaire -- qui commence en i ; i lui-meme sinon."""
-    if sql.startswith("--", i):
-        end = sql.find("\n", i)
-        return len(sql) if end == -1 else end
-    if sql[i] in "'\"`":
-        quote, j = sql[i], i + 1
-        while j < len(sql) and sql[j] != quote:
-            j += 2 if sql[j] == "\\" else 1
-        return j + 1
-    return i
-
-
-def fix_spark_if(sql: str) -> str:
-    """Complete les if(cond, valeur) a deux arguments par NULL.
-
-    Qlik accepte If(cond, valeur) (NULL sinon) ; le if de Spark exige trois
-    arguments, et le modele recopie souvent l'ecriture de Qlik. Ajouter NULL
-    donne exactement le resultat de Qlik.
-
-    Args:
-        sql: une expression ou une requete renvoyee par le modele.
-
-    Returns:
-        La meme, avec ses if a deux arguments completes.
-    """
-    starts = []
-    i = 0
-    while i < len(sql):
-        j = _skip_quoted(sql, i)
-        if j != i:
-            i = j
-            continue
-        m = re.match(r"if\s*\(", sql[i:], re.I)
-        if m and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] in "_.`")):
-            starts.append(i + m.end() - 1)
-        i += 1
-    # de la fin vers le debut : les if imbriques d'abord, sans decaler les
-    # positions de ceux d'avant
-    for open_pos in reversed(starts):
-        depth, commas, k = 0, 0, open_pos
-        while k < len(sql):
-            j = _skip_quoted(sql, k)
-            if j != k:
-                k = j
-                continue
-            ch = sql[k]
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            elif ch == "," and depth == 1:
-                commas += 1
-            k += 1
-        if k < len(sql) and commas == 1:
-            sql = sql[:k] + ", NULL" + sql[k:]
-    return sql
 
 
 def short_error(error: str) -> str:
@@ -352,7 +291,7 @@ def answer_sql(ok: bool, log: str, events: dict) -> tuple[str | None, str | None
         return answer, None, False
     sql = extract_sql(answer or "")
     if sql:
-        return answer, fix_spark_if(sql), False
+        return answer, sql, False
     for content in sorted(events.get("tool_inputs", []), key=len, reverse=True):
         sql = extract_sql(content)
         if sql:
@@ -646,7 +585,9 @@ def holes_phase(
         if not ok:
             errors = ["the previous call failed: answer with plain text"]
             continue
-        given = parse_holes(text)
+        # reparations sures en Python (backticks, if a 2 arguments) avant le
+        # controle : pas besoin de redemander au modele
+        given = {k: repair(v, sec, parser) for k, v in parse_holes(text).items()}
         previous = "\n".join(f"{k}: {v}" for k, v in given.items())
         unknown = [k for k in pending if given.get(k) == "?"]
         tentative = {k: v for k, v in given.items() if k in pending and v != "?"}
@@ -723,6 +664,9 @@ def statement_phase(
             continue
         if sql:
             full, missing = splice(draft, sql)
+            # reparations sures en Python (backticks, if a 2 arguments,
+            # SELECT * EXCEPT) avant le controle
+            full = repair(full, sec, parser)
             out.write_text(full, encoding="utf-8")
             (d / f"query.attempt{attempt}.sql").write_text(full, encoding="utf-8")
             previous = sql

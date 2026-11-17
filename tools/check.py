@@ -237,6 +237,49 @@ class SparkChecker:
         except Exception as exc:
             return "syntaxe SQL : " + spark_message(exc)[:300]
 
+    def _declare_views(self, views: dict) -> None:
+        """Declare les vues lues par une table, vides, avec leurs colonnes
+        et leurs types. A appeler sous self.lock.
+
+        Args:
+            views: les vues de la section.
+        """
+        for name, v in views.items():
+            types = v.get("types") or {}
+            cols = [
+                f"CAST(NULL AS {spark_type(types.get(c))}) AS `{c.replace('`', '``')}`"
+                for c in dict.fromkeys(v["columns"])
+                if c != "_qlik_order"
+            ]
+            cols.append("CAST(NULL AS ARRAY<BIGINT>) AS _qlik_order")
+            self.spark.sql(
+                f"SELECT {', '.join(cols)} WHERE false"
+            ).createOrReplaceTempView(name)
+            # vue de FileTime(), creee par read_input a cote de l'entree
+            self.spark.sql(
+                "SELECT CAST(NULL AS TIMESTAMP) AS file_time"
+            ).createOrReplaceTempView(name + FILE_VIEW_SUFFIX)
+
+    def columns_of(self, section: dict, sql: str) -> list[str] | None:
+        """Colonnes que Spark donne a une requete, sur les vues vides de la
+        section (rien n'est execute).
+
+        Args:
+            section: la table, avec ses vues.
+            sql: la requete.
+
+        Returns:
+            Les noms des colonnes, ou None si Spark ne peut pas l'analyser.
+        """
+        if unknown_columns(section):
+            return None
+        with self.lock:
+            try:
+                self._declare_views(section.get("views", {}))
+                return list(self.spark.sql(sql).schema.names)
+            except Exception:
+                return None
+
     def analyze(self, section: dict, sql: str) -> str | None:
         """Erreur de l'analyse Spark sur des vues vides, ou None.
 
@@ -251,22 +294,7 @@ class SparkChecker:
             return None
         with self.lock:
             try:
-                for name, v in views.items():
-                    types = v.get("types") or {}
-                    cols = [
-                        f"CAST(NULL AS {spark_type(types.get(c))}) AS "
-                        f"`{c.replace('`', '``')}`"
-                        for c in dict.fromkeys(v["columns"])
-                        if c != "_qlik_order"
-                    ]
-                    cols.append("CAST(NULL AS ARRAY<BIGINT>) AS _qlik_order")
-                    self.spark.sql(
-                        f"SELECT {', '.join(cols)} WHERE false"
-                    ).createOrReplaceTempView(name)
-                    # vue de FileTime(), creee par read_input a cote de l'entree
-                    self.spark.sql(
-                        "SELECT CAST(NULL AS TIMESTAMP) AS file_time"
-                    ).createOrReplaceTempView(name + FILE_VIEW_SUFFIX)
+                self._declare_views(views)
                 schema = self.spark.sql(sql).schema  # rien n'est execute
                 # Types des colonnes produites, tels que Spark les ecrira :
                 # fill_conf.py s'en sert pour le schema d'un fichier relu par
