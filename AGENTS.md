@@ -24,3 +24,13 @@ never write files. Think in English; SQL comments in French. Answer with one
   and `dateadd` do not exist in Spark. `AddYears(d, n)` is
   `add_months(d, 12 * n)`.
 - An empty string `''` is not null in Qlik.
+
+## Spark SQL 3.5.8 (not Databricks, not Spark 4)
+- No `SELECT * EXCEPT (col)`: list the columns you keep.
+- `instr(str, substr)` has 2 arguments only. Nth occurrence:
+  `length(substring_index(str, substr, n)) + 1`.
+- No `regexp_last`, no `>>`/`<<` operators (`shiftright`, `shiftleft`).
+- Qlik functions do not exist in Spark: `IsNum(x)` is
+  `try_cast(x AS DOUBLE) IS NOT NULL`, `RangeMax(a, b)` is `greatest(a, b)`.
+- A column name with a special character (#, space, dot) stays in
+  backticks: `TST#TEST`.

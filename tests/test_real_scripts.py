@@ -331,3 +331,52 @@ def test_drop_field_on_several_read_tables(project: Project) -> None:
     for name in ("A__2", "B__2"):
         assert by_table[name]["status"] == "deterministic"
         assert "Tmp" not in by_table[name]["columns"]
+
+
+@pytest.mark.spark
+def test_index_with_computed_arguments() -> None:
+    """Index(texte, motif, n) avec un motif ou un rang calcules : traduit
+    sans instr a 3 arguments (absent de Spark 3.5)."""
+    from check import get_parser
+
+    spark = get_parser().spark
+    sql = expr("Index(s, m, n)", ExprCtx())
+    assert "instr" not in sql
+    rows = spark.sql(
+        f"SELECT {sql} FROM VALUES ('a-b-c', '-', 2), ('a-b-c', '-', -1), "
+        "('a-b-c', '-', 5), ('a-b-c', '-', 0) AS t(s, m, n)"
+    ).collect()
+    assert [r[0] for r in rows] == [4, 4, 0, 0]
+
+
+def test_select_star_except_is_refused(tmp_path: Path) -> None:
+    """SELECT * EXCEPT : message clair pour le modele, Spark 3.5 ne le
+    connait pas."""
+    from check import check_section
+
+    query = tmp_path / "query.sql"
+    query.write_text("-- l.1 : T\nSELECT * EXCEPT (a) FROM in_t\n", encoding="utf-8")
+    errors, _ = check_section({"views": {"in_t": {}}, "statement_lines": [1]}, query)
+    assert any("EXCEPT" in e and "lister les colonnes" in e for e in errors)
+
+
+def test_new_version_keeps_translated_columns(project: Project) -> None:
+    """LOAD * d'un fichier decrit par conf/schema, lu puis DROP FIELD : la
+    nouvelle version reprend les colonnes que la traduction connait (le
+    graphe, lui, ne les connait pas) et reste traduite sans modele."""
+    (project / "script_qvd/v.qvs").write_text(
+        "V:\nLOAD * FROM [lib://data/ventes.csv] "
+        "(txt, utf8, embedded labels, delimiter is ',');\n"
+        "A:\nLOAD Site, Count(Produit) AS Nb RESIDENT V GROUP BY Site;\n"
+        "DROP FIELD Montant FROM V;\n"
+        "STORE V INTO [lib://out/v.qvd] (qvd);\n"
+        "STORE A INTO [lib://out/a.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    project.run("prepare.py", "script_qvd/v.qvs")
+    manifest = json.loads(
+        (project / "work/v/manifest.json").read_text(encoding="utf-8")
+    )
+    v2 = next(s for s in manifest["sections"] if s["table"] == "V__2")
+    assert v2["status"] == "deterministic"
+    assert v2["columns"] == ["Site", "Produit"]

@@ -547,6 +547,12 @@ def check_section(
             " + les CTE de la requete)"
         )
 
+    if re.search(r"\*\s*EXCEPT\s*\(", code_no_idents, re.I):
+        # Spark 3.5 repond "syntax error at or near <colonne>", peu parlant
+        errors.append(
+            "SELECT * EXCEPT (...) n'existe pas en Spark 3.5 (Databricks, "
+            "Spark 4) : lister les colonnes gardees"
+        )
     if re.search(r"\bmonotonically_increasing_id\s*\(", code_no_idents, re.I):
         errors.append(
             "monotonically_increasing_id() interdit : Spark le refuse dans un "

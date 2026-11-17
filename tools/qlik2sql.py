@@ -1002,7 +1002,20 @@ def _translate_function(
             ),
         )
         if sub is None or occ is None:
-            raise Untranslatable("Index() avec 3 arguments non litteraux")
+            # motif ou rang calcules : meme calcul, sans expression reguliere
+            # (instr n'a que 2 arguments en Spark 3.5)
+            s_, m_, k_ = a[0], a[1], a[2]
+            count = (
+                f"((length({s_}) - length(replace({s_}, {m_}, ''))) div length({m_}))"
+            )
+            return (
+                f"CASE WHEN {k_} = 0 THEN 0 "
+                f"WHEN {k_} > 0 THEN CASE WHEN {count} >= {k_} "
+                f"THEN length(substring_index({s_}, {m_}, {k_})) + 1 ELSE 0 END "
+                f"ELSE CASE WHEN {count} >= - {k_} THEN length({s_}) - "
+                f"length(substring_index({s_}, {m_}, {k_})) - length({m_}) + 1 "
+                f"ELSE 0 END END"
+            )
         nth = int(float(occ))
         count = f"(size(split({a[0]}, {sql_string(regex_escape(sub))})) - 1)"
         if nth == 0:
@@ -1661,6 +1674,9 @@ class SectionContext:
     table_base: Callable[[str], str | None] = lambda t: None
     # tables calculees dans cette section (vide : toutes)
     section_tables: set[str] = field(default_factory=set)
+    # colonnes d'une table d'une section deja traduite (plus sures que le
+    # graphe, qui ne connait pas toujours celles d'un LOAD *)
+    table_columns: Callable[[str], list[str] | None] = lambda t: None
 
 
 class SectionTranslator:
@@ -2644,7 +2660,7 @@ class SectionTranslator:
             f"SELECT * FROM {view}",
             f"{self.ctx.table_name(table)} telle qu'elle etait avant (lue par "
             "une autre table)",
-            self.ctx.graph_schema(base),
+            self.ctx.table_columns(base) or self.ctx.graph_schema(base),
         )
 
     def own_keys(self, inst: Inst) -> list[str]:

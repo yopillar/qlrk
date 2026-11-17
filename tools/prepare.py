@@ -2001,7 +2001,10 @@ helper CTEs before them if needed (new names). Be concise.
 3. Faithful translation: same column names, same order, same logic.
 4. Use only the views and CTEs that exist (listed in Facts). Never invent a
    column: missing information -> `-- TODO:` comment.
-5. Native Spark SQL only: no UDF, no CREATE, no INSERT, one single query.
+5. Native Spark SQL 3.5.8 only (not Databricks): no UDF, no CREATE, no
+   INSERT, one single query, no `SELECT * EXCEPT (...)` (list the columns),
+   `instr` with 2 arguments only. A name with a special character (#, space)
+   stays in backticks.
 6. Keep one comment `-- l.<n> : <what Qlik does, in French>` per statement.
 7. Qlik doubles apostrophes ('l''ete'); Spark SQL does NOT: `''` glues two
    strings and the apostrophe disappears. Write "l'ete" (double quotes).
@@ -2063,6 +2066,8 @@ If information is missing to translate an expression safely, answer
   columns the expression uses are listed.
 - Qlik functions do not exist in Spark: IsNum(x) is `try_cast(x AS DOUBLE)
   IS NOT NULL`, Len is length, Trim is trim. Never invent a function name.
+- Spark 3.5.8, not Databricks: `instr` has 2 arguments only, no
+  `regexp_last`, no `SELECT * EXCEPT`.
 
 # Expressions
 {holes}
@@ -2841,6 +2846,7 @@ def prepare(
             thousand_sep=env.vars.get("ThousandSep"),
             table_base=lambda t: tables.get(t, {}).get("base"),
             section_tables=set(names),
+            table_columns=lambda t: final_columns.get(t),
         )
         header = (
             f"-- Section {sec['id']} : table {g}"
