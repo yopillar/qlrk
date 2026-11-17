@@ -86,6 +86,68 @@ def extract_sql(text: str) -> str | None:
     return None
 
 
+def _skip_quoted(sql: str, i: int) -> int:
+    """Position juste apres une chaine '...', un nom `...` ou un
+    commentaire -- qui commence en i ; i lui-meme sinon."""
+    if sql.startswith("--", i):
+        end = sql.find("\n", i)
+        return len(sql) if end == -1 else end
+    if sql[i] in "'\"`":
+        quote, j = sql[i], i + 1
+        while j < len(sql) and sql[j] != quote:
+            j += 2 if sql[j] == "\\" else 1
+        return j + 1
+    return i
+
+
+def fix_spark_if(sql: str) -> str:
+    """Complete les if(cond, valeur) a deux arguments par NULL.
+
+    Qlik accepte If(cond, valeur) (NULL sinon) ; le if de Spark exige trois
+    arguments, et le modele recopie souvent l'ecriture de Qlik. Ajouter NULL
+    donne exactement le resultat de Qlik.
+
+    Args:
+        sql: une expression ou une requete renvoyee par le modele.
+
+    Returns:
+        La meme, avec ses if a deux arguments completes.
+    """
+    starts = []
+    i = 0
+    while i < len(sql):
+        j = _skip_quoted(sql, i)
+        if j != i:
+            i = j
+            continue
+        m = re.match(r"if\s*\(", sql[i:], re.I)
+        if m and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] in "_.`")):
+            starts.append(i + m.end() - 1)
+        i += 1
+    # de la fin vers le debut : les if imbriques d'abord, sans decaler les
+    # positions de ceux d'avant
+    for open_pos in reversed(starts):
+        depth, commas, k = 0, 0, open_pos
+        while k < len(sql):
+            j = _skip_quoted(sql, k)
+            if j != k:
+                k = j
+                continue
+            ch = sql[k]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif ch == "," and depth == 1:
+                commas += 1
+            k += 1
+        if k < len(sql) and commas == 1:
+            sql = sql[:k] + ", NULL" + sql[k:]
+    return sql
+
+
 def short_error(error: str) -> str:
     """Raccourcit une erreur avant de la renvoyer au modele. Sur une table
     large, Spark ajoute a "colonne introuvable" la liste de toutes les
@@ -290,7 +352,7 @@ def answer_sql(ok: bool, log: str, events: dict) -> tuple[str | None, str | None
         return answer, None, False
     sql = extract_sql(answer or "")
     if sql:
-        return answer, sql, False
+        return answer, fix_spark_if(sql), False
     for content in sorted(events.get("tool_inputs", []), key=len, reverse=True):
         sql = extract_sql(content)
         if sql:
@@ -498,7 +560,11 @@ def parse_holes(text: str) -> dict[str, str]:
             out[cur] = m.group(2)
         elif cur and line.strip() and not line.strip().startswith("```"):
             out[cur] += "\n" + line
-    return {k: v.strip().rstrip(";,").strip() for k, v in out.items() if v.strip()}
+    return {
+        k: fix_spark_if(v.strip().rstrip(";,").strip())
+        for k, v in out.items()
+        if v.strip()
+    }
 
 
 def translator_errors(sec: dict, path: Path, parser: SparkChecker | None) -> list[str]:

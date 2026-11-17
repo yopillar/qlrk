@@ -422,3 +422,20 @@ def test_mapping_with_where_and_aggregate(project: Project) -> None:
     project.run("prepare.py", "script_qvd/map.qvs")
     tables = run_sections(project / "work/map")
     assert tables["T"] == [("a", "ok", 30), ("b", "absent", 5)]
+
+
+@pytest.mark.spark
+def test_two_argument_if_from_the_model_is_completed() -> None:
+    """Le modele recopie If(cond, x) de Qlik ; le if de Spark exige trois
+    arguments : on complete par NULL, le resultat de Qlik."""
+    from check import get_parser
+    from translate import fix_spark_if, parse_holes
+
+    assert (
+        fix_spark_if("if(a > 1, if(b, 'x,y'))") == "if(a > 1, if(b, 'x,y', NULL), NULL)"
+    )
+    assert fix_spark_if("if(a, 1, 2)") == "if(a, 1, 2)"
+    answer = parse_holes("```sql\nh1: if(n > 1, 'grand')\n```")["h1"]
+    spark = get_parser().spark
+    rows = spark.sql(f"SELECT {answer} FROM VALUES (2), (0) AS t(n)").collect()
+    assert [r[0] for r in rows] == ["grand", None]

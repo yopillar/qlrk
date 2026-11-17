@@ -2075,7 +2075,8 @@ If information is missing to translate an expression safely, answer
 - Qlik functions do not exist in Spark: IsNum(x) is `try_cast(x AS DOUBLE)
   IS NOT NULL`, Len is length, Trim is trim. Never invent a function name.
 - Spark 3.5.8, not Databricks: `instr` has 2 arguments only, no
-  `regexp_last`, no `SELECT * EXCEPT`.
+  `regexp_last`, no `SELECT * EXCEPT`. Qlik If(cond, x) is
+  `CASE WHEN cond THEN x END` (Spark `if` needs 3 arguments).
 
 # Expressions
 {holes}

@@ -30,6 +30,8 @@ never write files. Think in English; SQL comments in French. Answer with one
 - `instr(str, substr)` has 2 arguments only. Nth occurrence:
   `length(substring_index(str, substr, n)) + 1`.
 - No `regexp_last`, no `>>`/`<<` operators (`shiftright`, `shiftleft`).
+- Qlik `If(cond, x)` (2 arguments) is `CASE WHEN cond THEN x END`: Spark
+  `if` needs 3 arguments.
 - Qlik functions do not exist in Spark: `IsNum(x)` is
   `try_cast(x AS DOUBLE) IS NOT NULL`, `RangeMax(a, b)` is `greatest(a, b)`.
 - A column name with a special character (#, space, dot) stays in
