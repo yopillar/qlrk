@@ -47,7 +47,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from check import SparkChecker, check_section, get_parser  # noqa: E402
-from conf import query_sha, work_dir  # noqa: E402
+from conf import opencode_dir, query_sha, work_dir  # noqa: E402
 from prepare import fill_holes, hole_key, load_cache  # noqa: E402
 from qlik2sql import ident  # noqa: E402
 
@@ -529,7 +529,8 @@ def opencode_command(args: argparse.Namespace) -> list[str]:
     installe sur l'hote : depuis la box, on passe par host-spawn. host-spawn
     ne reprend pas l'environnement du terminal, et opencode plantait sur une
     "unexpected server error" : on le lance donc par le shell de l'hote,
-    qui charge le profil (bash -lic), dans le dossier courant.
+    qui charge le profil (bash -lic), dans le dossier qui a .opencode/
+    (agent translator).
 
     Args:
         args: les options de translate.py (--opencode-bin, --opencode-in-box).
@@ -540,7 +541,7 @@ def opencode_command(args: argparse.Namespace) -> list[str]:
     if args.opencode_in_box or not in_distrobox():
         return [args.opencode_bin]
     script = f'cd "$1" && shift && exec {shlex.quote(args.opencode_bin)} "$@"'
-    return ["host-spawn", "bash", "-lic", script, "_", str(Path.cwd())]
+    return ["host-spawn", "bash", "-lic", script, "_", str(opencode_dir())]
 
 
 def run_opencode(message: str, args: argparse.Namespace) -> tuple[bool, str, dict]:
@@ -559,6 +560,8 @@ def run_opencode(message: str, args: argparse.Namespace) -> tuple[bool, str, dic
         # la sortie json et les erreurs
         res = subprocess.run(
             cmd,
+            # le dossier qui a .opencode/ : sinon, agent par defaut sans le dire
+            cwd=opencode_dir(),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -978,6 +981,16 @@ def selftest(args: argparse.Namespace, quiet: bool = False) -> int:
     ok, raw, events = run_opencode(msg, args)
     sec = round(time.perf_counter() - t0)
     answer, sql, from_tool = answer_sql(ok, raw, events)
+    if re.search(r"falling back to default agent|agent .{0,40}not found", raw, re.I):
+        # opencode repond quand meme, avec son agent par defaut et sans les
+        # consignes du traducteur : on s'arrete plutot que de traduire mal
+        print(
+            f"\n[!] opencode ne trouve pas l'agent {args.agent} : il prendrait "
+            f"son agent par defaut. Il le cherche dans {opencode_dir()}/.opencode/"
+            "agents/. Lancer le kit depuis le dossier qui contient .opencode/, "
+            "ou y copier celui du kit."
+        )
+        return 1
     if quiet and sql:
         return 0
     if quiet:

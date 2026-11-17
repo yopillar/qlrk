@@ -46,6 +46,7 @@ from conf import (  # noqa: E402
     IoConf,
     IoEntry,
     find_scripts,
+    opencode_dir,
     resolve_location,
     safe_name,
     writer_types,
@@ -3088,7 +3089,13 @@ def main(argv: list[str] | None = None) -> int:
         help="seulement recenser les fichiers lus/ecrits de chaque "
         "script dans work/stores.json",
     )
-    p.add_argument("--skills", type=Path, default=Path(".opencode/skills"))
+    p.add_argument(
+        "--skills",
+        type=Path,
+        default=opencode_dir() / ".opencode" / "skills",
+        help="skills a joindre aux prompts (defaut : ceux du projet, sinon "
+        "ceux du kit)",
+    )
     args = p.parse_args(argv)
     # un dossier de scripts est accepte aussi : on prend ce qu'il contient
     args.scripts = [s for path in args.scripts for s in find_scripts(path)]
