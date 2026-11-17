@@ -19,7 +19,7 @@ ignore = [
 known-first-party = ["conf", "prepare", "qlik2sql", "fill_conf", "compare",
                      "journal", "job_template", "orchestrate", "translate",
                      "check", "verify", "assemble", "migrate", "normalize",
-                     "conftest", "core", "commons", "scripts", "repair"]
+                     "conftest", "core", "commons", "scripts"]
 # spark_foundation et pyspark_commons sont des librairies installees : leurs
 # imports vont avec pyspark, avant ceux du projet (scripts).
 

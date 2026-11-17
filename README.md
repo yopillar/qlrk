@@ -631,7 +631,7 @@ vidant `work/`.
 ### Les reponses du modele reparees en Python
 
 Avant de controler une reponse du modele, le kit corrige ce qui se deduit
-sans risque, plutot que de lui redemander (`tools/repair.py`) : un nom avec
+sans risque, plutot que de lui redemander (dans `translate.py`) : un nom avec
 `#` (ou une colonne connue avec un espace) laisse sans backticks,
 `SELECT * EXCEPT (a, b)` (absent de Spark 3.5) remplace par la liste des
 colonnes gardees, et `if(cond, x)` a deux arguments complete par `NULL`,

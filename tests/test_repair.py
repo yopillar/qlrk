@@ -2,7 +2,7 @@
 
 import pytest
 
-from repair import backtick_names, expand_star_except, fix_spark_if, repair
+from translate import backtick_names, expand_star_except, fix_spark_if, repair
 
 
 def test_names_with_hash_get_backticks() -> None:
