@@ -404,3 +404,21 @@ def test_drop_field_ignores_dropped_tables(project: Project) -> None:
     columns = {s["table"]: s["columns"] for s in manifest["sections"]}
     assert set(columns) == {"T", "U", "Autre"}
     assert columns["T"] == ["k", "Garde", "Col"] and columns["Autre"] == ["k"]
+
+
+@pytest.mark.spark
+def test_mapping_with_where_and_aggregate(project: Project) -> None:
+    """Mapping filtre par un WHERE (une condition, pas le -1/0 de Qlik que
+    Spark refuse en filtre) et mapping avec Max et GROUP BY."""
+    (project / "script_qvd/map.qvs").write_text(
+        "Src:\nLOAD * INLINE [\nc1, c2, m\na, ok, 10\na, ok, 30\nb, verif, 5\n];\n"
+        "MapF:\nMAPPING LOAD c1, c2 RESIDENT Src WHERE c2 <> 'verif';\n"
+        "MapMax:\nMAPPING LOAD c1, Max(m) RESIDENT Src GROUP BY c1;\n"
+        "T:\nLOAD DISTINCT c1, ApplyMap('MapF', c1, 'absent') AS Etat, "
+        "ApplyMap('MapMax', c1, 0) AS Mx RESIDENT Src;\n"
+        "STORE T INTO [lib://o/t.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    project.run("prepare.py", "script_qvd/map.qvs")
+    tables = run_sections(project / "work/map")
+    assert tables["T"] == [("a", "ok", 30), ("b", "absent", 5)]

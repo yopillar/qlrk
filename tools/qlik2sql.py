@@ -2189,26 +2189,33 @@ class SectionTranslator:
         seg = segs[0]
         src, cols = self.base_source(insts[0], seg, None)
         exprs = [e for e, _ in seg.fields]
+        # meme contexte que le reste : types, DecimalSep, Peek...
+        ectx = self.base_ectx()
         if exprs == ["*"]:
             if not cols or len(cols) < 2:
                 raise Untranslatable(f"colonnes du mapping {mname} inconnues")
             k, v = ident(cols[0]), ident(cols[1])
         elif len(exprs) >= 2:
-            ectx = ExprCtx("", None, self.ctx.date_format, self.ctx.timestamp_format)
             k, v = expr(exprs[0], ectx), expr(exprs[1], ectx)
         else:
             raise Untranslatable(f"mapping {mname} sans 2 colonnes")
         where = ""
         if seg.where:
-            where = " WHERE " + expr(
-                seg.where,
-                ExprCtx("", None, self.ctx.date_format, self.ctx.timestamp_format),
-            )
+            # une condition, pas une valeur : WHERE (x <> 'a'), et non le
+            # CASE WHEN ... THEN -1 ELSE 0 END que Spark refuse en filtre
+            where = " WHERE " + safe_where(cond(seg.where, ectx))
+        # Mapping avec agregat (Max, Sum... et GROUP BY) : on groupe, et la
+        # ligne garde l'ordre de sa premiere ligne source
+        order, group = ORD, ""
+        if seg.group_by or ectx.aggregate_used:
+            order = f"min({ORD})"
+            if seg.group_by:
+                group = " GROUP BY " + ", ".join(expr(g, ectx) for g in seg.group_by)
         # cle en double : Qlik garde la premiere valeur chargee
         return (
             f"(SELECT map_key, min_by(map_value, __o) AS map_value FROM "
-            f"(SELECT {k} AS map_key, {v} AS map_value, {ORD} AS __o "
-            f"FROM {src}{where}) GROUP BY map_key)"
+            f"(SELECT {k} AS map_key, {v} AS map_value, {order} AS __o "
+            f"FROM {src}{where}{group}) GROUP BY map_key)"
         )
 
     def base_source(
