@@ -11,7 +11,6 @@ import pytest
 import check
 import fill_conf
 import translate
-from conftest import Project
 
 
 def options(**kwargs: object) -> argparse.Namespace:
@@ -68,40 +67,3 @@ def test_syntax_error_says_what_is_wrong() -> None:
     premiere ligne utile, sinon le modele ne sait pas quoi corriger."""
     error = check.get_parser().parse("SELECT (a FROM t")
     assert error and "PARSE_SYNTAX_ERROR" in error
-
-
-def test_skills_and_agent_from_the_kit(project: Project) -> None:
-    """Un projet sans .opencode/ prend l'agent et les skills du kit : plus
-    de prompt sans skill, ni d'agent par defaut d'opencode."""
-    import os
-
-    from conf import KIT_ROOT
-
-    assert not (project / ".opencode").exists()
-    project.run("prepare.py", "script_qvd/ventes.qvs")
-    rapport = (project / "work/ventes/rapport.md").read_text(encoding="utf-8")
-    assert "introuvable dans" not in rapport
-    cwd = os.getcwd()
-    try:
-        os.chdir(project.path)
-        assert translate.opencode_dir() == KIT_ROOT
-    finally:
-        os.chdir(cwd)
-
-
-def test_agent_fallback_stops_translation(project: Project, tmp_path: Path) -> None:
-    """opencode qui prend son agent par defaut : la traduction s'arrete avec
-    un message clair au lieu de traduire sans les consignes."""
-    fake = tmp_path / "opencode"
-    fake.write_text(
-        f"#!{sys.executable}\nimport sys, json\n"
-        "sys.stderr.write('agent translator not found. Falling back to default agent\\n')\n"
-        "print(json.dumps({'type': 'text', 'part': {'type': 'text', "
-        "'text': '```sql\\nSELECT 1 AS ok\\n```'}}))\n",
-        encoding="utf-8",
-    )
-    fake.chmod(0o755)
-    res = project.run(
-        "translate.py", "--selftest", "--opencode-bin", str(fake), check=False
-    )
-    assert res.returncode == 1 and "ne trouve pas l'agent translator" in res.stdout

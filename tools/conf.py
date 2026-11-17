@@ -33,28 +33,6 @@ IO_FILE = CONF / "io.yml"
 # courant, donc de la racine du projet).
 # ---------------------------------------------------------------------------
 WORK = Path("work")
-# Dossier du kit (celui qui contient tools/) : son .opencode/ (agent
-# translator, skills) sert quand le projet n'a pas le sien.
-KIT_ROOT = Path(__file__).resolve().parent.parent
-
-
-def opencode_dir() -> Path:
-    """Dossier dont opencode et prepare.py prennent .opencode/ (agent
-    translator, skills) : celui du projet s'il en a un, sinon celui du kit.
-
-    Sans cela, un kit lance depuis un dossier de projet sans .opencode/
-    faisait tourner l'agent par defaut d'opencode, sans skills, sans le dire.
-
-    Returns:
-        Le dossier qui contient .opencode/.
-    """
-    if (Path.cwd() / ".opencode").is_dir():
-        return Path.cwd()
-    if (KIT_ROOT / ".opencode").is_dir():
-        return KIT_ROOT
-    return Path.cwd()
-
-
 # Selon l'export, un script Qlik n'a pas toujours l'extension .qvs : on prend
 # aussi les .txt et les fichiers sans extension.
 SCRIPT_SUFFIXES = (".qvs", ".txt", "")
