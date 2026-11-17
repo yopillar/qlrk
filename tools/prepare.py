@@ -1562,7 +1562,15 @@ def build_graph(
                     if set(inst.fields) & set(schemas.get(key, []))
                 ]
             )
+            # Seulement les tables encore chargees : une table deja supprimee
+            # (DROP TABLE) n'est pas touchee par Qlik. Sans cela, elle perdait
+            # la colonne qu'une autre table lisait, ou gagnait une version
+            # fantome, ecrite en sortie.
+            targets = [
+                key for key in targets if key in tables and not tables[key]["dropped"]
+            ]
             inst.keys = []
+            inst.constructs.add("resolved")
             for key in targets:
                 key = fork(key, inst)
                 inst.keys.append(key)

@@ -2673,6 +2673,10 @@ class SectionTranslator:
         """DROP FIELD : nouvelle CTE sans les champs supprimes."""
         for key in self.own_keys(inst):
             self.seed(key)
+        if "resolved" in inst.constructs and not self.own_keys(inst):
+            # aucune table encore chargee n'a ces champs ici : rien a faire
+            self.notes.append(f"-- l.{line} : DROP FIELD sans effet ici")
+            return
         targets = (
             [k for k in self.own_keys(inst) if k in self.cur]
             if inst.keys

@@ -380,3 +380,27 @@ def test_new_version_keeps_translated_columns(project: Project) -> None:
     v2 = next(s for s in manifest["sections"] if s["table"] == "V__2")
     assert v2["status"] == "deterministic"
     assert v2["columns"] == ["Site", "Produit"]
+
+
+def test_drop_field_ignores_dropped_tables(project: Project) -> None:
+    """DROP FIELDS apres un DROP TABLE : la table supprimee n'est pas
+    touchee (elle gardait sa colonne pour la table qui la lit, et ne gagne
+    plus de version fantome ecrite en sortie)."""
+    (project / "script_qvd/fin.qvs").write_text(
+        "T:\nLOAD * INLINE [\nk, Garde, Col\n1, a, x\n];\n"
+        "STORE T INTO [lib://o/t.qvd] (qvd);\n"
+        "U:\nLOAD k, Col AS ColU RESIDENT T;\n"
+        "STORE U INTO [lib://o/u.qvd] (qvd);\n"
+        "DROP TABLE T;\nDROP TABLE U;\n"
+        "Autre:\nLOAD * INLINE [\nk, Col\n2, y\n];\n"
+        "DROP FIELDS Col;\n"
+        "STORE Autre INTO [lib://o/autre.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    project.run("prepare.py", "script_qvd/fin.qvs")
+    manifest = json.loads(
+        (project / "work/fin/manifest.json").read_text(encoding="utf-8")
+    )
+    columns = {s["table"]: s["columns"] for s in manifest["sections"]}
+    assert set(columns) == {"T", "U", "Autre"}
+    assert columns["T"] == ["k", "Garde", "Col"] and columns["Autre"] == ["k"]
