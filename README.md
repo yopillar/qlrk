@@ -293,6 +293,16 @@ a ecrire). Elle ne peut pas porter le meme nom que la sortie : Spark refuse
 une entree et une sortie du meme nom. Le controle des requetes qui la lisent
 prend les types de la requete Spark qui ecrit la sortie.
 
+Un fichier lu n'est rattache a une sortie que par son chemin, ou par son nom
+avec la meme extension : `commandes.csv`, la source brute, et
+`commandes.qvd`, ecrit par un autre script, restent deux entrees
+differentes (`commandes` et `commandes_relue`). Deux fichiers du meme nom
+mais d'extensions differentes (`airports.csv`, `airports.xlsx`) donnent
+`airports_csv` et `airports_xlsx`. Une table sans STORE presente dans
+plusieurs scripts prend une sortie par script (`<script>_<table>`), que
+`fill_conf.py` soit lance seul ou par `migrate.py`. Dans un CSV, une valeur a
+zero en tete (`001`) reste du texte, comme dans un `INLINE`.
+
 `fill_conf.py` ne modifie jamais une entree existante : une ancienne entree
 qui relit une sortie avec sa propre location (et souvent le meme nom que la
 sortie) est a supprimer a la main, il ecrira alors le `from_output`.
@@ -454,7 +464,31 @@ relit avec ce format.
   Qlik le fait au chargement.
 - **La casse des noms de champs** est respectee, comme dans Qlik.
 - **`Dual(texte, nombre)`** : on garde le texte, Parquet n'ayant qu'un type
-  par colonne (choix a valider).
+  par colonne (choix a valider). Pareil pour `Class(x, pas)`, qui donne
+  `3000 <= x < 4000`.
+- **Les nombres ecrits en texte** : avec `SET DecimalSep=','` (et
+  `ThousandSep`), une colonne texte comme `1 200,50` utilisee dans un calcul,
+  une comparaison a un nombre, `Sum`, `Avg`, `Round`, `RangeSum`... est lue
+  comme Qlik la lit. Sans cela, Spark donnait NULL. Une simple copie garde le
+  texte d'origine.
+- **Les valeurs formatees** : `Num(x, '00')` ou `Date(d, 'YYYY-MM')` donnent
+  leur texte affiche dans une concatenation (`'W' & Num(Week(d), '00')`
+  donne `W05`) ou comme texte d'un `Dual`, et restent un nombre ou une date
+  dans un calcul.
+- **`Even`**, **`Odd`**, **`DayNumberOfYear`**, **`QuarterStart`**, et un
+  alias entre apostrophes (`AS 'Nom'`), que Qlik accepte.
+- **`TextBetween`** (premiere occurrence), **`SubStringCount`**,
+  **`CROSSTABLE (attribut, donnee[, n])`** quand les colonnes sont connues, et
+  **`RENAME FIELD a TO b`** (pas `USING`, qui depend d'un mapping).
+- **Une table lue par une autre puis modifiee** (`JOIN`, `CONCATENATE`,
+  `DROP FIELD`, `RENAME FIELD`) : la lecture voit la table d'avant, comme
+  dans Qlik. Un agregat calcule avant un `CONCATENATE` ne compte pas les
+  lignes ajoutees ensuite.
+- **Les etiquettes repetees** : une boucle `FOR` qui recharge `Stocks:` avec
+  les memes champs ajoute ses lignes a `Stocks` ; avec d'autres champs, Qlik
+  cree `Stocks-1`. Un mapping utilise avant d'etre charge, ou une etiquette
+  ecrite apres le prefixe (`LEFT KEEP (A) T: LOAD`), est signale dans le
+  rapport.
 - **`JOIN`** (cles implicites, ordre des colonnes de Qlik), **`KEEP`**,
   **`CONCATENATE`**, l'auto-concatenation et **`DROP FIELD`**.
 - **`ApplyMap`**, traduit en `LEFT JOIN` sur la source du mapping, avec un
@@ -543,8 +577,20 @@ Parquet. A la retraduction, le modele recoit la liste des vraies colonnes
 que donne Spark et peut corriger le nom. Quand une table amont a ses
 colonnes deduites d'un autre script (`RESIDENT`, `STORE`), elles peuvent
 etre incompletes : la colonne introuvable est seulement signalee
-("non bloquant"). `fill_conf.py`, lance avec les vrais fichiers dans
-`data/`, remplit les schemas et rend ces colonnes sures.
+("non bloquant"). La regle est la meme pendant la traduction : une
+reponse du modele n'y est pas refusee pour une colonne que le controle
+accepterait. `fill_conf.py`, lance avec les vrais fichiers dans `data/`,
+remplit les schemas et rend ces colonnes sures.
+
+Si les colonnes d'une table lue sont inconnues (ni schema, ni fichier, ni
+script qui l'ecrit), Spark ne peut pas analyser la requete. Le controle le
+dit ("non analysee par Spark"), au lieu de laisser croire que la table est
+validee : ses erreurs n'apparaitront qu'au lancement du job, et ses types
+de sortie ne sont pas calcules.
+
+Un script dont une table n'est pas validee sort du job jusqu'a sa
+correction : le job ne garde pas une ancienne version de ses requetes. Le
+resume de `migrate.py` le signale ("retire du job").
 
 Une table bloquee ici perd ses reponses du modele non verifiees dans
 `work/expressions.json` : sans cela, la retraduction les lui redonnerait
@@ -575,9 +621,21 @@ de son fait.
 Chaque expression traduite par le modele y est enregistree comme non
 verifiee. Elle passe en verifiee quand la comparaison de sa table avec Qlik
 est identique : elle est alors reutilisee telle quelle, sans modele, dans
-les scripts suivants. Avant cela, elle est juste proposee au modele comme
+les scripts suivants. Une sortie que le job n'a pas reecrite (etape en
+echec) n'est pas comparee : elle date d'un lancement precedent. Une
+requete retouchee a la main depuis la traduction ne valide pas les
+reponses du modele. Avant cela, elle est juste proposee au modele comme
 piste. Le fichier se corrige a la main ; attention a ne pas le supprimer en
 vidant `work/`.
+
+### Les reponses du modele reparees en Python
+
+Avant de controler une reponse du modele, le kit corrige ce qui se deduit
+sans risque, plutot que de lui redemander (dans `translate.py`) : un nom avec
+`#` (ou une colonne connue avec un espace) laisse sans backticks,
+`SELECT * EXCEPT (a, b)` (absent de Spark 3.5) remplace par la liste des
+colonnes gardees, et `if(cond, x)` a deux arguments complete par `NULL`,
+comme Qlik. Le modele n'est relance que pour le reste.
 
 ### Verifier que le modele repond
 
@@ -709,7 +767,7 @@ pyspark, ils sont sautes.
 | `assemble.py` | copie des requetes d'un script dans `src/sql/` |
 | `orchestrate.py` | ordonne les scripts, ecrit l'etape 010 (et le job s'il manque) |
 | `job_template.py` | texte du job et de l'etape 010 |
-| `verify.py` | lance le job et compare avec `data/qlik_outputs/` |
+| `verify.py` | lance le job en entier (sans `--only`) et compare avec `data/qlik_outputs/` ; `migrate.py` lance le job une seule fois puis compare chaque script |
 | `compare.py` | comparaison de deux tables |
 | `conf.py` | lecture de `conf/io.yml` et des schemas |
 | `journal.py` | tenue de `work/journal.csv` |
@@ -730,6 +788,10 @@ pyspark, ils sont sautes.
 - **`FieldValue('F', RecNo())`** numerote les valeurs dans l'ordre trie,
   alors que Qlik suit l'ordre de chargement.
 - **`Date(x)` sur un nombre** (date Qlik en jours) n'est pas converti.
+- **Une valeur vide dans un CSV** est une chaine vide pour Qlik, NULL pour
+  Spark : `IsText`, `Len(x) = 0` ou `x = ''` peuvent donner un autre
+  resultat. Ecrire `IsNull(x) or Len(Trim(x)) = 0`, ou le traiter dans la
+  conf de lecture.
 - **Le typage des dates repose sur `conf/schema`.** Une colonne de dates
   sans type declare n'est pas reconnue comme date par `Min`, `Max` ou
   `Peek`, et c'est le job qui plantera sur `date - date`.

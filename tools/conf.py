@@ -355,19 +355,61 @@ class IoConf:
             f"{entry.name} : schema_file introuvable ({entry.schema_file})"
         )
 
-    def find(self, qlik_path: str, kind: str) -> IoEntry | None:
+    def find(
+        self,
+        qlik_path: str,
+        kind: str,
+        produced: bool | None = None,
+        strict: bool = False,
+    ) -> IoEntry | None:
         """Cherche l'entree qui correspond a un fichier Qlik, soit par le nom
         de l'entree, soit par le nom de fichier de sa location.
 
         On compare en ramenant espaces, accents, # et ponctuation a "_",
         comme les noms que fill_conf.py donne aux entrees :
-        [anon]-Ventes#2024.qvd retrouve l'entree anon_ventes_2024."""
+        [anon]-Ventes#2024.qvd retrouve l'entree anon_ventes_2024.
+
+        Args:
+            qlik_path: le fichier, tel que le script Qlik le nomme.
+            kind: "input" ou "output".
+            produced: pour une entree, si le fichier est ecrit par un STORE
+                du projet. Quand deux entrees ont le meme nom (le CSV brut
+                commandes.csv et la relecture de la sortie commandes), on
+                prend celle qui relit une sortie pour un fichier produit, et
+                l'autre sinon.
+            strict: ne rien renvoyer plutot qu'une entree de l'autre sorte.
+
+        Returns:
+            L'entree, ou None.
+        """
         stem = io_key(qlik_path)
         pool = self.inputs if kind == "input" else self.outputs
-        for e in pool:
-            if io_key(e.name) == stem or io_key(e.location) == stem:
-                return e
-        return None
+        found = [e for e in pool if stem in (io_key(e.name), io_key(e.location))]
+        # airports.csv et airports.xlsx : celle qui a la meme extension
+        ext = Path(qlik_path.replace("\\", "/")).suffix.lower()
+        if len(found) > 1 and ext:
+            found = [
+                e for e in found if Path(e.location).suffix.lower() in (ext, "")
+            ] or found
+        if kind != "input" or produced is None:
+            return found[0] if found else None
+        same = [e for e in found if self.rereads_output(e) == produced]
+        if same or strict:
+            return same[0] if same else None
+        return found[0] if found else None
+
+    def rereads_output(self, entry: IoEntry) -> bool:
+        """Dit si une entree relit une sortie du projet.
+
+        Args:
+            entry: l'entree.
+
+        Returns:
+            True pour un from_output, ou une ancienne entree dont la
+            location est celle d'une sortie.
+        """
+        outputs = {o.location for o in self.outputs}
+        return bool(entry.from_output) or entry.location in outputs
 
 
 def main() -> int:

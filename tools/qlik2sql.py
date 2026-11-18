@@ -297,6 +297,10 @@ class ExprCtx:
     applymap: Callable[..., Any] | None = None  # callback (map, key, default)
     date_format: str | None = None  # DateFormat du script
     timestamp_format: str | None = None
+    # DecimalSep et ThousandSep du script : comment Qlik lit un nombre ecrit
+    # en texte ("1 200,50" en francais)
+    decimal_sep: str | None = None
+    thousand_sep: str | None = None
     # RecNo()/RowNo() d'un AUTOGENERATE
     recno: str | None = None
     # IterNo() d'un AUTOGENERATE ... WHILE
@@ -333,13 +337,55 @@ class TsSql(DateSql):
 
 class StrField(str):
     """Colonne declaree en texte dans conf/schema. Qlik, au chargement,
-    prend pour une date un texte au format DateFormat. Spark ne le fait
-    pas, il faut le lui dire."""
+    prend pour une date un texte au format DateFormat, et pour un nombre un
+    texte ecrit avec DecimalSep et ThousandSep. Spark ne le fait pas, il
+    faut le lui dire."""
+
+
+class GuessedTs(TsSql):
+    """Colonne au type inconnu dont le nom dit une date (DateFin, dt_cmd).
+    Traitee comme un horodatage, sans CAST : les fonctions employees pour les
+    dates (CAST AS DATE, hour, datediff, + INTERVAL) prennent aussi bien une
+    date, un horodatage ou un texte ISO, et la colonne recopiee telle quelle
+    garde son type."""
+
+
+class NumSql(str):
+    """Expression SQL numerique (calcul, somme...) : un texte qu'on lui
+    compare est lu comme un nombre."""
 
 
 DATE_TYPES = ("date",)
 TS_TYPES = ("timestamp", "datetime")
 STR_TYPES = ("string", "str", "text", "varchar", "char")
+NUM_TYPES = ("double", "float", "decimal", "bigint", "int", "integer", "smallint")
+
+
+def text_to_timestamp(sql: str, fmt: str) -> str:
+    """try_to_timestamp d'un texte, tolerant comme la lecture de Qlik.
+
+    Spark 3.5 ne rend pas NULL mais plante (INCONSISTENT_BEHAVIOR_CROSS_
+    VERSION) quand l'ancien analyseur de dates aurait lu le texte : "1/2/2024"
+    avec dd/MM/yyyy, une heure en trop, une annee sur 2 chiffres. On lit donc
+    avec d/M/yyyy, on coupe l'heure si le format n'en a pas, et on exige
+    l'annee sur 4 chiffres.
+
+    Args:
+        sql: le texte.
+        fmt: le format Spark (deja converti depuis Qlik).
+
+    Returns:
+        L'horodatage, NULL si le texte n'a pas ce format.
+    """
+    lenient = re.sub(
+        r"(?<![dMHhms])(dd|MM|HH|hh|mm|ss)(?![dMHhms])", lambda m: m.group(1)[0], fmt
+    )
+    text = f"trim(CAST({sql} AS STRING))"
+    if " " not in fmt:
+        text = f"regexp_extract({text}, '^[^ ]+', 0)"
+    if "yyyy" in fmt:
+        text = f"if({text} RLIKE '[0-9]{{4}}', {text}, NULL)"
+    return f"try_to_timestamp({text}, {sql_string(lenient)})"
 
 
 def parse_date(sql: str, ctx: ExprCtx) -> DateSql:
@@ -354,15 +400,315 @@ def parse_date(sql: str, ctx: ExprCtx) -> DateSql:
     if not fmt or fmt == "yyyy-MM-dd":
         return DateSql(f"try_cast({sql} AS DATE)")
     return DateSql(
-        f"COALESCE(CAST(try_to_timestamp(CAST({sql} AS STRING), "
-        f"{sql_string(fmt)}) AS DATE), try_cast({sql} AS DATE))"
+        f"COALESCE(CAST({text_to_timestamp(sql, fmt)} AS DATE), "
+        f"try_cast({sql} AS DATE))"
     )
+
+
+ROUNDING = ("floor", "ceil", "round", "frac")
+QLIK_DAY_ZERO = "DATE'1899-12-30'"  # le jour 0 des dates Qlik
+
+
+def const_number(tokens: list[Token]) -> float | None:
+    """La valeur d'un nombre constant ecrit n ou n/m (1/24 pour une heure).
+
+    Args:
+        tokens: les jetons de l'argument.
+
+    Returns:
+        Le nombre, None s'il n'est pas constant.
+    """
+    text = "".join(str(v) for _, v in tokens).replace(" ", "")
+    m = re.fullmatch(r"\(?(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?\)?", text)
+    if not m or (m.group(2) is not None and float(m.group(2)) == 0):
+        return None
+    return float(m.group(1)) / float(m.group(2) or 1)
+
+
+def day_seconds(x: str) -> str:
+    """Secondes ecoulees depuis minuit."""
+    return f"(hour({x}) * 3600 + minute({x}) * 60 + second({x}))"
+
+
+def date_diff(left: DateSql, right: DateSql) -> str:
+    """date - date en Qlik : des jours, avec decimales s'il y a une heure.
+    En Spark, date - date donne un intervalle, que floor() refuse.
+
+    Args:
+        left: la date de fin.
+        right: la date de debut.
+
+    Returns:
+        Un entier (deux dates) ou un nombre de jours.
+    """
+    if not isinstance(left, TsSql) and not isinstance(right, TsSql):
+        return NumSql(f"datediff({left}, {right})")
+    # jours puis secondes du jour : exact, et sans fuseau horaire
+    return NumSql(
+        f"(datediff(CAST({left} AS DATE), CAST({right} AS DATE)) + "
+        f"({day_seconds(left)} - {day_seconds(right)}) / 86400D)"
+    )
+
+
+def whole_days(n: str) -> bool:
+    """Dit si n est un nombre de jours sans decimales : un entier ecrit, un
+    datediff, un Floor, ou une colonne (une duree en jours, le plus souvent)."""
+    text = str(n).strip()
+    if re.fullmatch(r"\(?\s*-?\s*\d+\s*\)?", text):
+        return True
+    if re.fullmatch(r"\(?\s*-?\s*\d*\.\d+\s*\)?", text):
+        return False
+    if not isinstance(n, NumSql):
+        return True
+    return text.startswith(
+        ("datediff(", "floor(", "ceil(", "round(")
+    ) and not re.search(r" / | \* ", text)
+
+
+def shift_date(d: DateSql, op: str, n: str) -> str:
+    """date +/- n jours, comme Qlik : n peut avoir des decimales (une heure
+    vaut 1/24) et le resultat a alors une heure. Spark refuse date + 1.5 et
+    horodatage + 1.
+
+    Args:
+        d: la date ou l'horodatage.
+        op: + ou -.
+        n: le nombre de jours.
+
+    Returns:
+        Une date, ou un horodatage.
+    """
+    literal_int = re.fullmatch(r"\d+", str(n).strip())
+    m = re.fullmatch(r"\(?\s*(\d+(?:\.\d+)?)\s*(?:/\s*(\d+(?:\.\d+)?))?\s*\)?", str(n))
+    const = (
+        float(m.group(1)) / float(m.group(2) or 1) if m and m.group(2) != "0" else None
+    )
+    if not isinstance(d, TsSql) and whole_days(n):
+        days = n if literal_int else f"CAST({as_value(n)} AS INT)"
+        return DateSql(f"({d} {op} {days})")
+    ts = d if isinstance(d, TsSql) else f"CAST({d} AS TIMESTAMP)"
+    if literal_int:
+        return TsSql(f"({ts} {op} INTERVAL {str(n).strip()} DAYS)")
+    if const is not None and float(const * 86400).is_integer():
+        # 1/24 : une heure, ecrite en secondes
+        return TsSql(f"({ts} {op} INTERVAL {int(const * 86400)} SECONDS)")
+    # jours entiers puis secondes : timestampadd prend un INT, que
+    # n * 86400 depasse au-dela de 68 ans
+    v, sign = as_value(n), "-" if op == "-" else ""
+    return TsSql(
+        f"timestampadd(SECOND, CAST({sign}round(({v} - floor({v})) * 86400) AS INT), "
+        f"timestampadd(DAY, CAST({sign}floor({v}) AS INT), {ts}))"
+    )
+
+
+DATE_NAME = re.compile(r"(^|[_ .`])(date|dt)([_ `]|$)|(^|[.`])date", re.I)
+
+
+def looks_like_date(sql: str) -> bool:
+    """Colonne au type inconnu dont le nom dit une date (DateFin, dt_cmd) :
+    la meme regle que fill_conf.py pour deviner un schema."""
+    return (
+        type(sql) in (str, StrField)
+        and bool(re.fullmatch(r"[\w.`# ]+", sql))
+        and bool(DATE_NAME.search(sql))
+    )
+
+
+def maybe_date(sql: str, ctx: ExprCtx) -> str:
+    """Une valeur au type inconnu qui doit etre une date (Floor(x) dans
+    Date(), colonne nommee comme une date) devient une date ; toute autre
+    valeur est rendue telle quelle."""
+    sql = dated(sql, ctx)
+    if looks_like_date(sql):
+        return as_timestamp(sql, ctx)
+    return sql
+
+
+def round_date(n: str, x: DateSql, step: float | None) -> str:
+    """Floor, Ceil, Round et Frac d'une date ou d'un horodatage. En Qlik une
+    date est un nombre de jours, l'heure en est la partie decimale : Floor
+    garde le jour, Floor(x, 1/24) l'heure, Frac l'heure seule.
+
+    Args:
+        n: floor, ceil, round ou frac.
+        x: la date ou l'horodatage.
+        step: le pas en jours (1 sans 2e argument).
+
+    Returns:
+        Une date, un horodatage, ou un nombre pour Frac.
+    """
+    ts = isinstance(x, TsSql)
+    secs = day_seconds(x)
+    if n == "frac":
+        return NumSql(f"({secs} / 86400D)" if ts else "0")
+    if step is None or step <= 0:
+        raise Untranslatable(f"{n}() d'une date avec un pas non constant")
+    day = f"CAST({x} AS DATE)" if ts else str(x)
+    if step == 1:
+        if not ts:
+            return DateSql(x)
+        if n == "floor":
+            return DateSql(day)
+        if n == "round":
+            return DateSql(f"CAST({x} + INTERVAL 12 HOURS AS DATE)")
+        return DateSql(
+            f"CASE WHEN {x} = CAST({day} AS TIMESTAMP) "
+            f"THEN {day} ELSE date_add({day}, 1) END"
+        )
+    if step > 1 and step == int(step):
+        # pas en jours, compte depuis le jour 0 de Qlik
+        k = int(step)
+        days = f"datediff({day}, {QLIK_DAY_ZERO})"
+        if ts:
+            days = f"({days} + {secs} / 86400D)"
+        return DateSql(
+            f"date_add({QLIK_DAY_ZERO}, CAST({n}({days} / {k}) * {k} AS INT))"
+        )
+    s = round(step * 86400)
+    if s < 1 or abs(s - step * 86400) > 1e-6:
+        raise Untranslatable(f"{n}() d'une date avec un pas de {step} jour")
+    if not ts:
+        return DateSql(x)
+    # pas en heures, minutes ou secondes, compte depuis minuit
+    return TsSql(
+        f"timestampadd(SECOND, CAST({n}({secs} / {s}) * {s} AS BIGINT), "
+        f"CAST({day} AS TIMESTAMP))"
+    )
+
+
+def dated(sql: str, ctx: ExprCtx) -> str:
+    """Floor(x) d'un x au type inconnu, quand le contexte dit que c'est une
+    date (Date(), comparaison avec une date) : x est lu comme horodatage puis
+    arrondi au jour. Toute autre valeur est rendue telle quelle.
+
+    Args:
+        sql: la valeur.
+        ctx: le contexte.
+
+    Returns:
+        La date, ou sql.
+    """
+    rounded = getattr(sql, "rounded", None)
+    if rounded is None:
+        return sql
+    func, x = rounded
+    return round_date(func, as_timestamp(x, ctx), 1.0)
+
+
+def as_timestamp(sql: str, ctx: ExprCtx) -> TsSql:
+    """Une valeur lue comme horodatage, pour Date(Floor(x)) : texte au format
+    du script (TimestampFormat, sinon DateFormat), ou date et horodatage.
+
+    Args:
+        sql: la valeur, de type inconnu ou texte.
+        ctx: le contexte, avec les formats du script.
+
+    Returns:
+        Un horodatage.
+    """
+    if not isinstance(sql, StrField):
+        return TsSql(f"CAST({sql} AS TIMESTAMP)")
+    day = f"CAST({parse_date(sql, ctx)} AS TIMESTAMP)"
+    try:
+        fmt = qlik_format_to_spark(ctx.timestamp_format or "")
+    except Untranslatable:
+        return TsSql(day)
+    if not ctx.timestamp_format:
+        return TsSql(day)
+    return TsSql(f"COALESCE({text_to_timestamp(sql, fmt)}, {day})")
 
 
 def as_date(sql: str, ctx: ExprCtx) -> str:
     """Argument d'une fonction de date : si c'est du texte, on le convertit
     d'abord."""
     return parse_date(sql, ctx) if isinstance(sql, StrField) else sql
+
+
+def as_number(sql: str, ctx: ExprCtx) -> str:
+    """Colonne texte utilisee dans un calcul : on la lit comme Qlik, avec
+    les separateurs du script. Sans eux, Spark donne NULL pour "1 200,50".
+
+    Args:
+        sql: l'expression.
+        ctx: le contexte, avec DecimalSep et ThousandSep.
+
+    Returns:
+        Le nombre, ou l'expression telle quelle si ce n'est pas un texte ou
+        si le script garde les separateurs par defaut.
+    """
+    dec = ctx.decimal_sep if ctx.decimal_sep not in (None, ".") else None
+    thousand = ctx.thousand_sep or None
+    if not isinstance(sql, StrField) or not (dec or thousand):
+        return sql
+    out = f"CAST({sql} AS STRING)"
+    if thousand:
+        # un espace dans Qlik couvre aussi les espaces insecables
+        pattern = (
+            r"[ \u00a0\u202f]" if thousand.strip() == "" else regex_escape(thousand)
+        )
+        out = f"regexp_replace({out}, {sql_string(pattern)}, '')"
+    if dec:
+        out = f"replace({out}, {sql_string(dec)}, '.')"
+    return NumSql(f"try_cast({out} AS DOUBLE)")
+
+
+class Shown(str):
+    """Expression SQL qui porte aussi le texte que Qlik affiche."""
+
+
+def with_display(sql: str, text: str) -> str:
+    """Attache a une expression le texte que Qlik affiche pour elle :
+    Num(x, '00') vaut x dans un calcul, mais "05" dans une concatenation.
+
+    Args:
+        sql: l'expression (nombre, date...).
+        text: l'expression SQL de son texte affiche.
+
+    Returns:
+        La meme expression, de meme type, avec son texte.
+    """
+    out = sql if type(sql) is not str else Shown(sql)
+    out.display = text  # type: ignore[attr-defined]
+    return out
+
+
+def shown(sql: str) -> str:
+    """Texte d'une expression dans une concatenation ou un Dual.
+
+    Args:
+        sql: l'expression.
+
+    Returns:
+        Son texte affiche s'il est connu, sinon la valeur en texte.
+    """
+    text = getattr(sql, "display", None)
+    return text if text else f"CAST({as_value(sql)} AS STRING)"
+
+
+def display_format(n: str, x: str, fmt: str) -> str | None:
+    """Texte affiche par Num(x, fmt) ou Date(x, fmt), pour les formats
+    simples ; None sinon (on garde alors la valeur).
+
+    Args:
+        n: "num", "date" ou "timestamp".
+        x: l'expression.
+        fmt: le format Qlik.
+
+    Returns:
+        L'expression SQL du texte, ou None.
+    """
+    if n == "num":
+        m = re.fullmatch(r"(0+)(?:\.(0+))?", fmt)
+        if not m:
+            return None
+        width, decimals = len(m.group(1)), len(m.group(2) or "")
+        if not decimals:
+            return f"lpad(CAST(CAST(round({x}) AS BIGINT) AS STRING), {width}, '0')"
+        return f"format_string('%0{width + decimals + 1}.{decimals}f', CAST({x} AS DOUBLE))"
+    try:
+        return f"date_format({x}, {sql_string(qlik_format_to_spark(fmt))})"
+    except Untranslatable:
+        return None
 
 
 def as_value(sql: str) -> str:
@@ -448,11 +794,24 @@ class ExprParser:
         if kind == "op" and v in ("=", "<>", "<", ">", "<=", ">="):
             self.take()
             right = self.p_concat()
+            # texte compare a un nombre : Qlik lit le texte comme un nombre
+            if isinstance(left, StrField) and is_numeric(right):
+                left = as_number(left, self.ctx)
+            elif isinstance(right, StrField) and is_numeric(left):
+                right = as_number(right, self.ctx)
+            # Floor(x) compare a une date : x est une date
+            if isinstance(right, DateSql):
+                left = dated(left, self.ctx)
+            if isinstance(left, DateSql):
+                right = dated(right, self.ctx)
             # date comparee a un texte : Qlik lit le texte comme une date
+            # (avec son heure si l'autre cote en a une)
             if isinstance(left, DateSql) and isinstance(right, StrField):
-                right = parse_date(right, self.ctx)
+                read = as_timestamp if isinstance(left, TsSql) else parse_date
+                right = read(right, self.ctx)
             elif isinstance(right, DateSql) and isinstance(left, StrField):
-                left = parse_date(left, self.ctx)
+                read = as_timestamp if isinstance(right, TsSql) else parse_date
+                left = read(left, self.ctx)
             return Bool(f"({as_value(left)} {v} {as_value(right)})")
         if (kind, v) == ("kw", "LIKE"):
             self.take()
@@ -480,12 +839,9 @@ class ExprParser:
             parts.append(self.p_add())
         if len(parts) == 1:
             return parts[0]
-        # avec & en Qlik, un null se comporte comme une chaine vide
-        return (
-            "concat_ws('', "
-            + ", ".join(f"CAST({as_value(p)} AS STRING)" for p in parts)
-            + ")"
-        )
+        # avec & en Qlik, un null se comporte comme une chaine vide ; une
+        # valeur formatee (Num(x, '00'), Date(d, 'YYYY-MM')) donne son texte
+        return "concat_ws('', " + ", ".join(shown(p) for p in parts) + ")"
 
     def p_add(self) -> str:
         """Addition et soustraction, dates comprises."""
@@ -493,25 +849,28 @@ class ExprParser:
         while self.peek() in (("op", "+"), ("op", "-")):
             op = self.take()[1]
             right = self.p_mul()
+            if any(isinstance(x, DateSql) or looks_like_date(x) for x in (left, right)):
+                # Un cote au type inconnu est peut-etre une date : Floor(x)
+                # dans un calcul de dates, colonne nommee DateFin... Sans
+                # cela, DateFin - DateDebut donnerait un intervalle en Spark.
+                left, right = maybe_date(left, self.ctx), maybe_date(right, self.ctx)
             if op == "-" and isinstance(left, DateSql) and isinstance(right, StrField):
                 right = parse_date(right, self.ctx)
             if op == "-" and isinstance(left, StrField) and isinstance(right, DateSql):
                 left = parse_date(left, self.ctx)
             if op == "-" and isinstance(left, DateSql) and isinstance(right, DateSql):
-                # en Qlik une date est un nombre de jours, donc date - date
-                # donne des jours
-                if isinstance(left, TsSql) or isinstance(right, TsSql):
-                    left = (
-                        f"((unix_timestamp({left}) - unix_timestamp({right}))"
-                        " / 86400.0)"
-                    )
-                else:
-                    left = f"datediff({left}, {right})"
+                # en Qlik une date est un nombre de jours : date - date donne
+                # des jours (Spark donnerait un intervalle)
+                left = date_diff(left, right)
             elif isinstance(left, DateSql) and not isinstance(right, DateSql):
-                # date +/- jours
-                left = DateSql(f"({left} {op} {as_value(right)})")
+                left = shift_date(left, op, right)
+            elif op == "+" and isinstance(right, DateSql):
+                left = shift_date(right, op, left)
             else:
-                left = f"({as_value(left)} {op} {as_value(right)})"
+                left = NumSql(
+                    f"({as_value(as_number(left, self.ctx))} {op} "
+                    f"{as_value(as_number(right, self.ctx))})"
+                )
         return left
 
     def p_mul(self) -> str:
@@ -519,14 +878,18 @@ class ExprParser:
         left = self.p_unary()
         while self.peek() in (("op", "*"), ("op", "/")):
             op = self.take()[1]
-            left = f"({as_value(left)} {op} {as_value(self.p_unary())})"
+            right = self.p_unary()
+            left = NumSql(
+                f"({as_value(as_number(left, self.ctx))} {op} "
+                f"{as_value(as_number(right, self.ctx))})"
+            )
         return left
 
     def p_unary(self) -> str:
         """Signe + ou - devant une valeur."""
         if self.peek() == ("op", "-"):
             self.take()
-            return f"(- {as_value(self.p_unary())})"
+            return NumSql(f"(- {as_value(as_number(self.p_unary(), self.ctx))})")
         if self.peek() == ("op", "+"):
             self.take()
         return self.p_primary()
@@ -561,6 +924,10 @@ class ExprParser:
             return DateSql(sql)
         if t in STR_TYPES:
             return StrField(sql)
+        if t in NUM_TYPES:
+            return NumSql(sql)
+        if not t and looks_like_date(name):
+            return GuessedTs(sql)
         return sql
 
     def call(self, name: str) -> str:
@@ -693,6 +1060,44 @@ DATE_ARG_FUNCTIONS = {
     "addyears",
 }
 
+# Fonctions qui lisent des nombres : un texte en argument est lu avec les
+# separateurs du script. Pas Min ni Max, qui servent aussi aux dates.
+NUMBER_ARG_FUNCTIONS = {
+    "sum",
+    "avg",
+    "round",
+    "floor",
+    "ceil",
+    "fabs",
+    "mod",
+    "div",
+    "frac",
+    "sign",
+    "sqrt",
+    "exp",
+    "log",
+    "log10",
+    "pow",
+    "rangesum",
+    "rangeavg",
+    "rangemin",
+    "rangemax",
+}
+
+
+def is_numeric(sql: str) -> bool:
+    """Dit si une expression SQL est un nombre : un litteral, ou un calcul.
+
+    Args:
+        sql: l'expression.
+
+    Returns:
+        True pour un nombre.
+    """
+    return isinstance(sql, NumSql) or bool(
+        re.fullmatch(r"\(?\s*-?\s*\d+(\.\d+)?\s*\)?", str(sql))
+    )
+
 
 def translate_function(
     name: str, a: list[str], raw: list[list[Token]], distinct: bool, ctx: ExprCtx
@@ -710,26 +1115,59 @@ def translate_function(
         L'expression Spark SQL.
     """
     n = name.lower()
+    if n in ("num", "date", "timestamp") and len(a) >= 2 and raw:
+        # la valeur d'abord, puis le texte que le format affiche
+        value = translate_function(name, a[:1], raw[:1], distinct, ctx)
+        fmt = literal(raw[1])
+        text = display_format(n, value, fmt) if fmt else None
+        return with_display(value, text) if text else value
     if n in DATE_ARG_FUNCTIONS and a:
         a = [as_date(a[0], ctx)] + a[1:]
-    if n in ("floor", "ceil") and len(a) == 1 and isinstance(a[0], DateSql):
-        # En Qlik une date est un nombre, et Floor garde le jour. Spark, lui,
-        # refuse floor() sur une date.
-        x = a[0]
-        if not isinstance(x, TsSql):
-            return DateSql(x)
-        if n == "floor":
-            return DateSql(f"CAST({x} AS DATE)")
-        return DateSql(
-            f"CASE WHEN {x} = CAST(CAST({x} AS DATE) AS TIMESTAMP) "
-            f"THEN CAST({x} AS DATE) ELSE date_add(CAST({x} AS DATE), "
-            f"1) END"
-        )
+    vals = a[1:] if n == "if" else a
+    if n in ROUNDING + ("if", "alt", "coalesce", "rangemax", "rangemin") and (
+        any(isinstance(x, DateSql) for x in vals)
+        or (vals and all(looks_like_date(x) for x in vals))
+    ):
+        # texte nomme comme une date a cote d'une date : Qlik le lit en date
+        a = [as_timestamp(x, ctx) if looks_like_date(x) else x for x in a]
+    elif n in ROUNDING and a and isinstance(a[0], StrField) and looks_like_date(a[0]):
+        a = [as_timestamp(a[0], ctx)] + a[1:]
+    original = list(a)
+    if n in NUMBER_ARG_FUNCTIONS:
+        a = [as_number(x, ctx) for x in a]
+    if n in ROUNDING and 1 <= len(a) <= 2 and isinstance(a[0], DateSql):
+        # Spark refuse floor() sur une date : on dit ce que Qlik fait
+        step = const_number(raw[1]) if len(a) == 2 and len(raw) == 2 else 1.0
+        return round_date(n, a[0], step)
+    if n in ("date", "timestamp") and len(a) == 1:
+        # Date(Floor(x)) : le type de x n'est pas toujours connu (colonne lue
+        # par RESIDENT), mais Date() dit que x est une date
+        a = [dated(a[0], ctx)]
+    if n in ("date", "timestamp") and len(a) == 1 and is_numeric(a[0]):
+        # un nombre Qlik : des jours depuis le 30/12/1899
+        if n == "date":
+            days = a[0] if whole_days(a[0]) else f"floor({as_value(a[0])})"
+            return DateSql(f"date_add({QLIK_DAY_ZERO}, CAST({days} AS INT))")
+        return shift_date(DateSql(QLIK_DAY_ZERO), "+", NumSql(as_value(a[0])))
     if n == "date" and a and isinstance(a[0], StrField):
         return parse_date(a[0], ctx)
     if n == "date" and a and isinstance(a[0], DateSql):
         return DateSql(a[0] if not isinstance(a[0], TsSql) else f"CAST({a[0]} AS DATE)")
     sql = _translate_function(name, a, raw, distinct, ctx)
+    values = a[1:] if n == "if" else a
+    if n in ("if", "alt", "coalesce", "rangemax", "rangemin") and values:
+        # If, Alt, RangeMax de dates restent des dates : sans ce type, une
+        # difference plus loin donnerait un intervalle en Spark
+        known = [v for v in values if str(v).strip().upper() != "NULL"]
+        if known and all(isinstance(v, DateSql) for v in known):
+            return (TsSql if any(isinstance(v, TsSql) for v in known) else DateSql)(sql)
+    if n in NUMBER_ARG_FUNCTIONS:
+        out = NumSql(sql)
+        if n in ROUNDING and len(original) == 1:
+            if not isinstance(original[0], NumSql):
+                # retenu pour Date(Floor(x)), qui garde le jour de x
+                out.rounded = (n, original[0])  # type: ignore[attr-defined]
+        return out
     # Min, Max, FirstValue... d'une date restent des dates. Sans ce typage,
     # le calendrier classique (Min/Max d'une date, LET vMin = Peek(...), puis
     # AUTOGENERATE vMax - vMin + 1) faisait date - date en Spark, qui donne
@@ -824,8 +1262,19 @@ def _translate_function(
     if n == "if":
         need(2, 3)
         return f"CASE WHEN {a[0]} THEN {a[1]} ELSE {a[2] if k == 3 else 'NULL'} END"
-    if n == "alt":
+    if n in ("alt", "coalesce"):
         return f"COALESCE({', '.join(a)})"
+    if n in ("interval", "time"):
+        need(1, 2)
+        # le format ne sert qu'a l'affichage : la valeur ne change pas
+        return a[0]
+    if n == "age":
+        need(2)
+        # annees revolues a la date a[0]
+        return NumSql(
+            f"CAST(floor(months_between({as_date(a[0], ctx)}, "
+            f"{as_date(a[1], ctx)}) / 12) AS INT)"
+        )
     if n in ("left", "right"):
         need(2)
         return f"{n}({a[0]}, {a[1]})"
@@ -848,7 +1297,20 @@ def _translate_function(
             ),
         )
         if sub is None or occ is None:
-            raise Untranslatable("Index() avec 3 arguments non litteraux")
+            # motif ou rang calcules : meme calcul, sans expression reguliere
+            # (instr n'a que 2 arguments en Spark 3.5)
+            s_, m_, k_ = a[0], a[1], a[2]
+            count = (
+                f"((length({s_}) - length(replace({s_}, {m_}, ''))) div length({m_}))"
+            )
+            return (
+                f"CASE WHEN {k_} = 0 THEN 0 "
+                f"WHEN {k_} > 0 THEN CASE WHEN {count} >= {k_} "
+                f"THEN length(substring_index({s_}, {m_}, {k_})) + 1 ELSE 0 END "
+                f"ELSE CASE WHEN {count} >= - {k_} THEN length({s_}) - "
+                f"length(substring_index({s_}, {m_}, {k_})) - length({m_}) + 1 "
+                f"ELSE 0 END END"
+            )
         nth = int(float(occ))
         count = f"(size(split({a[0]}, {sql_string(regex_escape(sub))})) - 1)"
         if nth == 0:
@@ -867,6 +1329,30 @@ def _translate_function(
     if n == "repeat":
         need(2)
         return f"repeat({a[0]}, {a[1]})"
+    if n == "substringcount":
+        need(2)
+        return (
+            f"((length({a[0]}) - length(replace({a[0]}, {a[1]}, ''))) "
+            f"div length({a[1]}))"
+        )
+    if n == "textbetween":
+        if k != 3:
+            raise Untranslatable("TextBetween avec une n-ieme occurrence")
+        rest = f"substr({a[0]}, instr({a[0]}, {a[1]}) + length({a[1]}))"
+        return (
+            f"CASE WHEN instr({a[0]}, {a[1]}) > 0 AND instr({rest}, {a[2]}) > 0 "
+            f"THEN substring_index({rest}, {a[2]}, 1) END"
+        )
+    if n == "class":
+        need(2, 3)
+        # Qlik renvoie un dual (borne basse, "3000 <= x < 4000") : on garde
+        # le texte, comme pour Dual
+        label = a[2] if k == 3 else "'x'"
+        low = f"(floor({a[0]} / {a[1]}) * {a[1]})"
+        return (
+            f"concat(CAST({low} AS STRING), ' <= ', {label}, ' < ', "
+            f"CAST({low} + {a[1]} AS STRING))"
+        )
     if n == "subfield":
         need(3)
         sep = literal(raw[1])
@@ -904,10 +1390,7 @@ def _translate_function(
         )
         if k > 2 or fmt is None:
             raise Untranslatable(f"{name} sans format litteral")
-        ts = (
-            f"try_to_timestamp(CAST({a[0]} AS STRING), "
-            f"{sql_string(qlik_format_to_spark(fmt))})"
-        )
+        ts = text_to_timestamp(a[0], qlik_format_to_spark(fmt))
         return f"CAST({ts} AS DATE)" if n == "date#" else ts
     if n == "date":
         need(1, 2)
@@ -1005,6 +1488,18 @@ def _translate_function(
             return f"{n}({a[0]})"
         # en Qlik le 2e argument est le pas
         return f"({n}({a[0]} / {a[1]}) * {a[1]})"
+    if n in ("daystart", "dayend"):
+        need(1)
+        x = a[0] if isinstance(a[0], DateSql) else as_timestamp(a[0], ctx)
+        start = f"CAST(CAST({x} AS DATE) AS TIMESTAMP)"
+        if n == "daystart":
+            return TsSql(start)
+        # comme Qlik : la derniere milliseconde du jour
+        return TsSql(f"({start} + INTERVAL 1 DAY - INTERVAL 1 MILLISECOND)")
+    if n == "frac":
+        need(1)
+        # Frac(-1.4) vaut 0.6 en Qlik
+        return f"({a[0]} - floor({a[0]}))"
     if n == "rangesum":
         # RangeSum ignore les nulls (comptes comme 0)
         return "(" + " + ".join(f"COALESCE({x}, 0)" for x in a) + ")"
@@ -1019,6 +1514,19 @@ def _translate_function(
     if n == "mod":
         need(2)
         return f"pmod({a[0]}, {a[1]})"
+    if n == "daynumberofyear":
+        need(1)
+        return f"dayofyear({as_date(a[0], ctx)})"
+    if n == "quarterstart":
+        need(1)
+        return DateSql(f"trunc({as_date(a[0], ctx)}, 'QUARTER')")
+    if n in ("even", "odd"):
+        need(1)
+        # vrai ou faux pour un entier, NULL sinon, comme Qlik
+        rest = "0" if n == "even" else "1"
+        return Bool(
+            f"(CASE WHEN {a[0]} = floor({a[0]}) THEN pmod({a[0]}, 2) = {rest} END)"
+        )
     if n == "div":
         need(2)
         return f"CAST({a[0]} / {a[1]} AS BIGINT)"
@@ -1027,8 +1535,9 @@ def _translate_function(
         return f"power({a[0]}, {a[1]})"
     if n == "dual":
         need(2)
-        # Parquet n'a qu'un type par colonne : on garde le texte (a valider)
-        return a[0]
+        # Parquet n'a qu'un type par colonne : on garde le texte (a valider),
+        # tel que Qlik l'affiche (Date(d, 'YYYY-MM') donne "2024-01")
+        return shown(a[0]) if getattr(a[0], "display", None) else a[0]
     if n == "null":
         return "NULL"
     if n == "isnull":
@@ -1265,7 +1774,12 @@ def parse_fields(text: str) -> list[tuple[str, str | None]]:
             m = pos
             break
         if m is not None:
-            alias = part[m + 2 :].strip().strip('[]"')
+            alias = part[m + 2 :].strip()
+            # AS [Nom], AS "Nom" ou AS 'Nom' : Qlik accepte les trois
+            if len(alias) >= 2 and alias[0] == alias[-1] == "'":
+                alias = alias[1:-1].strip()
+            else:
+                alias = alias.strip('[]"')
             if not alias:
                 raise Untranslatable(f"alias vide : {part[:40]}")
             out.append((part[:m].strip(), alias))
@@ -1458,6 +1972,15 @@ class SectionContext:
     column_types: dict[str, Any] = field(default_factory=dict)
     date_format: str | None = None
     timestamp_format: str | None = None
+    decimal_sep: str | None = None
+    thousand_sep: str | None = None
+    # version d'une table dont celle-ci repart (lue puis modifiee)
+    table_base: Callable[[str], str | None] = lambda t: None
+    # tables calculees dans cette section (vide : toutes)
+    section_tables: set[str] = field(default_factory=set)
+    # colonnes d'une table d'une section deja traduite (plus sures que le
+    # graphe, qui ne connait pas toujours celles d'un LOAD *)
+    table_columns: Callable[[str], list[str] | None] = lambda t: None
 
 
 class SectionTranslator:
@@ -1474,6 +1997,7 @@ class SectionTranslator:
         self.holes: list[dict[str, Any]] = []  # expressions laissees au modele
         self.todo_code: list[str] = []  # code Qlik laisse au modele
         self.derived_types: dict[str, str] = {}  # colonnes calculees en date
+        self.map_types: dict[str, type] = {}  # type des valeurs d'un mapping
         self.counter: dict[str, int] = {}
         self.technical: list[str] = []  # colonnes AutoNumber / Hash
         self.autogen_bottom: str | None = None  # "recno", "fieldvalue", "while"
@@ -1528,8 +2052,12 @@ class SectionTranslator:
                 self.drop_field(inst, line)
             elif inst.kind in ("store", "drop"):
                 return
+            elif inst.kind == "rename" and inst.renames:
+                self.rename_field(inst, line)
+            elif inst.kind == "rename" and inst.target:
+                self.notes.append(f"-- l.{line} : RENAME TABLE (rien a traduire)")
             elif inst.kind == "rename":
-                self.notes.append(f"-- l.{line} : RENAME (rien a traduire)")
+                raise Untranslatable("RENAME FIELD USING : renommage par un mapping")
             else:
                 raise Untranslatable(f"instruction {inst.kind}")
         except Untranslatable as exc:
@@ -1638,7 +2166,9 @@ class SectionTranslator:
                     f"CAST({alias}.map_key AS STRING)"
                 )
             alias = mapped[sig]
-            return f"COALESCE({alias}.map_value, {default_sql or key_sql})"
+            out = f"COALESCE({alias}.map_value, {default_sql or key_sql})"
+            # un mapping de dates donne des dates
+            return self.map_types.get(mname, str)(out)
 
         ectx = self.base_ectx(q, applymap)
         pre = f"{q}." if q else ""
@@ -1820,6 +2350,10 @@ class SectionTranslator:
         """Contexte d'expression qui a acces aux tables (pour Peek et
         NoOfRows)."""
         ectx = ExprCtx(q, applymap, self.ctx.date_format, self.ctx.timestamp_format)
+        ectx.decimal_sep, ectx.thousand_sep = (
+            self.ctx.decimal_sep,
+            self.ctx.thousand_sep,
+        )
         ectx.peek_table = self.peek_table_sql
         ectx.noofrows = self.noofrows_sql
         ectx.file_time = self.file_time_sql
@@ -1962,26 +2496,35 @@ class SectionTranslator:
         seg = segs[0]
         src, cols = self.base_source(insts[0], seg, None)
         exprs = [e for e, _ in seg.fields]
+        # meme contexte que le reste : types, DecimalSep, Peek...
+        ectx = self.base_ectx()
         if exprs == ["*"]:
             if not cols or len(cols) < 2:
                 raise Untranslatable(f"colonnes du mapping {mname} inconnues")
             k, v = ident(cols[0]), ident(cols[1])
         elif len(exprs) >= 2:
-            ectx = ExprCtx("", None, self.ctx.date_format, self.ctx.timestamp_format)
             k, v = expr(exprs[0], ectx), expr(exprs[1], ectx)
+            if isinstance(v, DateSql):
+                self.map_types[mname] = type(v)
         else:
             raise Untranslatable(f"mapping {mname} sans 2 colonnes")
         where = ""
         if seg.where:
-            where = " WHERE " + expr(
-                seg.where,
-                ExprCtx("", None, self.ctx.date_format, self.ctx.timestamp_format),
-            )
+            # une condition, pas une valeur : WHERE (x <> 'a'), et non le
+            # CASE WHEN ... THEN -1 ELSE 0 END que Spark refuse en filtre
+            where = " WHERE " + safe_where(cond(seg.where, ectx))
+        # Mapping avec agregat (Max, Sum... et GROUP BY) : on groupe, et la
+        # ligne garde l'ordre de sa premiere ligne source
+        order, group = ORD, ""
+        if seg.group_by or ectx.aggregate_used:
+            order = f"min({ORD})"
+            if seg.group_by:
+                group = " GROUP BY " + ", ".join(expr(g, ectx) for g in seg.group_by)
         # cle en double : Qlik garde la premiere valeur chargee
         return (
             f"(SELECT map_key, min_by(map_value, __o) AS map_value FROM "
-            f"(SELECT {k} AS map_key, {v} AS map_value, {ORD} AS __o "
-            f"FROM {src}{where}) GROUP BY map_key)"
+            f"(SELECT {k} AS map_key, {v} AS map_value, {order} AS __o "
+            f"FROM {src}{where}{group}) GROUP BY map_key)"
         )
 
     def base_source(
@@ -2097,8 +2640,12 @@ class SectionTranslator:
                 raise Untranslatable(f"WHILE : '{val}' non resolu")
         cap = self.WHILE_CAP
         # range() renvoie des BIGINT, et Spark refuse date + BIGINT
-        c_outer = cond(seg.while_cond or "", ExprCtx(iterno="CAST(g.id AS INT)"))
-        c_inner = cond(seg.while_cond or "", ExprCtx(iterno="CAST(r.id AS INT)"))
+        # contexte qui lit les tables : le calendrier classique compare
+        # IterNo() a Peek('MaxDate', 0, 'Bornes')
+        outer, inner = self.base_ectx(), self.base_ectx()
+        outer.iterno, inner.iterno = "CAST(g.id AS INT)", "CAST(r.id AS INT)"
+        c_outer = cond(seg.while_cond or "", outer)
+        c_inner = cond(seg.while_cond or "", inner)
         self.autogen_bottom = "while"
         return (
             f"(\n  -- WHILE Qlik : jusqu'a la premiere iteration fausse "
@@ -2169,10 +2716,14 @@ class SectionTranslator:
                 # le plus bas
                 self.autogen_bottom, self.autogen_field = None, None
         sql, columns = segs_sql[-1]
+        if "crosstable" in inst.constructs:
+            sql, columns = self.crosstable(inst, sql, columns)
         target = inst.target
         if target is None:
             raise Untranslatable("LOAD sans table cible")
         kind = self.describe(inst)
+        if {"join", "concatenate"} & inst.constructs:
+            self.seed(target)
         if {"join", "keep"} & inst.constructs:
             tmp = self.add(
                 f"{target}_joined", sql, f"l.{line} : {kind} (table jointe)", columns
@@ -2185,6 +2736,41 @@ class SectionTranslator:
             self.concat(target, tmp, columns, line)
         else:
             self.add(target, sql, f"l.{line} : {kind}", columns)
+
+    def crosstable(
+        self, inst: Inst, sql: str, columns: list[str] | None
+    ) -> tuple[str, list[str]]:
+        """CROSSTABLE (attribut, donnee, n) : une ligne par colonne apres les
+        n premieres, avec son nom et sa valeur, dans l'ordre de Qlik (ligne
+        par ligne, puis colonne par colonne).
+
+        Args:
+            inst: le LOAD.
+            sql: la requete du LOAD, avant le CROSSTABLE.
+            columns: ses colonnes.
+
+        Returns:
+            La requete depivotee et ses colonnes.
+        """
+        if inst.crosstable is None:
+            raise Untranslatable("CROSSTABLE non reconnu")
+        attr, data, n = inst.crosstable
+        if columns is None or len(columns) <= n:
+            raise Untranslatable("CROSSTABLE : colonnes inconnues")
+        keep, pivot = columns[:n], columns[n:]
+        stack = ", ".join(
+            f"{sql_string(c)}, {ident(c)}, {k}" for k, c in enumerate(pivot, 1)
+        )
+        select = [ident(c) for c in keep] + [
+            f"__attr AS {ident(attr)}",
+            f"__data AS {ident(data)}",
+            f"concat({ORD}, array(CAST(__k AS BIGINT))) AS {ORD}",
+        ]
+        out = (
+            f"SELECT {', '.join(select)}\nFROM (\n{_indent(sql, 2)}\n) x\n"
+            f"LATERAL VIEW stack({len(pivot)}, {stack}) st AS __attr, __data, __k"
+        )
+        return out, keep + [attr, data]
 
     def describe(self, inst: Inst) -> str:
         """Commentaire de la CTE : JOIN, CONCATENATE, source..."""
@@ -2372,10 +2958,45 @@ class SectionTranslator:
             cols,
         )
 
+    def seed(self, table: str) -> None:
+        """Version d'une table qui repart de la precedente (lue par une autre
+        table, puis modifiee) : on commence par relire celle-ci.
+
+        Args:
+            table: la cle de la version.
+        """
+        base = self.ctx.table_base(table)
+        if table in self.cur or not base:
+            return
+        view = self.ctx.table_view(base)
+        if view is None:
+            raise Untranslatable(f"version precedente de {table} introuvable")
+        self.add(
+            table,
+            f"SELECT * FROM {view}",
+            f"{self.ctx.table_name(table)} telle qu'elle etait avant (lue par "
+            "une autre table)",
+            self.ctx.table_columns(base) or self.ctx.graph_schema(base),
+        )
+
+    def own_keys(self, inst: Inst) -> list[str]:
+        """Tables touchees par l'instruction qui sont calculees dans cette
+        section (un DROP FIELD peut en toucher d'autres, ailleurs)."""
+        mine = self.ctx.section_tables
+        return [k for k in inst.keys if not mine or k in mine]
+
     def drop_field(self, inst: Inst, line: int) -> None:
         """DROP FIELD : nouvelle CTE sans les champs supprimes."""
+        for key in self.own_keys(inst):
+            self.seed(key)
+        if "resolved" in inst.constructs and not self.own_keys(inst):
+            # aucune table encore chargee n'a ces champs ici : rien a faire
+            self.notes.append(f"-- l.{line} : DROP FIELD sans effet ici")
+            return
         targets = (
-            [inst.target]
+            [k for k in self.own_keys(inst) if k in self.cur]
+            if inst.keys
+            else [inst.target]
             if inst.target
             else [
                 t
@@ -2396,6 +3017,34 @@ class SectionTranslator:
                 f"FROM {self.cur[t]}",
                 f"l.{line} : DROP FIELD {', '.join(inst.fields)}",
                 keep,
+            )
+
+    def rename_field(self, inst: Inst, line: int) -> None:
+        """RENAME FIELD : nouvelle CTE ou les champs changent de nom, dans
+        chaque table qui les a."""
+        names = dict(inst.renames)
+        for key in self.own_keys(inst):
+            self.seed(key)
+        targets = [
+            t for t in self.cur if set(names) & set(self.cols[self.cur[t]] or [])
+        ]
+        if not targets and any(self.cols[self.cur[t]] is None for t in self.cur):
+            # le champ est peut-etre dans une table aux colonnes inconnues
+            raise Untranslatable("RENAME FIELD : colonnes inconnues")
+        for t in targets:
+            known = self.cols.get(self.cur.get(t, ""))
+            if known is None:
+                raise Untranslatable("RENAME FIELD : colonnes inconnues")
+            select = [
+                f"{ident(c)} AS {ident(names[c])}" if c in names else ident(c)
+                for c in known
+            ]
+            self.add(
+                t,
+                f"SELECT {', '.join(select + [ORD])} FROM {self.cur[t]}",
+                f"l.{line} : RENAME FIELD "
+                + ", ".join(f"{a} TO {b}" for a, b in inst.renames),
+                [names.get(c, c) for c in known],
             )
 
     # -- assemblage

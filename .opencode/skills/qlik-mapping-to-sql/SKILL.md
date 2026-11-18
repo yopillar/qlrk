@@ -17,6 +17,11 @@ and, for each ApplyMap, the key expression and the default value.
 3. LEFT JOIN on the key expression, then `COALESCE(m.value, <default>)`.
 4. No default (2 arguments): ApplyMap returns the key itself ->
    `COALESCE(m.value, <key expression>)`.
+5. The mapping WHERE is a condition: `WHERE champ2 <> 'verif'`, never
+   `WHERE CASE WHEN ... THEN -1 ELSE 0 END` (Spark refuses an int filter).
+6. A mapping with an aggregate keeps its GROUP BY:
+   `MAPPING LOAD k, Max(v) RESIDENT T GROUP BY k` ->
+   `SELECT k AS map_key, max(v) AS map_value FROM t GROUP BY k`.
 
 ```sql
 WITH

@@ -27,6 +27,10 @@ columns into one column.
 - Duplicated keys multiply rows, in Qlik as in Spark: never deduplicate.
 - `UNION ALL` matches columns BY POSITION in Spark 3.5: list them explicitly
   on both sides, in the same order.
+- The keys are the names AFTER the AS of each LOAD: `LOAD Col AS c1` on both
+  sides joins on `c1`, and later steps use `c1`, never `Col`.
+- To drop helper columns after a join, list the columns you keep: Spark 3.5
+  has no `SELECT * EXCEPT (...)`.
 
 ```sql
 -- l.41 : LEFT JOIN (TMP_CMD1) sur id_produit

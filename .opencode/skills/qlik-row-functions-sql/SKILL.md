@@ -28,6 +28,11 @@ a RECURSIVE Peek, such as a running total.
   table) -> scalar subquery on that table's view or CTE.
 - Window functions cannot be used in WHERE: compute them in one CTE, filter
   in the next.
+- Range functions ignore nulls: `RangeSum(a, b)` is
+  `coalesce(a, 0) + coalesce(b, 0)`, `RangeMax(a, b)` is `greatest(a, b)`,
+  `RangeMin(a, b)` is `least(a, b)`.
+- Qlik `If(cond, x)` with 2 arguments is `CASE WHEN cond THEN x END`: Spark
+  `if` needs 3 arguments.
 
 ```sql
 -- l.40 : cumul des montants par client, dans l'ordre des dates

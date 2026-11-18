@@ -130,6 +130,36 @@ TYPE_ERRORS = (
 KNOWLEDGE_ERRORS = ("UNRESOLVED_COLUMN",)
 
 
+def spark_message(exc: Exception) -> str:
+    """Premiere ligne utile d'une erreur de Spark.
+
+    Le message commence parfois par une ligne vide : sans cela, le modele
+    ne recevait que "syntaxe SQL :" et ne savait pas quoi corriger.
+
+    Args:
+        exc: l'erreur.
+
+    Returns:
+        Sa premiere ligne non vide, ou "".
+    """
+    return next((x.strip() for x in str(exc).splitlines() if x.strip()), "")
+
+
+def unknown_columns(section: dict) -> list[str]:
+    """Vues lues par la table dont on ne connait pas les colonnes.
+
+    Spark ne peut pas analyser la requete sans elles : la table n'est alors
+    pas controlee, et ses types de sortie ne sont pas calcules.
+
+    Args:
+        section: la table, avec ses vues.
+
+    Returns:
+        Les noms de ces vues.
+    """
+    return [v for v, p in section.get("views", {}).items() if not p.get("columns")]
+
+
 def columns_sure(section: dict) -> bool:
     """Dit si toutes les colonnes que lit la table sont sures.
 
@@ -205,10 +235,50 @@ class SparkChecker:
             self.parser.parsePlan(sql)
             return None
         except Exception as exc:
-            # le message de Spark commence par une ligne vide : on prend la
-            # premiere qui dit quelque chose, sinon le modele n'a rien
-            lines = [x for x in str(exc).splitlines() if x.strip()]
-            return "syntaxe SQL : " + (lines[0] if lines else "")[:300]
+            return "syntaxe SQL : " + spark_message(exc)[:300]
+
+    def _declare_views(self, views: dict) -> None:
+        """Declare les vues lues par une table, vides, avec leurs colonnes
+        et leurs types. A appeler sous self.lock.
+
+        Args:
+            views: les vues de la section.
+        """
+        for name, v in views.items():
+            types = v.get("types") or {}
+            cols = [
+                f"CAST(NULL AS {spark_type(types.get(c))}) AS `{c.replace('`', '``')}`"
+                for c in dict.fromkeys(v["columns"])
+                if c != "_qlik_order"
+            ]
+            cols.append("CAST(NULL AS ARRAY<BIGINT>) AS _qlik_order")
+            self.spark.sql(
+                f"SELECT {', '.join(cols)} WHERE false"
+            ).createOrReplaceTempView(name)
+            # vue de FileTime(), creee par read_input a cote de l'entree
+            self.spark.sql(
+                "SELECT CAST(NULL AS TIMESTAMP) AS file_time"
+            ).createOrReplaceTempView(name + FILE_VIEW_SUFFIX)
+
+    def columns_of(self, section: dict, sql: str) -> list[str] | None:
+        """Colonnes que Spark donne a une requete, sur les vues vides de la
+        section (rien n'est execute).
+
+        Args:
+            section: la table, avec ses vues.
+            sql: la requete.
+
+        Returns:
+            Les noms des colonnes, ou None si Spark ne peut pas l'analyser.
+        """
+        if unknown_columns(section):
+            return None
+        with self.lock:
+            try:
+                self._declare_views(section.get("views", {}))
+                return list(self.spark.sql(sql).schema.names)
+            except Exception:
+                return None
 
     def analyze(self, section: dict, sql: str) -> str | None:
         """Erreur de l'analyse Spark sur des vues vides, ou None.
@@ -217,28 +287,14 @@ class SparkChecker:
         Spark (output_types).
         """
         views = section.get("views", {})
-        if any(not v.get("columns") for v in views.values()):
-            # on ne connait pas toutes les colonnes ; sans aucune vue (INLINE,
-            # AUTOGENERATE), il n'y a rien a declarer et on analyse quand meme
+        if unknown_columns(section):
+            # on ne connait pas toutes les colonnes : check_section le
+            # signale. Sans aucune vue (INLINE, AUTOGENERATE), il n'y a rien
+            # a declarer et on analyse quand meme.
             return None
         with self.lock:
             try:
-                for name, v in views.items():
-                    types = v.get("types") or {}
-                    cols = [
-                        f"CAST(NULL AS {spark_type(types.get(c))}) AS "
-                        f"`{c.replace('`', '``')}`"
-                        for c in dict.fromkeys(v["columns"])
-                        if c != "_qlik_order"
-                    ]
-                    cols.append("CAST(NULL AS ARRAY<BIGINT>) AS _qlik_order")
-                    self.spark.sql(
-                        f"SELECT {', '.join(cols)} WHERE false"
-                    ).createOrReplaceTempView(name)
-                    # vue de FileTime(), creee par read_input a cote de l'entree
-                    self.spark.sql(
-                        "SELECT CAST(NULL AS TIMESTAMP) AS file_time"
-                    ).createOrReplaceTempView(name + FILE_VIEW_SUFFIX)
+                self._declare_views(views)
                 schema = self.spark.sql(sql).schema  # rien n'est execute
                 # Types des colonnes produites, tels que Spark les ecrira :
                 # fill_conf.py s'en sert pour le schema d'un fichier relu par
@@ -256,7 +312,7 @@ class SparkChecker:
                 )
                 return None
             except Exception as exc:
-                msg = str(exc).splitlines()[0]
+                msg = spark_message(exc)
                 all_typed = all(
                     set(v["columns"]) - {"_qlik_order"} <= set(v.get("types") or {})
                     for v in views.values()
@@ -519,6 +575,12 @@ def check_section(
             " + les CTE de la requete)"
         )
 
+    if re.search(r"\*\s*EXCEPT\s*\(", code_no_idents, re.I):
+        # Spark 3.5 repond "syntax error at or near <colonne>", peu parlant
+        errors.append(
+            "SELECT * EXCEPT (...) n'existe pas en Spark 3.5 (Databricks, "
+            "Spark 4) : lister les colonnes gardees"
+        )
     if re.search(r"\bmonotonically_increasing_id\s*\(", code_no_idents, re.I):
         errors.append(
             "monotonically_increasing_id() interdit : Spark le refuse dans un "
@@ -559,8 +621,25 @@ def check_section(
     # remonter tout de suite les autres erreurs.
     if parser is not None and not [e for e in errors if "TODO(model)" not in e]:
         problem = parser.parse(raw) or parser.analyze(section, raw)
-        if problem:
+        if (
+            problem
+            and not columns_sure(section)
+            and any(k in problem for k in KNOWLEDGE_ERRORS)
+        ):
+            # Colonnes amont deduites du script : la colonne existe peut-etre.
+            # Meme regle a la traduction et au controle de migrate.py.
+            warnings.append(
+                f"{problem} (colonnes amont deduites du script : a confirmer, "
+                "non bloquant)"
+            )
+        elif problem:
             errors.append(problem)
+        elif unknown_columns(section):
+            warnings.append(
+                "non analysee par Spark : colonnes inconnues pour "
+                + ", ".join(unknown_columns(section))
+                + " (schema a ajouter dans conf/schema, ou fill_conf.py)"
+            )
     if "TODO" in raw.replace("TODO(model)", ""):
         warnings.append("TODO laisse dans la requete : a relire")
     return sorted(set(errors), key=errors.index), warnings
@@ -608,18 +687,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             sec["status"] = "ok"  # corrigee a la main, et validee
             changed = True
-        sure = (
-            errors
-            if columns_sure(sec)
-            else [e for e in errors if not any(k in e for k in KNOWLEDGE_ERRORS)]
-        )
-        if errors and not sure and args.mark:
-            print(
-                f"[!] {sec['id']} : {errors[0][:160]} (colonnes amont deduites "
-                "du script : a confirmer, non bloquant)"
-            )
-            continue
-        if sure and args.mark and sec["status"] in ("deterministic", "ok"):
+        if errors and args.mark and sec["status"] in ("deterministic", "ok"):
             # La requete avait ete acceptee mais Spark la refuse. C'est souvent
             # un cas que le traducteur gere mal : on la repasse en escalade
             # avant qu'elle n'arrive dans le job.
@@ -656,6 +724,11 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
         if args.mark and not errors:
+            # le controle de migrate.py n'affiche que les erreurs, sauf ce
+            # qui dit qu'une table n'a pas pu etre controlee pour de bon
+            for w in warnings:
+                if w.startswith("non analysee") or "non bloquant" in w:
+                    print(f"[!] {sec['id']} : {w[:300]}")
             continue
         print(f"{'KO' if errors else 'OK'} {sec['id']} ({sec['status']})")
         for e in errors:
