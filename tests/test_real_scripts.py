@@ -468,9 +468,13 @@ def test_date_of_floor_keeps_the_day() -> None:
             assert "floor(" not in sql.lower() and "ceil(" not in sql.lower()
             rows = spark.sql(f"SELECT {sql} FROM VALUES ({value}) AS t(d)").collect()
             assert str(rows[0][0]) == day, (typ, text, sql)
+    # m numerique : un numero de serie Qlik, des jours depuis le 30/12/1899
     ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
     ctx.column_types = {"m": "DOUBLE"}
-    assert expr("Date(Floor(m))", ctx).lower().count("floor(") == 1
+    sql = expr("Date(Floor(m))", ctx)
+    assert sql.lower().count("floor(") == 1
+    rows = spark.sql(f"SELECT {sql} FROM VALUES (45321.7D) AS t(m)").collect()
+    assert str(rows[0][0]) == "2024-01-30"
 
 
 @pytest.mark.spark
@@ -543,3 +547,173 @@ def test_spark_types_reach_the_next_tables(project: Project) -> None:
         encoding="utf-8"
     )
     assert "CAST(d AS DATE)" in draft and "floor(" not in draft
+
+
+DATES_SCRIPT = """SET DateFormat='DD/MM/YYYY';
+SET TimestampFormat='DD/MM/YYYY hh:mm:ss';
+Src:
+LOAD * INLINE [
+Id, Client, TxtDebut, TxtFin
+1, a, 28/01/2024 08:00:00, 30/01/2024 15:45:00
+2, a, 30/03/2024 12:00:00, 31/03/2024 12:00:00
+3, b, 01/02/2024 00:00:00, 01/02/2024 06:00:00
+];
+MapDerniere:
+MAPPING LOAD Client, Max(Timestamp#(TxtFin, 'DD/MM/YYYY hh:mm:ss'))
+RESIDENT Src GROUP BY Client;
+T1:
+NoConcatenate LOAD Id, Client,
+  Timestamp#(TxtDebut, 'DD/MM/YYYY hh:mm:ss') AS Debut,
+  Timestamp#(TxtFin, 'DD/MM/YYYY hh:mm:ss') AS Fin
+RESIDENT Src;
+T2:
+NoConcatenate LOAD Id, Client, Debut, Fin,
+  Fin - Debut AS Duree,
+  Floor(Fin) - Floor(Debut) AS NbJours,
+  Round((Fin - Debut) * 24, 0.01) AS Heures,
+  Date(Floor(Fin)) AS JourFin,
+  If(Fin > Debut, Fin, Debut) AS Dmax,
+  ApplyMap('MapDerniere', Client) AS Derniere
+RESIDENT T1;
+DROP TABLE T1;
+T3:
+NoConcatenate LOAD Id, Duree, NbJours, Heures,
+  Floor(Dmax - Debut) AS Ecart,
+  Date(JourFin + 7) AS Semaine,
+  Floor(Derniere) - Floor(Debut) AS DepuisDerniere,
+  Timestamp(Debut + 1/24) AS DebutPlus1h
+RESIDENT T2;
+STORE T3 INTO [lib://o/t3.qvd] (qvd);
+Agg:
+NoConcatenate LOAD Client, Max(Fin) - Min(Debut) AS Etendue,
+  Date(Max(Floor(Fin))) AS DernierJour
+RESIDENT T2 GROUP BY Client;
+STORE Agg INTO [lib://o/agg.qvd] (qvd);
+"""
+
+
+@pytest.mark.spark
+def test_date_arithmetic_through_resident_chain(project: Project) -> None:
+    """Calculs de dates Qlik sur plusieurs tables : date - date en jours (pas
+    un intervalle Spark), Floor d'un horodatage, date + 1/24, If et ApplyMap
+    de dates ; les types passent d'une table a l'autre. La 2e ligne passe a
+    l'heure d'ete : 24 heures quand meme, comme Qlik."""
+    (project / "script_qvd/dates.qvs").write_text(DATES_SCRIPT, encoding="utf-8")
+    project.run("prepare.py", "script_qvd/dates.qvs")
+    tables = run_sections(project / "work/dates")
+    rows = {r[0]: r for r in tables["T3"]}
+    # Id, Duree, NbJours, Heures, Ecart, Semaine, DepuisDerniere, DebutPlus1h
+    one = rows[1]
+    assert round(float(one[1]), 9) == round(2 + 7.75 / 24, 9)
+    assert (one[2], float(one[3]), one[4], one[6]) == (2, 55.75, 2, 63)
+    assert str(one[5]) == "2024-02-06"
+    assert str(one[7]) == "2024-01-28 09:00:00"
+    dst = rows[2]
+    assert (float(dst[1]), dst[2], float(dst[3])) == (1.0, 1, 24.0)
+    agg = {r[0]: r for r in tables["Agg"]}
+    assert round(float(agg["a"][1]), 6) == round(63 + 4 / 24, 6)
+    assert str(agg["a"][2]) == "2024-03-31"
+
+
+# Exemples de calculs de dates, valeurs attendues calculees a la main avec
+# les regles de Qlik : une date est un nombre de jours depuis le 30/12/1899,
+# l'heure en est la partie decimale. Colonnes DateDebut et DateFin pour trois
+# jeux de valeurs : des dates, des horodatages, et un jour de passage a
+# l'heure d'ete (24 heures quand meme pour Qlik).
+DATE_VALUES = {
+    "date": ("DATE'2024-01-28'", "DATE'2024-01-30'"),
+    "timestamp": ("TIMESTAMP'2024-01-28 08:00:00'", "TIMESTAMP'2024-01-30 15:45:00'"),
+    "dst": ("TIMESTAMP'2024-03-30 12:00:00'", "TIMESTAMP'2024-03-31 12:00:00'"),
+}
+DATE_CASES = [
+    # expression, attendu pour date, timestamp, dst
+    ("DateFin - DateDebut", ("2", "2.322917", "1")),
+    ("Floor(DateFin - DateDebut)", ("2", "2", "1")),
+    ("Floor(DateFin) - Floor(DateDebut)", ("2", "2", "1")),
+    ("Round((DateFin - DateDebut) * 24, 0.01)", ("48", "55.75", "24")),
+    ("Ceil(DateFin - DateDebut)", ("2", "3", "1")),
+    ("DateFin + 1", ("2024-01-31", "2024-01-31 15:45:00", "2024-04-01 12:00:00")),
+    ("Date(DateFin + n)", ("2024-02-02", "2024-02-02", "2024-04-03")),
+    (
+        "DateFin + x",
+        ("2024-01-31 12:00:00", "2024-02-01 03:45:00", "2024-04-02 00:00:00"),
+    ),
+    (
+        "Timestamp(DateFin - 1/24)",
+        ("2024-01-29 23:00:00", "2024-01-30 14:45:00", "2024-03-31 11:00:00"),
+    ),
+    ("If(DateFin > DateDebut, DateFin, DateDebut) - DateDebut", ("2", "2.322917", "1")),
+    ("Alt(DateFin, DateDebut) - DateDebut", ("2", "2.322917", "1")),
+    ("RangeMax(DateFin, DateDebut) - DateDebut", ("2", "2.322917", "1")),
+    ("Age(DateFin, MakeDate(1990, 1, 31))", ("33", "33", "34")),
+    ("DateFin >= DateDebut + 2", ("-1", "-1", "0")),
+    ("Date(Floor(DateFin, 7))", ("2024-01-27", "2024-01-27", "2024-03-30")),
+]
+
+
+def spark_text(spark: Any, sql: str, select: str) -> str:
+    """Valeur d'une expression Spark en texte : nombre arrondi, date,
+    horodatage ; un intervalle est signale (Qlik donne des jours)."""
+    row = spark.sql(
+        f"SELECT typeof(v), CAST(v AS STRING) FROM (SELECT {sql} AS v FROM "
+        f"(SELECT {select}))"
+    ).collect()[0]
+    if row[0].startswith("interval"):
+        return "intervalle " + row[1]
+    if row[0] in ("date", "timestamp", "string"):
+        return row[1]
+    return f"{float(row[1]):.6f}".rstrip("0").rstrip(".")
+
+
+@pytest.mark.spark
+@pytest.mark.parametrize("known", [True, False], ids=["type_connu", "type_inconnu"])
+def test_qlik_date_arithmetic(known: bool) -> None:
+    """date - date donne des jours (Spark : un intervalle), floor() ne recoit
+    jamais une date, date + n garde l'heure ; le type des colonnes connu
+    (conf) ou non (nom de date), et au passage a l'heure d'ete."""
+    from check import get_parser
+
+    spark = get_parser().spark
+    zone = str(spark.conf.get("spark.sql.session.timeZone"))
+    spark.conf.set("spark.sql.session.timeZone", "Europe/Paris")
+    try:
+        for k, (scenario, (debut, fin)) in enumerate(DATE_VALUES.items()):
+            types = {"n": "int", "x": "double"}
+            if known:
+                kind = "date" if scenario == "date" else "timestamp"
+                types.update(DateDebut=kind, DateFin=kind)
+            select = f"{debut} AS DateDebut, {fin} AS DateFin, 3 AS n, 1.5D AS x"
+            for text, expected in DATE_CASES:
+                ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
+                ctx.column_types = types
+                sql = expr(text, ctx)
+                got = spark_text(spark, sql, select)
+                assert got == expected[k], (scenario, text, sql)
+    finally:
+        spark.conf.set("spark.sql.session.timeZone", zone)
+
+
+@pytest.mark.spark
+def test_text_dates_never_crash_spark() -> None:
+    """Spark 3.5 plante (INCONSISTENT_BEHAVIOR_CROSS_VERSION) sur un texte
+    que l'ancien analyseur aurait lu : "1/2/2024", une heure en trop, une
+    annee sur 2 chiffres. Lu comme Qlik, ou NULL, jamais d'erreur."""
+    from check import get_parser
+
+    spark = get_parser().spark
+    ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
+    ctx.column_types = {"s": "string"}
+    expected = {
+        "30/01/2024 15:45:00": ("2024-01-30", "2024-01-30 15:45:00"),
+        "1/2/2024": ("2024-02-01", None),  # pas d heure : pas un horodatage
+        "30/01/24": (None, None),
+        "abc": (None, None),
+    }
+    day, stamp = expr("Date#(s)", ctx), expr("Timestamp#(s)", ctx)
+    for value, (want_day, want_stamp) in expected.items():
+        select = f"'{value}' AS s"
+        row = spark.sql(
+            f"SELECT CAST({day} AS STRING), "
+            f"CAST({stamp} AS STRING) FROM (SELECT {select})"
+        ).collect()[0]
+        assert (row[0], row[1]) == (want_day, want_stamp), value
