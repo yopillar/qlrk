@@ -590,8 +590,7 @@ def yaml_value(value: str) -> str:
 def entry_lines(name: str, props: dict, why: str) -> list[tuple[int, str]]:
     """Lignes d'une entree, avec leur niveau (0 : la cle, 1 : ses
     proprietes). Une propriete dictionnaire (options) tient sur une ligne."""
-    today = dt.date.today().isoformat()
-    return [(0, f"{yaml_key(name)}:  # ajoute le {today} : {why}")] + [
+    return [(0, f"{yaml_key(name)}:  # {why}")] + [
         (1, f"{k}: {flow_map(v) if isinstance(v, dict) else yaml_value(str(v))}")
         for k, v in props.items()
     ]
@@ -741,22 +740,18 @@ def type_text(t: str, style: dict) -> str:
     return t.upper()
 
 
-def schema_text(why: str, lines: list, style: dict) -> str:
-    """Texte d'un schema a creer, dans la forme des schemas existants.
+def schema_text(lines: list, style: dict) -> str:
+    """Texte d'un schema a creer, dans la forme des schemas existants. Ni
+    date ni en-tete : le fichier ne change que si les types changent.
 
     Args:
-        why: pourquoi il est cree (commentaire d'en-tete).
         lines: (colonne, type, d'ou vient le type) dans l'ordre.
         style: forme des schemas existants (voir schema_style).
 
     Returns:
         Le contenu du fichier.
     """
-    today = dt.date.today().isoformat()
-    body = [
-        f"# Cree par tools/fill_conf.py le {today} ({why}).",
-        "# Les types suivis de 'a verifier' ont ete devines.",
-    ]
+    body: list[str] = []
     pad = " " * style["indent"] if style["wrap"] else ""
     if style["wrap"]:
         body.append(f"{style['wrap']}:")
@@ -1239,12 +1234,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         schema_root, where = base, "conf/"
     created = []
-    for schema_file, (why, lines) in schemas_out.items():
+    for schema_file, (_, lines) in schemas_out.items():
         target = schema_root / schema_file
         if target.exists() and not args.draft:
             continue  # jamais d'ecrasement d'un vrai schema
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(schema_text(why, lines, style), encoding="utf-8")
+        target.write_text(schema_text(lines, style), encoding="utf-8")
         created.append(target)
 
     print_summary(
