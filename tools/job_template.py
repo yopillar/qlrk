@@ -99,21 +99,11 @@ def function_name(script_stem: str) -> str:
 
 JOB = '''"""Job du projet {project}.
 
-Cree par tools/orchestrate.py, qui ne le reecrit jamais : c'est ici qu'on
-ajoute ses propres etapes, dans l'ordre (scripts/{project}_step_020_<nom>.py...).
-L'etape 010 rejoue les scripts Qlik ; ses requetes sont dans sql/. Le job
-s'arrete au premier script en echec, et le dit dans les logs.
-
-    python src/job_{project}.py                  # tout
-    python src/job_{project}.py --from ventes    # reprendre a un script
-    python src/job_{project}.py --only ventes    # un seul script
-
-Sur le cluster, depuis la racine du projet :
-
-    spark-submit --name {project} --deploy-mode client \\\\
-        --py-files <spark_foundation et pyspark_commons, s'ils ne sont
-                    pas installes> \\\\
-        src/job_{project}.py [--from <script> | --only <script>]
+Cree une seule fois, jamais reecrit : c'est ici qu'on ajoute ses propres
+etapes, dans l'ordre (scripts/{project}_step_020_<nom>.py...). L'etape 010
+rejoue les scripts Qlik ; ses requetes sont dans sql/. Le job s'arrete au
+premier script en echec, et le dit dans les logs. --from <script> reprend a
+un script, --only <script> n'en lance qu'un.
 """
 
 from __future__ import annotations
@@ -144,8 +134,8 @@ SCRIPTS_INIT = '"""Etapes du projet {project}, une par fichier, dans l\'ordre.""
 
 STEP_HEADER = '''"""Etape 010 du projet {project} : les scripts Qlik, traduits en Spark SQL.
 
-Fichier genere par tools/orchestrate.py : ne pas le modifier a la main, il
-est reecrit a chaque migration. Vos etapes vont dans d'autres fichiers
+Fichier genere : ne pas le modifier a la main, il est reecrit a chaque
+migration. Vos etapes vont dans d'autres fichiers
 ({project}_step_020_<nom>.py...).
 
 Une liste par script Qlik : ses tables dans l'ordre, chacune avec sa

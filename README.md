@@ -154,8 +154,9 @@ spark-submit --name <projet> --deploy-mode client \
 En mode client, le driver lit `src/scripts/` et `src/sql/` sur place. Le
 mode cluster demanderait d'envoyer aussi ces dossiers et `conf/` : ce n'est
 pas prevu pour l'instant. Les reglages SQL dont dependent les requetes
-(sensibilite a la casse, ANSI desactive, `timeParserPolicy=CORRECTED`) sont
-poses par le socle, il n'y a pas de `--conf` a passer.
+(sensibilite a la casse, ANSI desactive, `timeParserPolicy=LEGACY`,
+`analyzer.maxIterations=10000`) sont poses par le socle, il n'y a pas de
+`--conf` a passer.
 
 ### Les logs
 

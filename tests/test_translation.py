@@ -58,11 +58,12 @@ def test_check_refuses_invented_date_functions(project: Project) -> None:
     assert "add_month() inconnue de Spark" in res.stdout
 
 
-def test_job_template_has_spark_submit() -> None:
-    """Le job genere compile et rappelle la commande spark-submit."""
+def test_job_template_without_kit_references() -> None:
+    """Le job genere compile, et ne cite ni les outils du kit ni de commande
+    spark-submit : il leur survit."""
     from job_template import render_job
 
     code = render_job("demo")
     compile(code, "job_demo.py", "exec")
     head = code.split('"""')[1]
-    assert "spark-submit" in head and "src/job_demo.py" in head
+    assert "tools/" not in head and "spark-submit" not in head

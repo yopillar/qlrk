@@ -501,7 +501,10 @@ def shift_date(d: DateSql, op: str, n: str) -> str:
     )
 
 
-DATE_NAME = re.compile(r"(^|[_ .`])(date|dt)([_ `]|$)|(^|[.`])date", re.I)
+# DateFin, date_cmd, dt_fin, DT_CREA, et en suffixe ColDate, CreationDate
+DATE_NAME = re.compile(
+    r"(?i:(^|[_ .`])(date|dt)([_ `]|$)|(^|[.`])date)|(?<=[a-z0-9])Date"
+)
 
 
 def looks_like_date(sql: str) -> bool:
@@ -522,6 +525,31 @@ def maybe_date(sql: str, ctx: ExprCtx) -> str:
     if looks_like_date(sql):
         return as_timestamp(sql, ctx)
     return sql
+
+
+FLIPPED = {">": "<", "<": ">", ">=": "<=", "<=": ">=", "=": "=", "<>": "<>"}
+
+
+def date_vs_number(d: DateSql, op: str, n: str) -> str:
+    """Date comparee a un nombre. En Qlik, le nombre de la date est compare :
+    des jours depuis le 30/12/1899. Spark refuse de comparer une date a un
+    nombre.
+
+    ColDate > 0 sert a dire "date renseignee" : toute vraie date est apres
+    le 30/12/1899, et NULL ne passe pas. C'est donc IS NOT NULL.
+
+    Args:
+        d: la date.
+        op: l'operateur, la date a gauche.
+        n: le nombre.
+
+    Returns:
+        La condition.
+    """
+    if str(n).strip("() ") == "0" and op in (">", ">=", "<>"):
+        return Bool(f"({d} IS NOT NULL)")
+    target = shift_date(DateSql(QLIK_DAY_ZERO), "+", n)
+    return Bool(f"({d} {op} {as_value(target)})")
 
 
 def round_date(n: str, x: DateSql, step: float | None) -> str:
@@ -794,6 +822,20 @@ class ExprParser:
         if kind == "op" and v in ("=", "<>", "<", ">", "<=", ">="):
             self.take()
             right = self.p_concat()
+            # texte nomme comme une date (DateFin) compare a un nombre : Qlik
+            # le lit en date, puis compare son nombre de jours
+            if (
+                looks_like_date(left)
+                and isinstance(left, StrField)
+                and is_numeric(right)
+            ):
+                left = as_timestamp(left, self.ctx)
+            elif (
+                looks_like_date(right)
+                and isinstance(right, StrField)
+                and is_numeric(left)
+            ):
+                right = as_timestamp(right, self.ctx)
             # texte compare a un nombre : Qlik lit le texte comme un nombre
             if isinstance(left, StrField) and is_numeric(right):
                 left = as_number(left, self.ctx)
@@ -812,6 +854,10 @@ class ExprParser:
             elif isinstance(right, DateSql) and isinstance(left, StrField):
                 read = as_timestamp if isinstance(right, TsSql) else parse_date
                 left = read(left, self.ctx)
+            if isinstance(left, DateSql) and is_numeric(right):
+                return date_vs_number(left, v, right)
+            if isinstance(right, DateSql) and is_numeric(left):
+                return date_vs_number(right, FLIPPED[v], left)
             return Bool(f"({as_value(left)} {v} {as_value(right)})")
         if (kind, v) == ("kw", "LIKE"):
             self.take()

@@ -63,8 +63,11 @@ def test_migrate_demo_identical_to_qlik(project: Project) -> None:
         "--var",
         "sorties=data/output",
     )
-    job = (project / "src/job_demo.py").read_text(encoding="utf-8")
-    assert "spark-submit" in job
+    # le code genere survit au kit : ni ses outils ni de commande a lancer
+    for f in (project / "src").rglob("*"):
+        if f.is_file() and f.suffix in (".py", ".sql"):
+            text = f.read_text(encoding="utf-8")
+            assert "tools/" not in text and "spark-submit" not in text, f
 
 
 def test_csv_without_header(project: Project) -> None:

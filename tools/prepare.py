@@ -2864,7 +2864,7 @@ def prepare(
         header = (
             f"-- Section {sec['id']} : table {g}"
             f" (lignes Qlik {sec['lines'][0]}-{sec['lines'][1]})\n"
-            "-- Traduit depuis Qlik par tools/prepare.py\n"
+            "-- Traduit depuis Qlik\n"
         )
         sql, todos, cols, technical, short_sql, holes, derived = translate_section(
             sec_insts, [i.clean_text for i in sec_insts], ctx, header

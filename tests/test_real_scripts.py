@@ -717,3 +717,38 @@ def test_text_dates_never_crash_spark() -> None:
             f"CAST({stamp} AS STRING) FROM (SELECT {select})"
         ).collect()[0]
         assert (row[0], row[1]) == (want_day, want_stamp), value
+
+
+@pytest.mark.spark
+def test_date_compared_to_a_number() -> None:
+    """ColDate > 0 dit "date renseignee" en Qlik (le nombre d'une date
+    compte les jours depuis le 30/12/1899) : IS NOT NULL. Spark refuse de
+    comparer une date a un nombre ; un autre nombre devient la date de ce
+    rang."""
+    from check import get_parser
+
+    spark = get_parser().spark
+    values = [
+        ("date", "DATE'2024-01-30'", "CAST(NULL AS DATE)"),
+        ("timestamp", "TIMESTAMP'2024-01-30 15:45:00'", "CAST(NULL AS TIMESTAMP)"),
+        (None, "DATE'2024-01-30'", "CAST(NULL AS DATE)"),
+        ("string", "'30/01/2024'", "''"),
+    ]
+    cases = {
+        "ColDate > 0": [-1, 0],
+        "0 < ColDate": [-1, 0],
+        "ColDate >= 45321": [-1, 0],
+    }
+    for typ, filled, empty in values:
+        ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
+        ctx.column_types = {"ColDate": typ} if typ else {}
+        for text, want in cases.items():
+            sql = expr(text, ctx)
+            got = [
+                spark.sql(f"SELECT {sql} FROM (SELECT {v} AS ColDate)").collect()[0][0]
+                for v in (filled, empty)
+            ]
+            assert got == want, (typ, text, sql)
+    ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
+    ctx.column_types = {"ColDate": "date"}
+    assert "IS NOT NULL" in expr("ColDate > 0", ctx)

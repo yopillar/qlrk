@@ -288,7 +288,7 @@ def suggest(col: str, counter: Counter | None) -> tuple[str | None, str]:
         # colonne de dates utilisee seulement dans Min() ou Max(), comme
         # dans un calendrier, n'a pas d'autre indice, et c'est justement la
         # que le type compte.
-        if re.search(r"(^|[_ ])(date|dt)([_ ]|$)|^date", col, re.I):
+        if re.search(r"(?i:(^|[_ ])(date|dt)([_ ]|$)|^date)|(?<=[a-z0-9])Date", col):
             return "date", "devine d'apres le nom de la colonne, a verifier"
         return "string", "type inconnu : string par defaut, a verifier"
     by_type: dict[str, list[str]] = {}
@@ -558,9 +558,8 @@ def var_prefix(conf: IoConf, kind: str, default: str) -> str:
 
 
 DRAFT_HEADER = [
-    "# Brouillon ecrit par tools/fill_conf.py --draft : a relire,",
-    "# puis a recopier dans conf/io.yml. Ni le kit ni le socle",
-    "# ne lisent ce fichier.",
+    "# Brouillon : a relire, puis a recopier dans conf/io.yml.",
+    "# Ni le kit ni le socle ne lisent ce fichier.",
     "",
 ]
 

@@ -344,10 +344,11 @@ def get_parser() -> SparkChecker:
         .config("spark.ui.enabled", "false")
         .getOrCreate()
     )
-    # meme comportement que Spark 3.5
+    # memes reglages que la session du socle
     spark.conf.set("spark.sql.ansi.enabled", "false")
-    # Qlik est sensible a la casse
     spark.conf.set("spark.sql.caseSensitive", "true")
+    spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+    spark.conf.set("spark.sql.analyzer.maxIterations", "10000")
     spark.sparkContext.setLogLevel("ERROR")
     return SparkChecker(spark)
 
