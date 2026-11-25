@@ -187,8 +187,8 @@ def csv_options(options: dict[str, str]) -> dict[str, str | bool]:
     out: dict[str, str | bool] = {
         "header": options.get("header", "true") == "true",
         "mode": "PERMISSIVE",
-        # dates a la francaise par defaut ; Spark lit aussi l'ISO avec
-        # timeParserPolicy=LEGACY, le reglage du socle
+        # dates a la francaise par defaut : seules les colonnes a ce format
+        # sont typees date ou timestamp (value_kind)
         **CSV_DATE_OPTIONS,
     }
     out.update({k: v for k, v in options.items() if k != "header"})
@@ -470,9 +470,10 @@ def csv_types(path: Path, header: bool = True) -> tuple[list[str], dict[str, str
     """En-tete d'un CSV et types deduits de ses valeurs (sur place : rien
     n'en sort du poste). On ne retient que des types que Spark relit avec
     les options ecrites par le kit : entier, decimal a point, date et
-    horodatage ISO (2024-01-31, 2024-01-31 10:00:00) ou a la francaise
-    (31/01/2024, 31/01/2024 10:00:00), booleen true/false. Un decimal a
-    virgule reste en string, car Spark ne le lirait pas.
+    horodatage au format de lecture (31/01/2024, 31/01/2024 10:00:00),
+    booleen true/false. Une date ISO ou un decimal a virgule restent en
+    string, car Spark les lirait en null ; le kit lit deja comme une date un
+    texte au DateFormat du script, ou en ISO.
 
     On lit tout le fichier : une seule valeur texte, meme a la millionieme
     ligne, met la colonne en string. Un echantillon la laissait en bigint, et
@@ -515,8 +516,10 @@ def csv_types(path: Path, header: bool = True) -> tuple[list[str], dict[str, str
 CSV_TYPES = (
     ("bigint", {"bigint"}),
     ("double", {"bigint", "double"}),
+    # une seule forme par colonne : Spark lit une date avec dateFormat et un
+    # horodatage avec timestampFormat, sans melange possible
     ("date", {"date"}),
-    ("timestamp", {"date", "timestamp"}),
+    ("timestamp", {"timestamp"}),
     ("boolean", {"boolean"}),
 )
 
@@ -540,15 +543,9 @@ def value_kind(v: str) -> str:
         return "double"
     if v.lower() in ("true", "false"):
         return "boolean"
-    m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})([ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?", v)
-    if m:
-        try:
-            dt.datetime.fromisoformat(v.replace("T", " "))
-        except ValueError:
-            return "string"
-        return "timestamp" if m.group(2) else "date"
-    # a la francaise, les formats de lecture par defaut (CSV_DATE_OPTIONS)
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})( (\d{1,2}):(\d{2}):(\d{2}))?", v)
+    # Exactement les formats de lecture (CSV_DATE_OPTIONS) : dd/MM/yyyy et
+    # dd/MM/yyyy HH:mm:ss. Spark lit une autre forme (ISO, 1/2/2024) en null.
+    m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})( (\d{2}):(\d{2}):(\d{2}))?", v)
     if m:
         d, mo, y = (int(m.group(k)) for k in (1, 2, 3))
         try:

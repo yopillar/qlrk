@@ -364,8 +364,9 @@ def test_parquet_types_keep_precision(tmp_path: Path) -> None:
 
 
 def test_csv_values_give_dates_and_booleans(tmp_path: Path) -> None:
-    """Dates et horodatages ISO ou a la francaise et booleens d'un CSV sont
-    types, pas les fausses dates."""
+    """Dates et horodatages au format de lecture (a la francaise) et
+    booleens d'un CSV sont types ; une date ISO ou fausse reste en string,
+    Spark la lirait en null."""
     path = tmp_path / "t.csv"
     path.write_text(
         "jour;moment;actif;fr;faux;mixte\n"
@@ -376,12 +377,12 @@ def test_csv_values_give_dates_and_booleans(tmp_path: Path) -> None:
     )
     _, types, _ = csv_types(path)
     assert types == {
-        "jour": "date",
-        "moment": "timestamp",
+        "jour": "string",
+        "moment": "string",
         "actif": "boolean",
         "fr": "date",
         "faux": "string",
-        "mixte": "timestamp",
+        "mixte": "string",
     }
 
 
@@ -393,13 +394,22 @@ def test_check_keeps_decimal_precision() -> None:
 
 
 def test_french_dates_typed_in_csv(tmp_path: Path) -> None:
-    """Une colonne de dates a la francaise est typee date ou timestamp : le
-    kit ecrit les formats francais dans les options de lecture."""
+    """Une colonne exactement au format de lecture (dd/MM/yyyy, dd/MM/yyyy
+    HH:mm:ss) est typee date ou timestamp. Une autre forme (ISO, 1/2/2024,
+    date et horodatage melanges) reste en string : Spark la lirait en null."""
     path = tmp_path / "f.csv"
     path.write_text(
-        "Fr;FrTs;Iso;Faux\n31/01/2024;31/01/2024 10:05:00;2024-01-31;31/02/2024\n"
-        "1/2/2024;01/02/2024 08:00:00;2024-02-01;01/01/2024\n",
+        "Fr;FrTs;Iso;Court;Mix\n"
+        "31/01/2024;31/01/2024 10:05:00;2024-01-31;1/2/2024;31/01/2024\n"
+        "01/02/2024;01/02/2024 08:00:00;2024-02-01;01/02/2024;"
+        "01/02/2024 08:00:00\n",
         encoding="utf-8",
     )
     _, types, _ = csv_types(path)
-    assert types == {"Fr": "date", "FrTs": "timestamp", "Iso": "date", "Faux": "string"}
+    assert types == {
+        "Fr": "date",
+        "FrTs": "timestamp",
+        "Iso": "string",
+        "Court": "string",
+        "Mix": "string",
+    }

@@ -17,8 +17,7 @@ def read_config(spark: SparkSession, name: str) -> DataFrame:
 
     Un CSV est lu avec son schema (colonnes dans l'ordre du fichier) et ses
     options (header, sep, encoding, mode...), passees telles quelles au
-    lecteur CSV de Spark. En-tete et dates a la francaise par defaut
-    (dd/MM/yyyy, dd/MM/yyyy HH:mm:ss). Un fichier Excel (xlsx, xls)
+    lecteur CSV de Spark. En-tete par defaut. Un fichier Excel (xlsx, xls)
     est lu feuille par feuille (option sheets). Les autres formats sont lus
     par leur nom (parquet...).
 
@@ -38,14 +37,7 @@ def read_config(spark: SparkSession, name: str) -> DataFrame:
     if fmt != "csv":
         return spark.read.format(fmt).load(path)
     reader = spark.read
-    # En-tete et dates a la francaise par defaut ; avec timeParserPolicy=
-    # LEGACY (session.py), Spark lit aussi les dates ISO.
-    options: dict[str, Any] = {
-        "header": True,
-        "dateFormat": "dd/MM/yyyy",
-        "timestampFormat": "dd/MM/yyyy HH:mm:ss",
-        **(description.get("options") or {}),
-    }
+    options: dict[str, Any] = {"header": True, **(description.get("options") or {})}
     for key, value in options.items():
         reader = reader.option(
             key, str(value).lower() if isinstance(value, bool) else value

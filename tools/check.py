@@ -347,7 +347,7 @@ def get_parser() -> SparkChecker:
     # memes reglages que la session du socle
     spark.conf.set("spark.sql.ansi.enabled", "false")
     spark.conf.set("spark.sql.caseSensitive", "true")
-    spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+    spark.conf.set("spark.sql.legacy.timeParserPolicy", "CORRECTED")
     spark.conf.set("spark.sql.analyzer.maxIterations", "10000")
     spark.sparkContext.setLogLevel("ERROR")
     return SparkChecker(spark)
