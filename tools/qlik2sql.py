@@ -2045,6 +2045,7 @@ class SectionTranslator:
         self.derived_types: dict[str, str] = {}  # colonnes calculees en date
         self.map_types: dict[str, type] = {}  # type des valeurs d'un mapping
         self.counter: dict[str, int] = {}
+        self.mapping_ctes: dict[str, str] = {}  # mapping -> sa CTE
         self.technical: list[str] = []  # colonnes AutoNumber / Hash
         self.autogen_bottom: str | None = None  # "recno", "fieldvalue", "while"
         self.autogen_field: str | None = None
@@ -2207,7 +2208,7 @@ class SectionTranslator:
                 alias = f"m{len(mapped) + 1}"
                 mapped[sig] = alias
                 joins.append(
-                    f"LEFT JOIN {self.mapping_sql(mname)} {alias}\n"
+                    f"LEFT JOIN {self.mapping_cte(mname)} {alias}\n"
                     f"  ON CAST({key_sql} AS STRING) = "
                     f"CAST({alias}.map_key AS STRING)"
                 )
@@ -2525,14 +2526,55 @@ class SectionTranslator:
                 sources.append(view)
         if not sources:
             return "false"  # champ jamais charge jusqu'ici
-        union = " UNION ALL ".join(
-            f"SELECT {ident(field_name)} AS v FROM {src}"
-            for src in dict.fromkeys(sources)
+        # NOT Exists : en Qlik une valeur NULL n'existe jamais, la ligne
+        # passe. En SQL, NOT (NULL IN (...)) vaut NULL et la perdrait, comme
+        # une liste qui contient NULL : d'ou les deux gardes.
+        text = getattr(inst, "clean_text", "") or ""
+        negated = re.search(
+            r"\bNOT\s+Exists\s*\(\s*[\['\"]?" + re.escape(field_name), text, re.I
         )
-        return f"EXISTS (SELECT 1 FROM ({union}) ex WHERE ex.v = {value})"
+        col = ident(field_name)
+        not_null = f" WHERE {col} IS NOT NULL" if negated else ""
+        union = " UNION ALL ".join(
+            f"SELECT {col} FROM {src}{not_null}" for src in dict.fromkeys(sources)
+        )
+        constant = re.fullmatch(r"'(?:[^']|'')*'|-?\d+(\.\d+)?", value.strip())
+        if negated and not constant:
+            return f"({value} IS NOT NULL AND {value} IN ({union}))"
+        return f"({value} IN ({union}))"
 
-    def mapping_sql(self, mname: str) -> str:
-        """Sous-requete (map_key, map_value) d'une table de mapping."""
+    def mapping_cte(self, mname: str) -> str:
+        """CTE d'un mapping, ecrite une seule fois et lue par chaque ApplyMap.
+
+        En tete de la requete si le mapping lit un fichier, sinon juste
+        avant la table qui l'utilise : elle doit suivre la table qu'elle lit.
+
+        Args:
+            mname: le nom du mapping.
+
+        Returns:
+            Le nom de la CTE (map_<mapping>).
+        """
+        if mname in self.mapping_ctes:
+            return self.mapping_ctes[mname]
+        body, src = self.mapping_sql(mname)
+        name = "map_" + view_name(mname).lower()
+        inst = self.ctx.mapping_insts(mname)[0]
+        cte = Cte(name, body, f"l.{inst.stmt.first_line} : mapping {mname}", None)
+        known = {c.name for c in self.ctes}
+        reads_cte = any(re.search(rf"\b{re.escape(n)}\b", src) for n in known)
+        if reads_cte:
+            self.ctes.append(cte)
+        else:
+            maps = sum(1 for c in self.ctes if c.name.startswith("map_"))
+            self.ctes.insert(maps, cte)
+        self.cols[name] = ["map_key", "map_value"]
+        self.mapping_ctes[mname] = name
+        return name
+
+    def mapping_sql(self, mname: str) -> tuple[str, str]:
+        """Requete (map_key, map_value) d'une table de mapping, et sa
+        source."""
         insts = [i for i in self.ctx.mapping_insts(mname) if i.kind == "load"]
         if len(insts) != 1:
             raise Untranslatable(f"mapping {mname} defini en plusieurs fois")
@@ -2567,11 +2609,16 @@ class SectionTranslator:
             if seg.group_by:
                 group = " GROUP BY " + ", ".join(expr(g, ectx) for g in seg.group_by)
         # cle en double : Qlik garde la premiere valeur chargee
+        group_line = f"\n  {group.strip()}" if group else ""
+        where_line = f"\n  {where.strip()}" if where else ""
         return (
-            f"(SELECT map_key, min_by(map_value, __o) AS map_value FROM "
-            f"(SELECT {k} AS map_key, {v} AS map_value, {order} AS __o "
-            f"FROM {src}{where}{group}) GROUP BY map_key)"
-        )
+            "SELECT map_key, min_by(map_value, __o) AS map_value\n"
+            "FROM (\n"
+            f"  SELECT {k} AS map_key, {v} AS map_value, {order} AS __o\n"
+            f"  FROM {src}{where_line}{group_line}\n"
+            ")\n"
+            "GROUP BY map_key"
+        ), src
 
     def base_source(
         self, inst: Inst, seg: Segment, sql_text: str | None

@@ -162,7 +162,7 @@ def run_sections(workdir: Path) -> dict[str, list[tuple]]:
         df = spark.sql((workdir / sec["id"] / "query.sql").read_text(encoding="utf-8"))
         df.createOrReplaceTempView(sec["view"])
         rows = df.drop("_qlik_order").collect()
-        out[sec["table"]] = sorted(tuple(r) for r in rows)
+        out[sec["table"]] = sorted((tuple(r) for r in rows), key=str)
     return out
 
 
@@ -752,3 +752,38 @@ def test_date_compared_to_a_number() -> None:
     ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
     ctx.column_types = {"ColDate": "date"}
     assert "IS NOT NULL" in expr("ColDate > 0", ctx)
+
+
+@pytest.mark.spark
+def test_exists_as_in_and_mapping_ctes(project: Project) -> None:
+    """Exists devient un IN, NOT Exists garde une cle NULL comme Qlik (une
+    valeur NULL n'existe jamais) ; chaque mapping est une CTE map_<nom>,
+    lue par un LEFT JOIN."""
+    (project / "script_qvd/exist.qvs").write_text(
+        "Clients:\nLOAD * INLINE [\nCodeClient, Pays\na, FR\nb, BE\n];\n"
+        "STORE Clients INTO [lib://o/clients.qvd] (qvd);\n"
+        "MapPays:\nMAPPING LOAD CodeClient, Pays RESIDENT Clients;\n"
+        "Src:\nLOAD * INLINE [\nCode, M\na, 1\nc, 2\nx, 3\n];\n"
+        "Ventes:\nNoConcatenate LOAD If(Code = 'x', Null(), Code) AS Code, M "
+        "RESIDENT Src;\n"
+        "Connus:\nNoConcatenate LOAD Code, M, ApplyMap('MapPays', Code, '?') AS Pays "
+        "RESIDENT Ventes WHERE Exists(CodeClient, Code);\n"
+        "STORE Connus INTO [lib://o/connus.qvd] (qvd);\n"
+        "Inconnus:\nNoConcatenate LOAD Code, M RESIDENT Ventes "
+        "WHERE NOT Exists(CodeClient, Code);\n"
+        "STORE Inconnus INTO [lib://o/inconnus.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    project.run("prepare.py", "script_qvd/exist.qvs")
+    work = project / "work/exist"
+    queries = {
+        q.parent.name: q.read_text(encoding="utf-8") for q in work.glob("*/query.sql")
+    }
+    connus = next(
+        v for k, v in queries.items() if k.endswith("connus") and "in" not in k
+    )
+    assert "Code IN (SELECT CodeClient FROM" in connus and "EXISTS" not in connus
+    assert "map_mappays AS (" in connus and "LEFT JOIN map_mappays m1" in connus
+    tables = run_sections(work)
+    assert tables["Connus"] == [("a", 1, "FR")]
+    assert tables["Inconnus"] == sorted([("c", 2), (None, 3)], key=str)

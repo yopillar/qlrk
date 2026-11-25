@@ -42,6 +42,8 @@ from typing import Any, overload
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from conf import (  # noqa: E402
+    DEFAULT_DATE_FORMAT,
+    DEFAULT_TIMESTAMP_FORMAT,
     WORK,
     IoConf,
     IoEntry,
@@ -2853,8 +2855,9 @@ def prepare(
                 fieldvalue_views, produced_tables=produced_now
             ),
             column_types=conf_types,
-            date_format=env.vars.get("DateFormat"),
-            timestamp_format=env.vars.get("TimestampFormat"),
+            date_format=env.vars.get("DateFormat") or DEFAULT_DATE_FORMAT,
+            timestamp_format=env.vars.get("TimestampFormat")
+            or DEFAULT_TIMESTAMP_FORMAT,
             decimal_sep=env.vars.get("DecimalSep"),
             thousand_sep=env.vars.get("ThousandSep"),
             table_base=lambda t: tables.get(t, {}).get("base"),
@@ -2992,8 +2995,8 @@ def prepare(
         "script": script.name,
         "notes": notes,
         "unresolved_variables": unresolved,
-        "date_format": env.vars.get("DateFormat"),
-        "timestamp_format": env.vars.get("TimestampFormat"),
+        "date_format": env.vars.get("DateFormat") or DEFAULT_DATE_FORMAT,
+        "timestamp_format": env.vars.get("TimestampFormat") or DEFAULT_TIMESTAMP_FORMAT,
         "sections": sections,
     }
     (base / "manifest.json").write_text(

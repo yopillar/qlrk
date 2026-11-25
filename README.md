@@ -99,28 +99,27 @@ def run(spark: SparkSession, args: list[str]) -> None:
     demo_step_010_run_sql.run()
 ```
 
-L'etape 010 contient une liste de tables par script Qlik, une seule boucle,
-et `run()` qui appelle les scripts dans l'ordre. Avec 50 tables, on a 50
-lignes dans une liste, pas 140 appels de fonction :
+L'etape 010 contient une liste de tables par script Qlik, puis `run()` et
+sa boucle unique, qui enchaine les scripts dans l'ordre. Avec 50 tables, on
+a 50 lignes dans une liste, pas 140 appels de fonction :
 
 ```python
+# Script Qlik ventes.qvs
 VENTES: list[tuple[str, str, str | None]] = [
     ("ventes__01_ventes.sql", "Ventes", "ventes_enrichies_v2"),
     ("ventes__02_clients.sql", "Clients", None),  # None : pas de STORE
 ]
 
-
-@script
-def ventes() -> None:
-    """Script Qlik ventes.qvs."""
-    run_tables(VENTES)
+# Script Qlik synthese.qvs, apres ventes dont il lit les sorties
+SYNTHESE: list[tuple[str, str, str | None]] = [...]
 
 
 def run() -> None:
     """Fait tourner les scripts Qlik du projet, dans l'ordre."""
-    calendrier()
-    ventes()
-    synthese()  # apres ventes, dont il lit les sorties
+    for sql_file, table, output in CALENDRIER + VENTES + SYNTHESE:
+        run_sql(sql_file, table=table)
+        if output:
+            write_output(output, table=table)
 ```
 
 Chaque ligne de `VENTES` donne la requete, le nom de la table Qlik et, si
@@ -186,18 +185,20 @@ il les affiche au niveau INFO, sur la sortie d'erreur, que YARN recupere.
   lui, comme dans l'enchainement des taches de rechargement Qlik.
   `orchestrate.py` le calcule a partir de `work/stores.json` (ce que chaque
   script lit et ecrit) et le note en commentaire.
-- **Le job s'arrete au premier script en echec**, comme un rechargement
-  Qlik : les suivants liraient des donnees absentes ou d'hier. On corrige,
-  puis on relance avec `--from <script>`. Toutes les ecritures sont en
-  overwrite, relancer ne cree donc pas de doublon. Un nom inconnu passe a
-  `--from` ou `--only` est signale.
-- **`@script` marche aussi sur vos etapes** : posez-le sur leur fonction
-  pour pouvoir les viser avec `--from` et `--only`.
-- **Chaque script a ses propres vues**, supprimees a la fin, pour que deux
-  scripts puissent avoir une table du meme nom.
-- **Chaque table Qlik est ecrite dans le catalogue**, sous
-  `<base>.<script>__<table>` (base `<projet>_qlik` par defaut, `--database`
-  pour en changer), en overwrite, puis relue de la. C'est pour OpenLineage :
+- **Le job s'arrete a la premiere table en echec**, comme un rechargement
+  Qlik : les suivantes liraient des donnees absentes ou d'hier. On corrige,
+  puis on relance le job. Toutes les ecritures sont en overwrite, relancer
+  ne cree donc pas de doublon. Le nom de chaque requete commence par celui
+  de son script (`ventes__03_t2.sql`) : les logs disent ou on en est.
+- **`@script` du socle reste disponible pour vos etapes** : posez-le sur
+  leur fonction pour pouvoir les viser avec `--from` et `--only`. Le code
+  genere ne s'en sert pas.
+- **Chaque table Qlik est ecrite dans le catalogue**, sous `<base>.__<table>`
+  (`<base>.<script>__<table>` dans une etape sous `@script` ; base
+  `<projet>_qlik` par defaut, `--database` pour en changer), en overwrite,
+  puis relue de la. Deux scripts avec une table du meme nom ecrivent donc la
+  meme table du catalogue, l'un apres l'autre : sans effet sur les
+  resultats, mais la lignee ne garde que la derniere. C'est pour OpenLineage :
   une vue temporaire n'est pas un jeu de donnees, et la lignee irait des
   fichiers lus aux sorties sans montrer les tables entre les deux. Avec
   `--temp-views`, le job garde des vues temporaires : plus rapide, mais rien
@@ -448,8 +449,13 @@ relit avec ce format.
   `Previous`, `Peek` (champ simple, ou `Peek('f', n, 'T')` sur une autre
   table), `FirstValue`, `LastValue`, `NoOfRows`, et les mappings, qui gardent
   la premiere valeur chargee comme Qlik.
-- **`Exists(champ[, expr])` et `NOT Exists(...)`**, y compris le
-  dedoublonnage quand le LOAD charge lui-meme le champ.
+- **`Exists(champ[, expr])` et `NOT Exists(...)`**, en
+  `valeur IN (SELECT champ FROM ...)`, y compris le dedoublonnage quand le
+  LOAD charge lui-meme le champ. Une valeur NULL n'existe jamais, comme
+  dans Qlik : `NOT Exists` garde la ligne.
+- **Les mappings**, chacun en une CTE `map_<mapping>` en tete de la requete
+  (ou juste avant la table qui l'utilise, s'il lit une table de la
+  requete), et chaque `ApplyMap` en `LEFT JOIN map_<mapping>`.
 - **`FileTime()`** dans un `LOAD ... FROM fichier` (ou `FileTime('fichier')`
   sur ce meme fichier) : la date de modification du fichier lu. Pour un
   autre fichier, c'est laisse au modele, car il n'est peut-etre pas declare
@@ -693,7 +699,6 @@ Le code genere n'importe que ceci :
 | Import | Fichier du socle | Role |
 |---|---|---|
 | `from spark_foundation import pipeline` | `runner.py` | `@pipeline("<projet>")` ouvre la session, configure les logs, lit les options du job et trouve `sql/` a cote du job |
-| `from spark_foundation.runner import script` | `runner.py` | `@script` sur un script : `--from` / `--only`, vues du script, logs, arret au premier echec |
 | `from spark_foundation.tables import run_sql` | `tables.py` | calcule une table Qlik avec sa requete, apres avoir lu les entrees dont elle a besoin |
 | `from spark_foundation.datasets import write_output` | `datasets.py` | ecrit une table dans une sortie de `conf/io.yml` |
 

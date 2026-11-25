@@ -101,9 +101,8 @@ JOB = '''"""Job du projet {project}.
 
 Cree une seule fois, jamais reecrit : c'est ici qu'on ajoute ses propres
 etapes, dans l'ordre (scripts/{project}_step_020_<nom>.py...). L'etape 010
-rejoue les scripts Qlik ; ses requetes sont dans sql/. Le job s'arrete au
-premier script en echec, et le dit dans les logs. --from <script> reprend a
-un script, --only <script> n'en lance qu'un.
+rejoue les scripts Qlik ; ses requetes sont dans sql/. Le job s'arrete a la
+premiere table en echec, et le dit dans les logs.
 """
 
 from __future__ import annotations
@@ -120,8 +119,8 @@ def run(spark: SparkSession, args: list[str]) -> None:
 
     Args:
         spark: la session Spark, ouverte par @pipeline.
-        args: les arguments de la ligne de commande (--from, --only), deja
-            pris en compte par @pipeline.
+        args: les arguments de la ligne de commande, deja lus par
+            @pipeline.
     """
     {step}.run()
 
@@ -147,20 +146,15 @@ dans conf/io.yml : il n'y a rien a declarer ici.
 from __future__ import annotations
 
 from spark_foundation.datasets import write_output
-from spark_foundation.runner import script
 from spark_foundation.tables import run_sql
 '''
 
-STEP_LOOP = '''
+STEP_RUN = '''
 
-def run_tables(tables: list[tuple[str, str, str | None]]) -> None:
-    """Calcule les tables dans l'ordre, et ecrit celles qui ont une sortie.
-
-    Args:
-        tables: (requete du dossier sql/, table, sortie dans conf/io.yml ou
-            None) pour chaque table.
-    """
-    for sql_file, table, output in tables:
+def run() -> None:
+    """Fait tourner les scripts Qlik du projet, dans l'ordre : chaque table
+    est calculee, puis ecrite si le script Qlik la stockait (STORE)."""
+    for sql_file, table, output in {tables}:
         run_sql(sql_file, table=table)
         if output:
             write_output(output, table=table)
@@ -220,45 +214,40 @@ def render_step(
 ) -> str:
     """Code de src/scripts/<projet>_step_010_run_sql.py.
 
-    Une liste de tables et une fonction par script Qlik, une seule boucle
-    pour tous, et run() qui appelle les scripts dans l'ordre.
+    Une liste de tables par script Qlik, puis run() et sa boucle unique,
+    qui les enchaine dans l'ordre.
 
     Args:
         project: le nom du projet.
         scripts: pour chaque script, dans l'ordre ou ils tournent : (nom de
-            la fonction, fichier du script Qlik, ses tables [fichier sql,
-            table, sortie ou None], fonctions dont il depend).
+            la liste, fichier du script Qlik, ses tables [fichier sql,
+            table, sortie ou None], scripts dont il depend).
 
     Returns:
         Le code du module.
     """
     parts = [STEP_HEADER.format(project=project)]
-    for func, _, steps, _ in scripts:
+    for func, qlik_file, steps, deps in scripts:
         lines = "".join(
             _table_line(sql_file, table, output or None) + "\n"
             # *_ : les anciens assembly.json ont une 4e valeur, ignoree
             for sql_file, table, output, *_ in steps
         )
+        after = f", apres {', '.join(deps)} dont il lit les sorties" if deps else ""
         parts.append(
-            f"\n{func.upper()}: list[tuple[str, str, str | None]] = ["
+            f"\n# Script Qlik {qlik_file}{after}\n"
+            f"{func.upper()}: list[tuple[str, str, str | None]] = ["
             + (f"\n{lines}" if lines else "")
             + "]\n"
         )
-    parts.append(STEP_LOOP)
-    for func, qlik_file, _, _ in scripts:
-        parts.append(
-            f"\n\n@script\ndef {func}() -> None:\n"
-            f'    """Script Qlik {qlik_file}."""\n'
-            f"    run_tables({func.upper()})\n"
+    names = " + ".join(func.upper() for func, *_ in scripts)
+    if len(f"    for sql_file, table, output in {names}:") > 88:
+        # une liste par ligne, comme ruff format
+        names = (
+            "(\n        "
+            + "\n        + ".join(func.upper() for func, *_ in scripts)
+            + "\n    )"
         )
-    calls = "".join(
-        f"    {func}()"
-        + (f"  # apres {', '.join(deps)}, dont il lit les sorties" if deps else "")
-        + "\n"
-        for func, _, _, deps in scripts
-    )
-    parts.append(
-        '\n\ndef run() -> None:\n    """Fait tourner les scripts Qlik du projet, '
-        'dans l\'ordre."""\n' + (calls or "    pass\n")
-    )
-    return "".join(parts)
+    if not scripts:
+        return parts[0] + '\n\ndef run() -> None:\n    """Aucun script Qlik."""\n'
+    return "".join(parts) + STEP_RUN.format(tables=names)

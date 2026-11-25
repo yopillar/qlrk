@@ -39,6 +39,9 @@ never write files. Think in English; SQL comments in French. Answer with one
 - `Date(n)` of a number is `date_add(DATE'1899-12-30', n)`, never
   `CAST(n AS DATE)`.
 - An empty string `''` is not null in Qlik.
+- `Exists(f, v)` is `v IN (SELECT f FROM <tables loaded before>)`. A NULL
+  never exists: `NOT Exists(f, v)` keeps the row when v is NULL, so write
+  `NOT (v IS NOT NULL AND v IN (SELECT f FROM t WHERE f IS NOT NULL))`.
 
 ## Spark SQL 3.5.8 (not Databricks, not Spark 4)
 - No `SELECT * EXCEPT (col)`: list the columns you keep.

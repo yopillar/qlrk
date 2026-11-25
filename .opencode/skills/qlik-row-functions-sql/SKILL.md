@@ -51,4 +51,4 @@ step_2 AS (
 |---|---|
 | `FirstValue(x)` / `LastValue(x)` (with GROUP BY) | `first_value(x) OVER (PARTITION BY <group> ORDER BY _qlik_order)` / `last_value(...)` with `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`, then one row per group |
 | `FirstSortedValue(x, sort)` | `max_by(x, -sort)` / `min_by(x, sort)` ; Qlik returns null when several rows share the best sort value |
-| `WHERE NOT Exists(Key)` while the same LOAD produces `Key` | keep the first row per key in load order: `row_number() OVER (PARTITION BY Key ORDER BY _qlik_order) = 1`, and exclude keys already present in the earlier tables (`NOT EXISTS (...)`) |
+| `WHERE NOT Exists(Key)` while the same LOAD produces `Key` | keep the first row per key in load order: `row_number() OVER (PARTITION BY Key ORDER BY _qlik_order) = 1`, and exclude keys already present in the earlier tables (`NOT (Key IS NOT NULL AND Key IN (SELECT Key FROM t WHERE Key IS NOT NULL))`) |

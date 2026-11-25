@@ -67,9 +67,12 @@ def test_csv_options_declared(project: Project) -> None:
     # options du lecteur CSV de Spark, d'apres la specification Qlik
     assert conf["inputs"]["ventes"]["format"] == "csv"
     sites = conf["inputs"]["ref_sites_2024"]
+    # dates a la francaise par defaut
     assert sites["options"] == {
         "header": True,
         "mode": "PERMISSIVE",
+        "dateFormat": "dd/MM/yyyy",
+        "timestampFormat": "dd/MM/yyyy HH:mm:ss",
         "encoding": "UTF-8",
         "sep": ",",
     }
@@ -94,6 +97,8 @@ def test_csv_without_header_file_absent(project: Project) -> None:
     assert conf["inputs"]["codes"]["options"] == {
         "header": False,
         "mode": "PERMISSIVE",
+        "dateFormat": "dd/MM/yyyy",
+        "timestampFormat": "dd/MM/yyyy HH:mm:ss",
         "sep": ";",
     }
     schema = yaml.safe_load(
@@ -359,8 +364,8 @@ def test_parquet_types_keep_precision(tmp_path: Path) -> None:
 
 
 def test_csv_values_give_dates_and_booleans(tmp_path: Path) -> None:
-    """Dates et horodatages ISO et booleens d'un CSV sont types, pas les
-    dates a la francaise ni les fausses dates."""
+    """Dates et horodatages ISO ou a la francaise et booleens d'un CSV sont
+    types, pas les fausses dates."""
     path = tmp_path / "t.csv"
     path.write_text(
         "jour;moment;actif;fr;faux;mixte\n"
@@ -374,7 +379,7 @@ def test_csv_values_give_dates_and_booleans(tmp_path: Path) -> None:
         "jour": "date",
         "moment": "timestamp",
         "actif": "boolean",
-        "fr": "string",
+        "fr": "date",
         "faux": "string",
         "mixte": "timestamp",
     }
@@ -385,3 +390,16 @@ def test_check_keeps_decimal_precision() -> None:
     assert spark_type("DECIMAL(18,2)") == "DECIMAL(18,2)"
     assert spark_type("decimal") == "DECIMAL(38,10)"
     assert spark_type("binary") == "BINARY"
+
+
+def test_french_dates_typed_in_csv(tmp_path: Path) -> None:
+    """Une colonne de dates a la francaise est typee date ou timestamp : le
+    kit ecrit les formats francais dans les options de lecture."""
+    path = tmp_path / "f.csv"
+    path.write_text(
+        "Fr;FrTs;Iso;Faux\n31/01/2024;31/01/2024 10:05:00;2024-01-31;31/02/2024\n"
+        "1/2/2024;01/02/2024 08:00:00;2024-02-01;01/01/2024\n",
+        encoding="utf-8",
+    )
+    _, types, _ = csv_types(path)
+    assert types == {"Fr": "date", "FrTs": "timestamp", "Iso": "date", "Faux": "string"}

@@ -27,6 +27,15 @@ from typing import Any
 CONF = Path("conf")
 IO_FILE = CONF / "io.yml"
 
+# Formats de date par defaut, a la francaise : ceux d'un script Qlik sans
+# SET DateFormat, et ceux de la lecture des CSV (format Spark).
+DEFAULT_DATE_FORMAT = "DD/MM/YYYY"
+DEFAULT_TIMESTAMP_FORMAT = "DD/MM/YYYY hh:mm:ss"
+CSV_DATE_OPTIONS = {
+    "dateFormat": "dd/MM/yyyy",
+    "timestampFormat": "dd/MM/yyyy HH:mm:ss",
+}
+
 
 # ---------------------------------------------------------------------------
 # Chemins du projet, communs a tous les outils (tous partent du dossier
