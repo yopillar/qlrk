@@ -15,6 +15,7 @@ reste de la requete est deja ecrit.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -755,6 +756,13 @@ def shown(sql: str) -> str:
     return text if text else f"CAST({as_value(sql)} AS STRING)"
 
 
+def concat_part(sql: str) -> str:
+    """Un morceau d'une concatenation : son texte affiche s'il est connu
+    (Num(x, '00')), sinon la valeur telle quelle."""
+    text = getattr(sql, "display", None)
+    return text if text else as_value(sql)
+
+
 def display_format(n: str, x: str, fmt: str) -> str | None:
     """Texte affiche par Num(x, fmt) ou Date(x, fmt), pour les formats
     simples ; None sinon (on garde alors la valeur).
@@ -786,10 +794,55 @@ def as_value(sql: str) -> str:
     return f"CASE WHEN {sql} THEN -1 ELSE 0 END" if isinstance(sql, Bool) else sql
 
 
+def value_family(sql: str) -> str:
+    """Sorte connue d'une valeur : texte, nombre ou date ; "" si inconnue."""
+    if isinstance(sql, StrField) or re.fullmatch(r"'[^']*'", str(sql).strip()):
+        return "text"
+    if isinstance(sql, NumSql):
+        return "number"
+    if isinstance(sql, DateSql) and not isinstance(sql, GuessedTs):
+        return "date"
+    return ""
+
+
+def single_case(sql: str) -> bool:
+    """Dit si sql est un seul CASE WHEN ... END, sans rien autour.
+
+    Args:
+        sql: l'expression.
+
+    Returns:
+        True pour CASE WHEN ... END entier.
+    """
+    text = str(sql).strip()
+    if not (text.startswith("CASE WHEN ") and text.endswith(" END")):
+        return False
+    level = 0
+    words = [t for k, t, _ in _sql_tokens(text) if k == "word"]
+    for n, w in enumerate(words):
+        level += (w.upper() == "CASE") - (w.upper() == "END")
+        if level == 0 and n < len(words) - 1:
+            return False  # CASE ... END + autre chose
+    return level == 0
+
+
+class Ranked(str):
+    """Match, MixMatch, WildMatch : le rang de la valeur trouvee (0 sinon).
+    En condition, c'est un simple IN ou LIKE (positive), et sa negation
+    (negative), qui garde une valeur NULL comme Qlik."""
+
+    positive: str = ""
+    negative: str = ""
+
+
 def as_cond(sql: str) -> str:
     """Valeur utilisee comme condition. En Qlik, tout nombre non nul est
     vrai."""
-    return sql if isinstance(sql, Bool) else Bool(f"(({sql}) <> 0)")
+    if isinstance(sql, Bool):
+        return sql
+    if getattr(sql, "positive", ""):
+        return condition(sql.positive, sql.negative)  # type: ignore[attr-defined]
+    return Bool(f"(({sql}) <> 0)")
 
 
 class ExprParser:
@@ -931,7 +984,8 @@ class ExprParser:
             return parts[0]
         # avec & en Qlik, un null se comporte comme une chaine vide ; une
         # valeur formatee (Num(x, '00'), Date(d, 'YYYY-MM')) donne son texte
-        return "concat_ws('', " + ", ".join(shown(p) for p in parts) + ")"
+        # concat_ws convertit lui-meme nombres et dates en texte : pas de CAST
+        return "concat_ws('', " + ", ".join(concat_part(p) for p in parts) + ")"
 
     def p_add(self) -> str:
         """Addition et soustraction, dates comprises."""
@@ -974,7 +1028,9 @@ class ExprParser:
         if self.peek() == ("op", "-"):
             self.take()
             value = as_number(self.p_unary(), self.ctx)
-            out = f"(- {as_value(value)})"
+            # -1 plutot que (- 1)
+            plain = re.fullmatch(r"\d+(\.\d+)?", str(value).strip())
+            out = f"-{value}" if plain else f"(- {as_value(value)})"
             return NumSql(out) if known_number(value) else out
         if self.peek() == ("op", "+"):
             self.take()
@@ -1375,7 +1431,13 @@ def _translate_function(
         return f"{simple[n]}({a[0]})"
     if n == "if":
         need(2, 3)
-        return f"CASE WHEN {a[0]} THEN {a[1]} ELSE {a[2] if k == 3 else 'NULL'} END"
+        other = a[2] if k == 3 else "NULL"
+        if single_case(other):
+            # If(c1, x, If(c2, y, z)) : un seul CASE, une ligne par cas
+            return f"CASE WHEN {a[0]} THEN {a[1]} {str(other)[len('CASE ') :]}"
+        if other == "NULL":
+            return f"CASE WHEN {a[0]} THEN {a[1]} END"
+        return f"CASE WHEN {a[0]} THEN {a[1]} ELSE {other} END"
     if n in ("alt", "coalesce"):
         return f"COALESCE({', '.join(a)})"
     if n in ("interval", "time"):
@@ -1624,7 +1686,14 @@ def _translate_function(
         need(1, 2)
         if k == 1:
             return f"round({a[0]})"
-        # en Qlik le 2e argument est le pas
+        # En Qlik le 2e argument est le pas. Un pas de 0.01, 0.1, 10... est
+        # un nombre de decimales : round(x, 2), sans le 1.2300000000000002
+        # que donne round(x / 0.01) * 0.01 en double.
+        step = const_number(raw[1]) if len(raw) > 1 else None
+        if step:
+            digits = -math.log10(step)
+            if abs(digits - round(digits)) < 1e-9 and abs(digits) <= 9:
+                return f"round({a[0]}, {round(digits)})"
         return f"(round({a[0]} / {a[1]}) * {a[1]})"
     if n == "mod":
         need(2)
@@ -1661,26 +1730,53 @@ def _translate_function(
     if n in ("match", "mixmatch", "wildmatch"):
         if k < 2:
             raise Untranslatable(f"{name} sans valeur")
-        whens = []
+        whens: list[str] = []
+        tests: list[str] = []
+        subject = str(a[0]) if n == "match" else f"lower({a[0]})"
         for rank, (sql, r) in enumerate(zip(a[1:], raw[1:]), 1):
+            lit = literal(r)
             if n == "match":
-                whens.append(f"WHEN {a[0]} = {sql} THEN {rank}")
-            elif n == "mixmatch":
-                whens.append(f"WHEN lower({a[0]}) = lower({sql}) THEN {rank}")
+                wanted = str(sql)
+            elif lit is not None:
+                # en minuscules des la traduction : 'a', pas lower('A')
+                wanted = sql_string(lit.lower())
             else:
-                pat = literal(r)
-                if pat is None:
+                wanted = f"lower({sql})"
+            if n == "wildmatch":
+                if lit is None:
                     raise Untranslatable("WildMatch avec motif non litteral")
                 like = (
-                    pat.replace("%", "\\%")
+                    lit.lower()
+                    .replace("%", "\\%")
                     .replace("_", "\\_")
                     .replace("*", "%")
                     .replace("?", "_")
                 )
-                whens.append(
-                    f"WHEN lower({a[0]}) LIKE lower({sql_string(like)}) THEN {rank}"
-                )
-        return "CASE " + " ".join(whens) + " ELSE 0 END"
+                test = f"{subject} LIKE {sql_string(like)}"
+            else:
+                test = f"{subject} = {wanted}"
+            whens.append(f"WHEN {test} THEN {rank}")
+            tests.append(test if n == "wildmatch" else wanted)
+        out = Ranked("CASE " + " ".join(whens) + " ELSE 0 END")
+        # en condition : x IN (...) ; NULL n'est jamais trouve, et NOT le
+        # garde, comme Qlik
+        if n == "wildmatch" and len(tests) == 1:
+            out.positive = f"({tests[0]})"
+            out.negative = (
+                f"({a[0]} IS NULL OR {tests[0].replace(' LIKE ', ' NOT LIKE ', 1)})"
+            )
+        elif n == "wildmatch":
+            found = " OR ".join(tests)
+            out.positive = f"({found})"
+            out.negative = f"({a[0]} IS NULL OR NOT ({found}))"
+        elif len(tests) == 1:
+            out.positive = f"({subject} = {tests[0]})"
+            out.negative = f"({a[0]} IS NULL OR {subject} <> {tests[0]})"
+        else:
+            values = ", ".join(tests)
+            out.positive = f"({subject} IN ({values}))"
+            out.negative = f"({a[0]} IS NULL OR {subject} NOT IN ({values}))"
+        return out
     if n == "pick":
         if k < 2:
             raise Untranslatable("Pick sans valeur")
@@ -2113,6 +2209,7 @@ class SectionTranslator:
         self.todo_code: list[str] = []  # code Qlik laisse au modele
         self.derived_types: dict[str, str] = {}  # colonnes calculees en date
         self.map_types: dict[str, type] = {}  # type des valeurs d'un mapping
+        self.map_keys: dict[str, str] = {}  # sorte des cles d'un mapping
         self.counter: dict[str, int] = {}
         self.mapping_ctes: dict[str, str] = {}  # mapping -> sa CTE
         self.technical: list[str] = []  # colonnes AutoNumber / Hash
@@ -2276,11 +2373,18 @@ class SectionTranslator:
             if sig not in mapped:
                 alias = f"m{len(mapped) + 1}"
                 mapped[sig] = alias
-                joins.append(
-                    f"LEFT JOIN {self.mapping_cte(mname)} {alias}\n"
-                    f"  ON CAST({key_sql} AS STRING) = "
-                    f"CAST({alias}.map_key AS STRING)"
+                cte = self.mapping_cte(mname)
+                # Meme sorte de cle des deux cotes : une simple egalite. Sinon
+                # on compare les textes, comme Qlik ('001' et 1 different).
+                same = value_family(key_sql) and value_family(
+                    key_sql
+                ) == self.map_keys.get(mname)
+                on = (
+                    f"{key_sql} = {alias}.map_key"
+                    if same
+                    else f"CAST({key_sql} AS STRING) = CAST({alias}.map_key AS STRING)"
                 )
+                joins.append(f"LEFT JOIN {cte} {alias}\n  ON {on}")
             alias = mapped[sig]
             out = f"COALESCE({alias}.map_value, {default_sql or key_sql})"
             # un mapping de dates donne des dates
@@ -2380,10 +2484,11 @@ class SectionTranslator:
                 if not re.fullmatch(r"\[[^\]]+\]|\"[^\"]+\"|[^\W\d][\w.#%@$]*", e):
                     raise Untranslatable(f"expression sans alias : {e[:40]}")
                 name = e.strip('[]"')
-                select.append(sql if not q else f"{sql} AS {ident(name)}")
             else:
                 name = alias
-                select.append(f"{sql} AS {ident(name)}")
+            # s.Site AS Site : l'alias ne sert a rien, Spark garde le nom
+            same = str(sql) in (ident(name), f"{q}.{ident(name)}" if q else "")
+            select.append(str(sql) if same else f"{sql} AS {ident(name)}")
             if out_cols is not None:
                 out_cols.append(name)
         where_sql = None
@@ -2667,6 +2772,8 @@ class SectionTranslator:
             k, v = expr(exprs[0], ectx), expr(exprs[1], ectx)
             if isinstance(v, DateSql):
                 self.map_types[mname] = type(v)
+            if value_family(k):
+                self.map_keys[mname] = value_family(k)
         else:
             raise Untranslatable(f"mapping {mname} sans 2 colonnes")
         where = ""
@@ -3239,7 +3346,7 @@ class SectionTranslator:
             if re.search(rf"\b{re.escape(c.name)}\b", todo_text)
         }
         for k, c in enumerate(self.ctes):
-            body = _indent(c.sql, 2)
+            body = _indent(tidy_parens(c.sql), 2)
             if condensed and c not in todo:
                 if c.name in read:
                     known = (
@@ -3261,6 +3368,301 @@ class SectionTranslator:
             sel = f"...  -- {len(cols)} columns + {ORD}, listed by the tool"
         out.append(f"SELECT {sel}\nFROM {final}")
         return "\n".join(out) + "\n", cols
+
+
+# Priorite des operateurs Spark SQL, de la plus faible a la plus forte. Les
+# comparaisons et les predicats (IS, IN, LIKE...) n'ont pas d'associativite
+# sure : une parenthese entre deux d'entre eux reste.
+OR_P, AND_P, NOT_P, CMP_P, ADD_P, MUL_P, NEG_P, ATOM_P = 2, 3, 4, 5, 7, 8, 9, 100
+BINARY_P = {
+    "=": CMP_P,
+    "==": CMP_P,
+    "<>": CMP_P,
+    "!=": CMP_P,
+    "<": CMP_P,
+    ">": CMP_P,
+    "<=": CMP_P,
+    ">=": CMP_P,
+    "<=>": CMP_P,
+    "+": ADD_P,
+    "-": ADD_P,
+    "||": ADD_P,
+    "*": MUL_P,
+    "/": MUL_P,
+    "%": MUL_P,
+}
+PREDICATE_WORDS = {"IS", "IN", "LIKE", "RLIKE", "ILIKE", "BETWEEN"}
+# mots qui ouvrent ou ferment une expression entiere, comme une virgule
+OPENING_WORDS = {"WHEN", "THEN", "ELSE", "WHERE", "ON", "HAVING", "SELECT", "CASE"}
+CLOSING_WORDS = {
+    "THEN",
+    "WHEN",
+    "ELSE",
+    "END",
+    "AS",
+    "FROM",
+    "WHERE",
+    "GROUP",
+    "ORDER",
+    "LIMIT",
+    "ON",
+    "LEFT",
+    "RIGHT",
+    "INNER",
+    "FULL",
+    "CROSS",
+    "JOIN",
+    "UNION",
+    "HAVING",
+    "ASC",
+    "DESC",
+    "NULLS",
+}
+# mots qui sont des valeurs (ou en font partie), pas des operateurs
+VALUE_WORDS = {
+    "NULL",
+    "TRUE",
+    "FALSE",
+    "DATE",
+    "TIMESTAMP",
+    "INTERVAL",
+    "DAY",
+    "DAYS",
+    "HOUR",
+    "HOURS",
+    "MINUTE",
+    "MINUTES",
+    "SECOND",
+    "SECONDS",
+    "MONTH",
+    "MONTHS",
+    "YEAR",
+    "YEARS",
+    "WEEK",
+    "WEEKS",
+    "MILLISECOND",
+    "MILLISECONDS",
+}
+# mots qui font d'une parenthese autre chose qu'un groupe : sous-requete,
+# liste, fenetre...
+NOT_A_GROUP = {
+    "SELECT",
+    "FROM",
+    "AS",
+    "WITH",
+    "VALUES",
+    "OVER",
+    "PARTITION",
+    "BY",
+    "DISTINCT",
+    "UNION",
+    "JOIN",
+    "ALL",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "ORDER",
+    "GROUP",
+    "LIMIT",
+    "ROWS",
+    "RANGE",
+    "WHERE",
+    "ON",
+}
+SQL_TOKEN = re.compile(
+    r"""(?P<ws>\s+)|(?P<comment>--[^\n]*|/\*.*?\*/)
+    |(?P<str>'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")|(?P<bt>`(?:[^`]|``)*`)
+    |(?P<num>(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?[DLSYBF]?)
+    |(?P<word>[A-Za-z_][A-Za-z0-9_]*)|(?P<op><=>|<=|>=|<>|!=|==|\|\||->|::|.)""",
+    re.S | re.X,
+)
+
+
+def _sql_tokens(sql: str) -> list[tuple[str, str, int]]:
+    """Jetons d'un texte SQL : (sorte, texte, position), sans les blancs."""
+    return [
+        (m.lastgroup or "op", m.group(), m.start())
+        for m in SQL_TOKEN.finditer(sql)
+        if m.lastgroup != "ws"
+    ]
+
+
+def _is_value_end(tok: tuple[str, str, int] | None) -> bool:
+    """Le jeton termine-t-il une valeur ? Sinon un - qui suit est unaire."""
+    if tok is None:
+        return False
+    kind, text, _ = tok
+    if kind in ("str", "bt", "num"):
+        return True
+    if kind == "word":
+        up = text.upper()
+        return (
+            up in VALUE_WORDS
+            or up == "END"
+            or (
+                up not in OPENING_WORDS
+                and up not in PREDICATE_WORDS
+                and up not in ("AND", "OR", "NOT")
+            )
+        )
+    return text in (")", "]")
+
+
+def _inner_priority(toks: list[tuple[str, str, int]]) -> int | None:
+    """Priorite la plus faible au niveau 0 d'un groupe, ou None si ce n'est
+    pas une expression a regrouper (liste, sous-requete, trou du modele)."""
+    best, depth, k, between = ATOM_P, 0, 0, False
+    if not toks:
+        return None
+    while k < len(toks):
+        kind, text, _ = toks[k]
+        up = text.upper() if kind == "word" else text
+        if text in ("{", "}", ";") or (kind == "comment" and depth == 0):
+            return None  # un trou du modele garde ses parentheses
+        if text in ("(", "["):
+            depth += 1
+        elif text in (")", "]"):
+            depth -= 1
+        elif depth == 0:
+            if kind == "op" and text == ",":
+                return None
+            if kind == "word":
+                if up == "CASE":
+                    # CASE ... END : une seule valeur
+                    level = 1
+                    while level and k + 1 < len(toks):
+                        k += 1
+                        w = toks[k][1].upper() if toks[k][0] == "word" else ""
+                        level += (w == "CASE") - (w == "END")
+                    k += 1
+                    continue
+                if up in NOT_A_GROUP:
+                    return None
+                if up == "OR":
+                    best = min(best, OR_P)
+                elif up == "AND":
+                    if between:
+                        between = False
+                    else:
+                        best = min(best, AND_P)
+                elif up == "NOT":
+                    nxt = toks[k + 1][1].upper() if k + 1 < len(toks) else ""
+                    prev = toks[k - 1][1].upper() if k else ""
+                    best = min(
+                        best, CMP_P if nxt in PREDICATE_WORDS or prev == "IS" else NOT_P
+                    )
+                elif up in PREDICATE_WORDS:
+                    between = between or up == "BETWEEN"
+                    best = min(best, CMP_P)
+            elif kind == "op" and text in BINARY_P:
+                if text in ("-", "+") and not _is_value_end(toks[k - 1] if k else None):
+                    best = min(best, NEG_P)
+                else:
+                    best = min(best, BINARY_P[text])
+            elif kind == "op" and text not in (".",):
+                return None  # operateur inconnu : on ne touche a rien
+        k += 1
+    return best
+
+
+def _left_need(prev: tuple[str, str, int] | None, before: tuple | None) -> int | None:
+    """Priorite qu'il faut au groupe pour perdre ses parentheses, vu ce qui
+    le precede ; None si la parenthese ouvre un appel ou une liste."""
+    if prev is None:
+        return 0
+    kind, text, _ = prev
+    if text in ("(", ","):
+        return 0
+    if kind == "word":
+        up = text.upper()
+        if up in OPENING_WORDS:
+            return 0
+        if up == "OR":
+            return OR_P
+        if up == "AND":
+            return AND_P
+        if up == "NOT" or up in PREDICATE_WORDS - {"IN"}:
+            # NOT (a = b) reste lisible comme ca
+            return CMP_P
+        return None  # f(...), IN (...), EXISTS (...)...
+    if kind == "op" and text in BINARY_P:
+        if text in ("-", "+") and not _is_value_end(before):
+            return NEG_P
+        return BINARY_P[text]
+    return None
+
+
+def _right_need(nxt: tuple[str, str, int] | None) -> int | None:
+    """Comme _left_need, vu ce qui suit le groupe."""
+    if nxt is None:
+        return 0
+    kind, text, _ = nxt
+    if text in (")", ","):
+        return 0
+    if kind == "word":
+        up = text.upper()
+        if up in CLOSING_WORDS:
+            return 0
+        if up == "OR":
+            return OR_P
+        if up == "AND":
+            return AND_P
+        if up in PREDICATE_WORDS or up == "NOT":
+            return CMP_P
+        return None
+    if kind == "op" and text in BINARY_P:
+        return BINARY_P[text]
+    return None
+
+
+def tidy_parens(sql: str) -> str:
+    """Enleve les parentheses que la priorite des operateurs rend inutiles :
+    a + b * 2, a > 0 AND b > 0, WHERE x > 0, CASE WHEN a = 1 THEN... Le sens
+    ne change jamais : une parenthese ne part que si l'ordre d'evaluation
+    reste le meme, et un trou laisse au modele garde les siennes.
+
+    Args:
+        sql: le texte SQL.
+
+    Returns:
+        Le meme SQL, avec moins de parentheses.
+    """
+    while True:
+        toks = _sql_tokens(sql)
+        stack, pairs = [], []
+        for k, (_, text, _) in enumerate(toks):
+            if text == "(":
+                stack.append(k)
+            elif text == ")" and stack:
+                pairs.append((len(stack), stack.pop(), k))
+        removed = False
+        for _, i, j in sorted(pairs, key=lambda p: (-p[0], p[1])):
+            inner = _inner_priority(toks[i + 1 : j])
+            prev = toks[i - 1] if i else None
+            left = _left_need(prev, toks[i - 2] if i > 1 else None)
+            right = _right_need(toks[j + 1] if j + 1 < len(toks) else None)
+            if inner is None or left is None or right is None:
+                continue
+            # a AND b au milieu de OR : les parentheses aident a lire
+            mixed = inner == AND_P and OR_P in (left, right)
+            if (
+                not mixed
+                and inner > left
+                and (inner > right if right == CMP_P else inner >= right)
+            ):
+                a, b = toks[i][2], toks[j][2]
+                body = sql[a + 1 : b]
+                glue_a = (
+                    " " if a and (sql[a - 1].isalnum() or sql[a - 1] in "_`'") else ""
+                )
+                tail = sql[b + 1 : b + 2]
+                glue_b = " " if tail and (tail.isalnum() or tail in "_`'") else ""
+                sql = sql[:a] + glue_a + body + glue_b + sql[b + 1 :]
+                removed = True
+                break
+        if not removed:
+            return sql
 
 
 def _indent(text: str, n: int) -> str:

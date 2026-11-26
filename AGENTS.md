@@ -42,6 +42,11 @@ never write files. Think in English; SQL comments in French. Answer with one
 - Write the readable negation: `x IS NOT NULL`, `a <> b`, `a <= b`,
   `x NOT LIKE ...`, `v NOT IN (...)`, never `NOT (x IS NULL)` or
   `NOT (a = b)`.
+- Keep SQL light: no parentheses that operator priority makes useless
+  (`a + b * 2`, `a > 0 AND b > 0`, `WHERE x > 0`); one CASE for nested If
+  (`CASE WHEN a = 1 THEN 'x' WHEN a = 2 THEN 'y' ELSE 'z' END`);
+  `Round(x, 0.01)` is `round(x, 2)`; `concat_ws('', a, '-', b)` needs no
+  CAST; `Match(x, 'A', 'B')` in a condition is `x IN ('A', 'B')`.
 - `Exists(f, v)` is `v IN (SELECT f FROM <tables loaded before>)`. A NULL
   never exists: `NOT Exists(f, v)` keeps the row when v is NULL, so write
   `NOT (v IS NOT NULL AND v IN (SELECT f FROM t WHERE f IS NOT NULL))`.

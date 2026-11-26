@@ -849,3 +849,91 @@ def test_date_of_unknown_plus_days() -> None:
             f"SELECT {sql} FROM (SELECT {value} AS x, {value} AS n)"
         ).collect()
         assert str(rows[0][0]) == want, (text, sql)
+
+
+TIDY_CASES = [
+    # (avant, apres) : meme resultat dans Spark, moins de parentheses
+    ("(a + (b * 2))", "a + b * 2"),
+    ("((a + b) * 2)", "(a + b) * 2"),
+    ("((a - b) - 1)", "a - b - 1"),
+    ("(a - (b - 1))", "a - (b - 1)"),
+    ("((a > 0) AND (b > 0))", "a > 0 AND b > 0"),
+    ("((a > 0) AND ((b > 0) OR (m > 1)))", "a > 0 AND (b > 0 OR m > 1)"),
+    ("(((a > 0) AND (b > 0)) OR (m > 1))", "(a > 0 AND b > 0) OR m > 1"),
+    ("(NOT ((a > 0) AND (b > 0)))", "NOT (a > 0 AND b > 0)"),
+    ("((a = b) IS NULL)", "(a = b) IS NULL"),
+    (
+        "CASE WHEN (a > 0) THEN (a + 1) ELSE -1 END",
+        "CASE WHEN a > 0 THEN a + 1 ELSE -1 END",
+    ),
+    ("CAST((a + b) AS STRING)", "CAST(a + b AS STRING)"),
+    ("((a IS NOT NULL) AND (a IN (1, 2)))", "a IS NOT NULL AND a IN (1, 2)"),
+    ("(a BETWEEN (b - 1) AND (b + 1))", "a BETWEEN b - 1 AND b + 1"),
+    ("((/*TODO(model):h1*/ NULL) * 2)", "(/*TODO(model):h1*/ NULL) * 2"),
+]
+
+
+@pytest.mark.spark
+def test_tidy_parens_same_result() -> None:
+    """Les parentheses que la priorite rend inutiles partent, les autres
+    restent (un trou du modele garde les siennes) ; le resultat dans Spark
+    ne change pas, NULL compris."""
+    from check import get_parser
+    from qlik2sql import tidy_parens
+
+    spark = get_parser().spark
+    rows = "VALUES (1, 2, 3.5), (NULL, 2, -1.0), (5, 0, 0.0) AS t(a, b, m)"
+    for before, after in TIDY_CASES:
+        assert tidy_parens(before) == after, before
+        if "TODO" in before:
+            continue
+        got = [
+            spark.sql(f"SELECT {sql} FROM {rows}").collect() for sql in (before, after)
+        ]
+        assert got[0] == got[1], before
+
+
+@pytest.mark.spark
+def test_friendly_translations() -> None:
+    """If imbriques en un seul CASE, Round au pas decimal en round(x, n),
+    concatenation sans CAST, Match en condition en = ou IN (NOT garde une
+    valeur NULL, comme Qlik)."""
+    from check import get_parser
+    from qlik2sql import cond, tidy_parens
+
+    spark = get_parser().spark
+    ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
+    ctx.column_types = {"a": "int", "m": "double", "Code": "string"}
+    rows = (
+        "VALUES (1, 1.005D, 'A'), (NULL, 2.675D, NULL), (2, 3.0D, 'bz')"
+        " AS t(a, m, Code)"
+    )
+    values = {
+        "If(a = 1, 'x', If(a = 2, 'y', 'z'))": (
+            "CASE WHEN a = 1 THEN 'x' WHEN a = 2 THEN 'y' ELSE 'z' END",
+            ["x", "z", "y"],
+        ),
+        "Round(m, 0.01)": ("round(m, 2)", [1.01, 2.68, 3.0]),
+        "Code & '-' & a": ("concat_ws('', Code, '-', a)", ["A-1", "-", "bz-2"]),
+    }
+    for text, (want, result) in values.items():
+        sql = tidy_parens(expr(text, ctx))
+        assert sql == want, text
+        assert [
+            r[0] for r in spark.sql(f"SELECT {sql} FROM {rows}").collect()
+        ] == result
+    conditions = {
+        "Match(Code, 'A', 'B')": ("Code IN ('A', 'B')", [1, 0, 0]),
+        "not Match(Code, 'A')": ("Code IS NULL OR Code <> 'A'", [0, 1, 1]),
+        "not WildMatch(Code, 'b*')": (
+            "Code IS NULL OR lower(Code) NOT LIKE 'b%'",
+            [1, 1, 0],
+        ),
+    }
+    for text, (want, result) in conditions.items():
+        sql = tidy_parens(cond(text, ctx))
+        assert sql == want, text
+        got = spark.sql(
+            f"SELECT CASE WHEN {sql} THEN 1 ELSE 0 END FROM {rows}"
+        ).collect()
+        assert [r[0] for r in got] == result, text
