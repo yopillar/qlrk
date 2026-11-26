@@ -937,3 +937,29 @@ def test_friendly_translations() -> None:
             f"SELECT CASE WHEN {sql} THEN 1 ELSE 0 END FROM {rows}"
         ).collect()
         assert [r[0] for r in got] == result, text
+
+
+@pytest.mark.spark
+def test_alt_skips_text_that_is_not_a_number() -> None:
+    """Alt rend le premier argument qui a une valeur numerique, sinon le
+    dernier : un texte 'abc' ou '' est saute, pas seulement NULL. Un nombre
+    ou une date garde un simple COALESCE."""
+    from check import get_parser
+    from qlik2sql import tidy_parens
+
+    spark = get_parser().spark
+    ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
+    ctx.column_types = {"s": "string", "n": "int"}
+    rows = "VALUES ('12', 5), ('abc', NULL), ('', 7), (NULL, NULL) AS t(s, n)"
+    cases = {
+        "Alt(s, 0)": ("COALESCE(try_cast(s AS DOUBLE), 0)", [12.0, 0.0, 0.0, 0.0]),
+        "Alt(s, 'N/A')": (None, ["12", "N/A", "N/A", "N/A"]),
+        "Alt(s, n, -1)": (None, [12.0, -1.0, 7.0, -1.0]),
+        "Alt(n, 0)": ("COALESCE(n, 0)", [5, 0, 7, 0]),
+    }
+    for text, (want, result) in cases.items():
+        sql = tidy_parens(expr(text, ctx))
+        if want:
+            assert sql == want, text
+        got = [r[0] for r in spark.sql(f"SELECT {sql} FROM {rows}").collect()]
+        assert got == result, (text, sql)

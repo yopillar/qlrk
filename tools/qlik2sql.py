@@ -805,6 +805,42 @@ def value_family(sql: str) -> str:
     return ""
 
 
+def alt_sql(args: list[str], ctx: ExprCtx) -> str:
+    """Alt(x, ..., sinon) : le premier argument qui a une valeur numerique,
+    sinon le dernier. Un texte qui ne se lit pas comme un nombre ('abc',
+    '') est saute, pas seulement NULL : COALESCE ne suffit pas. Un nombre
+    ou une date (un nombre pour Qlik) est NULL ou valide.
+
+    Args:
+        args: les arguments traduits ; au moins un texte avant le dernier.
+        ctx: le contexte (separateurs du script).
+
+    Returns:
+        Un nombre si le dernier argument n'est pas un texte, sinon le texte
+        de l'argument retenu.
+    """
+    *tried, other = args
+    text_result = isinstance(other, StrField) or bool(
+        re.fullmatch(r"'(?:[^'\\]|\\.)*'|\"[^\"]*\"", str(other).strip())
+    )
+    if not text_result:
+        # resultat numerique : le premier nombre lisible
+        nums = [number_of(x, ctx) if isinstance(x, StrField) else x for x in tried]
+        return NumSql(f"COALESCE({', '.join(map(str, nums + [other]))})")
+    whens = []
+    for x in tried:
+        test = number_of(x, ctx) if isinstance(x, StrField) else x
+        whens.append(f"WHEN {as_value(test)} IS NOT NULL THEN {x}")
+    return f"CASE {' '.join(whens)} ELSE {other} END"
+
+
+def number_of(sql: str, ctx: ExprCtx) -> str:
+    """Un texte lu comme un nombre, avec les separateurs du script ; NULL
+    s'il n'en est pas un."""
+    num = as_number(sql, ctx)
+    return num if num is not sql else NumSql(f"try_cast({sql} AS DOUBLE)")
+
+
 def single_case(sql: str) -> bool:
     """Dit si sql est un seul CASE WHEN ... END, sans rien autour.
 
@@ -1438,6 +1474,8 @@ def _translate_function(
         if other == "NULL":
             return f"CASE WHEN {a[0]} THEN {a[1]} END"
         return f"CASE WHEN {a[0]} THEN {a[1]} ELSE {other} END"
+    if n == "alt" and len(a) > 1 and any(isinstance(x, StrField) for x in a[:-1]):
+        return alt_sql(a, ctx)
     if n in ("alt", "coalesce"):
         return f"COALESCE({', '.join(a)})"
     if n in ("interval", "time"):
