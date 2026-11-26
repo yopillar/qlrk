@@ -2,6 +2,7 @@
 
 import datetime as dt
 import decimal
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -208,14 +209,68 @@ def test_excel_input_declared_with_its_sheets(project: Project) -> None:
     project.run("prepare.py", "--collect", "script_qvd/tarifs.qvs")
     project.run("fill_conf.py", "script_qvd/tarifs.qvs")
     conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
-    entry = conf["inputs"]["tarifs"]
+    # lu sur la feuille Prix et sans feuille : deux entrees
+    entry = conf["inputs"]["tarifs_prix"]
     assert entry["format"] == "xlsx"
     assert entry["location"] == "${entrees}/tarifs.xlsx"
     assert entry["options"] == {"sheets": "Prix"}
+    assert conf["inputs"]["tarifs"]["options"] == {"sheets": "*"}
     schema = yaml.safe_load(
-        (project / "conf/schemas/tarifs.yml").read_text(encoding="utf-8")
+        (project / "conf/schemas/tarifs_prix.yml").read_text(encoding="utf-8")
     )
     assert list(schema["columns"]) == ["Code", "Libelle"]
+
+
+def test_excel_sheets_get_their_own_entry(project: Project) -> None:
+    """Un fichier Excel lu sur deux feuilles aux colonnes differentes : une
+    entree et un schema par feuille, et chaque table lit la vue de sa
+    feuille."""
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("openpyxl")
+    with pd.ExcelWriter(project / "data/input/ref.xlsx") as writer:
+        pd.DataFrame({"Code": [1, 2], "Libelle": ["a", "b"]}).to_excel(
+            writer, sheet_name="Produits", index=False
+        )
+        pd.DataFrame({"Site": ["S1"], "Region": ["Nord"], "Surface": [120.5]}).to_excel(
+            writer, sheet_name="Sites", index=False
+        )
+    (project / "script_qvd/ref.qvs").write_text(
+        "Produits:\nLOAD Code, Libelle\n"
+        "FROM [lib://in/ref.xlsx] (ooxml, embedded labels, table is Produits);\n"
+        "STORE Produits INTO [lib://out/produits.qvd] (qvd);\n"
+        "Sites:\nLOAD Site, Region, Surface\n"
+        "FROM [lib://in/ref.xlsx] (ooxml, embedded labels, table is Sites);\n"
+        "STORE Sites INTO [lib://out/sites.qvd] (qvd);\n"
+    )
+    project.run("prepare.py", "--collect", "script_qvd/ref.qvs")
+    project.run("fill_conf.py", "script_qvd/ref.qvs")
+    conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
+    assert conf["inputs"]["ref_produits"]["options"] == {"sheets": "Produits"}
+    assert conf["inputs"]["ref_sites"]["options"] == {"sheets": "Sites"}
+    schemas = {
+        n: yaml.safe_load(
+            (project / f"conf/schemas/{n}.yml").read_text(encoding="utf-8")
+        )["columns"]
+        for n in ("ref_produits", "ref_sites")
+    }
+    assert list(schemas["ref_produits"]) == ["Code", "Libelle"]
+    assert list(schemas["ref_sites"]) == ["Site", "Region", "Surface"]
+    project.run("prepare.py", "script_qvd/ref.qvs")
+    manifest = json.loads(
+        (project / "work/ref/manifest.json").read_text(encoding="utf-8")
+    )
+    views = {
+        s["table"]: set(s["views"]) for s in manifest["sections"] if s.get("views")
+    }
+    assert views["Produits"] == {"in_ref_produits"}
+    assert views["Sites"] == {"in_ref_sites"}
+    for sec in manifest["sections"]:
+        if sec["table"] == "Sites":
+            assert sec["views"]["in_ref_sites"]["columns"] == [
+                "Site",
+                "Region",
+                "Surface",
+            ]
 
 
 def test_types_from_script_comparisons_and_shared_fields(project: Project) -> None:

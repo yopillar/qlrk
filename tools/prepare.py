@@ -47,9 +47,11 @@ from conf import (  # noqa: E402
     WORK,
     IoConf,
     IoEntry,
+    excel_sheet,
     find_scripts,
     resolve_location,
     safe_name,
+    sheet_path,
     writer_types,
 )
 from qlik2sql import (
@@ -1107,10 +1109,14 @@ def analyze(inst: Inst) -> None:
             if not path:
                 continue
             src = clean_path(resolve_path(path, inst.directory))
-            inst.sources.append(src)
             spec = re.compile(r"\s*\(([^)]*)\)").match(body, end)
             if spec:
                 inst.source_specs[src] = spec.group(1).strip()
+                # Excel : la feuille lue suit le chemin, pour trouver l'entree
+                # de io.yml de cette feuille
+                if Path(src).suffix.lower()[1:] in EXCEL_FORMATS:
+                    src = sheet_path(src, excel_sheet(spec.group(1)))
+            inst.sources.append(src)
     if re.search(r"\bINLINE\b", masked, re.I):
         inst.constructs.add("inline")
     if re.search(r"\bSELECT\b", masked, re.I):

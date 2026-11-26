@@ -141,6 +141,8 @@ class IoEntry:
     types: dict[str, str] = field(default_factory=dict)
     # entree qui relit une sortie : le nom de cette sortie
     from_output: str | None = None
+    # fichier Excel : la feuille lue (options sheets), "*" pour toutes
+    sheets: str | None = None
 
 
 def reread_name(output: str) -> str:
@@ -187,6 +189,50 @@ def _stem(text: str) -> str:
     return re.sub(
         r"\.(qvd|txt|csv|parquet|xlsx?|json|orc|delta)$", "", name, flags=re.I
     ).lower()
+
+
+class SheetPath(str):
+    """Chemin d'un fichier Excel lu sur une feuille (table is Feuil2) : le
+    meme chemin pour tout le kit, qui porte en plus la feuille lue, pour
+    trouver l'entree de io.yml de cette feuille."""
+
+    sheet: str | None = None
+
+
+def sheet_path(path: str, sheet: str | None) -> str:
+    """Le chemin, avec la feuille lue s'il y en a une.
+
+    Args:
+        path: le chemin du fichier.
+        sheet: la feuille, ou None.
+
+    Returns:
+        Le chemin, en SheetPath si une feuille est donnee.
+    """
+    if not sheet:
+        return path
+    out = SheetPath(path)
+    out.sheet = sheet
+    return out
+
+
+def excel_sheet(spec: str | None) -> str | None:
+    """Feuille lue d'apres la specification Qlik : (ooxml, table is Feuil2),
+    (biff, table is [Feuil2$]). None sans "table is".
+
+    Args:
+        spec: la specification entre parentheses.
+
+    Returns:
+        Le nom de la feuille, ou None.
+    """
+    m = re.search(
+        r"table\s+is\s+(\[[^\]]*\]|\"[^\"]*\"|'[^']*'|[^,)]+)", spec or "", re.I
+    )
+    if not m:
+        return None
+    name = m.group(1).strip().strip("[]\"'").strip()
+    return name.removesuffix("$") or None
 
 
 def io_key(text: str) -> str:
@@ -293,12 +339,15 @@ def _entries(section: Any, kind: str) -> Iterator[IoEntry]:
         location = props.get("location") or props.get("path")
         if not location:
             continue
+        options = props.get("options")
+        sheets = options.get("sheets") if isinstance(options, dict) else None
         yield IoEntry(
             name or _stem(location),
             kind,
             str(location),
             str(props.get("format", "parquet")).lower(),
             props.get("schema_file") or props.get("schema"),
+            sheets=str(sheets) if sheets is not None else None,
         )
 
 
@@ -370,6 +419,7 @@ class IoConf:
         kind: str,
         produced: bool | None = None,
         strict: bool = False,
+        sheet: str | None = None,
     ) -> IoEntry | None:
         """Cherche l'entree qui correspond a un fichier Qlik, soit par le nom
         de l'entree, soit par le nom de fichier de sa location.
@@ -387,6 +437,8 @@ class IoConf:
                 prend celle qui relit une sortie pour un fichier produit, et
                 l'autre sinon.
             strict: ne rien renvoyer plutot qu'une entree de l'autre sorte.
+            sheet: pour un fichier Excel, la feuille lue ; par defaut celle
+                que porte qlik_path (SheetPath).
 
         Returns:
             L'entree, ou None.
@@ -399,6 +451,12 @@ class IoConf:
         if len(found) > 1 and ext:
             found = [
                 e for e in found if Path(e.location).suffix.lower() in (ext, "")
+            ] or found
+        # un fichier Excel a plusieurs feuilles : l'entree de la feuille lue
+        sheet = sheet or getattr(qlik_path, "sheet", None)
+        if len(found) > 1 and sheet:
+            found = [
+                e for e in found if (e.sheets or "").lower() == sheet.lower()
             ] or found
         if kind != "input" or produced is None:
             return found[0] if found else None

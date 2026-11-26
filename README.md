@@ -356,7 +356,10 @@ D'ou viennent les informations :
   du `table is ...` de Qlik, sinon `"*"`, toutes les feuilles mises bout a
   bout (elles doivent avoir les memes colonnes). Le socle le lit en
   binaire, puis l'ouvre avec pandas sur le driver (`openpyxl` requis), et
-  le convertit aux types du schema.
+  le convertit aux types du schema. Un meme fichier lu sur plusieurs
+  feuilles donne une entree par feuille (`tarifs_prix`, `tarifs_remises`),
+  chacune avec sa feuille, son schema, et les types lus sur cette feuille :
+  chaque requete lit la vue de sa feuille.
 
   ```yaml
   tarifs:

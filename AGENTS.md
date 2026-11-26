@@ -50,6 +50,11 @@ never write files. Think in English; SQL comments in French. Answer with one
   (`CASE WHEN a = 1 THEN 'x' WHEN a = 2 THEN 'y' ELSE 'z' END`);
   `Round(x, 0.01)` is `round(x, 2)`; `concat_ws('', a, '-', b)` needs no
   CAST; `Match(x, 'A', 'B')` in a condition is `x IN ('A', 'B')`.
+- Qlik `LIKE` and `WildMatch` ignore case: `x ILIKE 'a%'`, not
+  `lower(x) LIKE lower('A%')`.
+- A value read by `Peek('f', 0, 'T')` is a one-row CTE written once
+  (`SELECT f FROM t ORDER BY _qlik_order LIMIT 1`), read as
+  `(SELECT f FROM peek_f)`. A calendar is `sequence(first_day, last_day)`.
 - `Exists(f, v)` is `v IN (SELECT f FROM <tables loaded before>)`. A NULL
   never exists: `NOT Exists(f, v)` keeps the row when v is NULL, so write
   `NOT (v IS NOT NULL AND v IN (SELECT f FROM t WHERE f IS NOT NULL))`.

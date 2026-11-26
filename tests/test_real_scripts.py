@@ -807,7 +807,7 @@ def test_readable_not_same_result() -> None:
         "NOT IsNull(x)": "(x IS NOT NULL)",
         "NOT a = b": "(a <> b)",
         "NOT a > b": "(a <= b)",
-        "NOT x LIKE 'A*'": "(lower(x) NOT LIKE lower('A%'))",
+        "NOT x LIKE 'A*'": "(x NOT ILIKE 'A%')",
         "NOT NOT a = b": "(a = b)",
         "NOT d > 0": "(d IS NULL)",
     }
@@ -926,7 +926,7 @@ def test_friendly_translations() -> None:
         "Match(Code, 'A', 'B')": ("Code IN ('A', 'B')", [1, 0, 0]),
         "not Match(Code, 'A')": ("Code IS NULL OR Code <> 'A'", [0, 1, 1]),
         "not WildMatch(Code, 'b*')": (
-            "Code IS NULL OR lower(Code) NOT LIKE 'b%'",
+            "Code IS NULL OR Code NOT ILIKE 'b%'",
             [1, 1, 0],
         ),
     }
@@ -963,3 +963,17 @@ def test_alt_skips_text_that_is_not_a_number() -> None:
             assert sql == want, text
         got = [r[0] for r in spark.sql(f"SELECT {sql} FROM {rows}").collect()]
         assert got == result, (text, sql)
+
+
+def test_calendar_and_peek_in_spark_style(project: Project) -> None:
+    """Le calendrier de Qlik (AUTOGENERATE fin - debut + 1, debut + RecNo()
+    - 1) devient sequence(debut, fin), et chaque Peek une CTE d'une ligne,
+    ecrite une fois ; la requete finale est un SELECT * quand les colonnes
+    sont deja les bonnes."""
+    project.run("prepare.py", "script_qvd/calendrier")
+    work = project / "work/calendrier"
+    sql = next(work.glob("*_calendrier/query.sql")).read_text(encoding="utf-8")
+    assert "posexplode(sequence((SELECT MinDate FROM peek_mindate)" in sql
+    assert sql.count("ORDER BY _qlik_order\n  LIMIT 1") == 2
+    assert "RecNo" not in sql and "__jour AS Jour" in sql
+    assert sql.rstrip().endswith("SELECT *\nFROM calendrier_1")

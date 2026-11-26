@@ -405,13 +405,10 @@ NUM_TYPES = ("double", "float", "decimal", "bigint", "int", "integer", "smallint
 
 
 def text_to_timestamp(sql: str, fmt: str) -> str:
-    """try_to_timestamp d'un texte, tolerant comme la lecture de Qlik.
-
-    Spark 3.5 ne rend pas NULL mais plante (INCONSISTENT_BEHAVIOR_CROSS_
-    VERSION) quand l'ancien analyseur de dates aurait lu le texte : "1/2/2024"
-    avec dd/MM/yyyy, une heure en trop, une annee sur 2 chiffres. On lit donc
-    avec d/M/yyyy, on coupe l'heure si le format n'en a pas, et on exige
-    l'annee sur 4 chiffres.
+    """try_to_timestamp d'un texte, tolerant comme la lecture de Qlik : avec
+    d/M/yyyy, "1/2/2024" se lit comme "01/02/2024", et une heure en trop est
+    coupee si le format n'en a pas. Le socle est en timeParserPolicy=
+    CORRECTED : un texte qui ne suit pas le format donne NULL, sans erreur.
 
     Args:
         sql: le texte.
@@ -423,11 +420,10 @@ def text_to_timestamp(sql: str, fmt: str) -> str:
     lenient = re.sub(
         r"(?<![dMHhms])(dd|MM|HH|hh|mm|ss)(?![dMHhms])", lambda m: m.group(1)[0], fmt
     )
-    text = f"trim(CAST({sql} AS STRING))"
+    text = str(sql) if isinstance(sql, StrField) else f"CAST({sql} AS STRING)"
     if " " not in fmt:
-        text = f"regexp_extract({text}, '^[^ ]+', 0)"
-    if "yyyy" in fmt:
-        text = f"if({text} RLIKE '[0-9]{{4}}', {text}, NULL)"
+        # une date suivie d'une heure : on garde la date
+        text = f"substring_index({text}, ' ', 1)"
     return f"try_to_timestamp({text}, {sql_string(lenient)})"
 
 
@@ -1004,8 +1000,9 @@ class ExprParser:
                 .replace("?", "_")
             )
             # le LIKE de Qlik : jokers * et ?, et pas sensible a la casse
-            a, b = f"lower({as_value(left)})", f"lower({sql_string(pat)})"
-            return condition(f"({a} LIKE {b})", f"({a} NOT LIKE {b})")
+            # LIKE de Qlik : insensible a la casse, c'est ILIKE en Spark
+            a, b = as_value(left), sql_string(pat)
+            return condition(f"({a} ILIKE {b})", f"({a} NOT ILIKE {b})")
         if kind == "kw" and v in ("PRECEDES", "FOLLOWS"):
             raise Untranslatable(f"operateur {v}")
         return left
@@ -1770,7 +1767,7 @@ def _translate_function(
             raise Untranslatable(f"{name} sans valeur")
         whens: list[str] = []
         tests: list[str] = []
-        subject = str(a[0]) if n == "match" else f"lower({a[0]})"
+        subject = str(a[0]) if n in ("match", "wildmatch") else f"lower({a[0]})"
         for rank, (sql, r) in enumerate(zip(a[1:], raw[1:]), 1):
             lit = literal(r)
             if n == "match":
@@ -1784,13 +1781,12 @@ def _translate_function(
                 if lit is None:
                     raise Untranslatable("WildMatch avec motif non litteral")
                 like = (
-                    lit.lower()
-                    .replace("%", "\\%")
+                    lit.replace("%", "\\%")
                     .replace("_", "\\_")
                     .replace("*", "%")
                     .replace("?", "_")
                 )
-                test = f"{subject} LIKE {sql_string(like)}"
+                test = f"{subject} ILIKE {sql_string(like)}"
             else:
                 test = f"{subject} = {wanted}"
             whens.append(f"WHEN {test} THEN {rank}")
@@ -1801,7 +1797,7 @@ def _translate_function(
         if n == "wildmatch" and len(tests) == 1:
             out.positive = f"({tests[0]})"
             out.negative = (
-                f"({a[0]} IS NULL OR {tests[0].replace(' LIKE ', ' NOT LIKE ', 1)})"
+                f"({a[0]} IS NULL OR {tests[0].replace(' ILIKE ', ' NOT ILIKE ', 1)})"
             )
         elif n == "wildmatch":
             found = " OR ".join(tests)
@@ -2250,6 +2246,7 @@ class SectionTranslator:
         self.map_keys: dict[str, str] = {}  # sorte des cles d'un mapping
         self.counter: dict[str, int] = {}
         self.mapping_ctes: dict[str, str] = {}  # mapping -> sa CTE
+        self.peek_ctes: dict[tuple[str, int, str], str] = {}  # Peek -> sa CTE
         self.technical: list[str] = []  # colonnes AutoNumber / Hash
         self.autogen_bottom: str | None = None  # "recno", "fieldvalue", "while"
         self.autogen_field: str | None = None
@@ -2660,14 +2657,33 @@ class SectionTranslator:
         """Peek('champ', n, 'T') : n-ieme ligne de T (en partant de la fin
         si n est negatif)."""
         src = self.table_ref(table)
-        if row >= 0:
-            order, offset = "", row
-        else:
-            order, offset = " DESC", -row - 1
-        return (
-            f"(SELECT {ident(field_name)} FROM {src} ORDER BY {ORD}{order} "
-            f"LIMIT 1{f' OFFSET {offset}' if offset else ''})"
-        )
+        key = (field_name, row, src)
+        if key not in self.peek_ctes:
+            # une CTE d'une ligne, ecrite une fois, que chaque usage lit
+            if row >= 0:
+                order, offset = "", row
+            else:
+                order, offset = " DESC", -row - 1
+            body = (
+                f"SELECT {ident(field_name)}\nFROM {src}\nORDER BY {ORD}{order}\n"
+                f"LIMIT 1{f' OFFSET {offset}' if offset else ''}"
+            )
+            base = "peek_" + view_name(field_name).lower()
+            taken = {c.name for c in self.ctes}
+            name, k = base, 1
+            while name in taken:
+                k += 1
+                name = f"{base}_{k}"
+            cte = Cte(name, body, f"Peek('{field_name}', {row}, '{table}')", None)
+            # apres la table lue si c'est une CTE de la requete, sinon en tete
+            if src in taken:
+                self.ctes.append(cte)
+            else:
+                top = sum(1 for c in self.ctes if c.name.startswith(("map_", "peek_")))
+                self.ctes.insert(top, cte)
+            self.cols[name] = [field_name]
+            self.peek_ctes[key] = name
+        return f"(SELECT {ident(field_name)} FROM {self.peek_ctes[key]})"
 
     def noofrows_sql(self, table: str) -> str:
         """NoOfRows('T') : nombre de lignes de T."""
@@ -2901,6 +2917,9 @@ class SectionTranslator:
                 f"__recno FROM (\n  SELECT DISTINCT __fv FROM (\n  {union}"
                 f"\n  )\n  )\n  )\n)"
             ), []
+        calendar = self.calendar_source(arg, seg)
+        if calendar:
+            return calendar, []
         if re.fullmatch(r"\d+", arg.strip()):
             n = arg.strip()
         else:
@@ -2925,6 +2944,56 @@ class SectionTranslator:
             f"(SELECT __recno, array(CAST(__recno AS BIGINT)) AS {ORD} FROM "
             f"(SELECT explode(sequence(1, {n})) AS __recno))"
         ), []
+
+    def calendar_source(self, arg: str, seg: Segment) -> str | None:
+        """Le calendrier de Qlik : AUTOGENERATE fin - debut + 1, avec
+        debut + RecNo() - 1 dans les champs, debut et fin des dates. En Spark,
+        c'est la suite des jours, sequence(debut, fin) : chaque champ lit
+        directement le jour, __jour, au lieu de debut + RecNo() - 1.
+
+        Args:
+            arg: l'argument d'AUTOGENERATE.
+            seg: le LOAD, dont les champs sont reecrits si c'est un calendrier.
+
+        Returns:
+            La source (une ligne par jour), ou None si ce n'est pas ce motif.
+        """
+        m = re.fullmatch(r"(.+?)\s*\+\s*1", arg.strip(), re.S)
+        if not m:
+            return None
+        body, depth = m.group(1), 0
+        for k, ch in enumerate(body):
+            depth += (ch == "(") - (ch == ")")
+            if ch != "-" or depth:
+                continue
+            hi, lo = body[:k].strip(), body[k + 1 :].strip()
+            if not hi or not lo:
+                continue
+            day = re.compile(
+                r"\s*".join(map(re.escape, lo.split()))
+                + r"\s*\+\s*RecNo\s*\(\s*\)\s*-\s*1(?![\w.])",
+                re.I,
+            )
+            if not any(day.search(e) for e, _ in seg.fields):
+                continue
+            try:
+                first, last = expr(lo, self.base_ectx()), expr(hi, self.base_ectx())
+            except Untranslatable:
+                return None
+            if not all(
+                isinstance(x, DateSql) and not isinstance(x, TsSql)
+                for x in (first, last)
+            ):
+                return None
+            seg.fields = [(day.sub("__jour", e), a_) for e, a_ in seg.fields]
+            self.derived_types["__jour"] = "date"
+            self.autogen_bottom = "recno"
+            return (
+                f"(SELECT __jour, __n + 1 AS __recno, "
+                f"array(CAST(__n + 1 AS BIGINT)) AS {ORD}\n"
+                f"  FROM (SELECT posexplode(sequence({first}, {last})) AS (__n, __jour)))"
+            )
+        return None
 
     # garde-fou sur le nombre d'iterations d'un WHILE (100 000 jours, soit un
     # calendrier de plus de 270 ans)
@@ -3398,9 +3467,22 @@ class SectionTranslator:
             sep = "," if k < len(self.ctes) - 1 else ""
             out.append(f"-- {c.comment}\n{c.name} AS (\n{body}\n){sep}")
         out += self.notes
+        last = next(c for c in self.ctes if c.name == final)
+        # La derniere CTE produit deja ces colonnes, dans cet ordre : un
+        # SELECT * suffit. La liste ne reste que s'il y a un doublon a ecarter
+        # ou une partie que le modele ecrit (ses colonnes ne sont pas sures).
+        exact = (
+            cols is not None
+            and len(set(cols)) == len(cols)
+            and "TODO(model)" not in last.sql
+        )
         if cols:
             cols = list(dict.fromkeys(cols))
-        sel = ",\n       ".join([ident(c) for c in cols] + [ORD]) if cols else "*"
+        sel = (
+            ",\n       ".join([ident(c) for c in cols] + [ORD])
+            if cols and not exact
+            else "*"
+        )
         if condensed and cols and len(cols) > FEW_COLUMNS:
             # le SELECT final est ecrit par l'outil, pas par le modele
             sel = f"...  -- {len(cols)} columns + {ORD}, listed by the tool"

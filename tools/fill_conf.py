@@ -57,6 +57,7 @@ from conf import (
     IoConf,
     _load_yaml,
     find_scripts,
+    io_key,
     missing_library,
     reread_name,
     resolve_location,
@@ -313,7 +314,7 @@ def suggest(col: str, counter: Counter | None) -> tuple[str | None, str]:
 
 
 def file_columns(
-    location: str, header: bool = True
+    location: str, header: bool = True, sheet: str | None = None
 ) -> tuple[list[str], dict[str, str], str | None, str]:
     """Colonnes et types d'un fichier de donnees present sur le disque, son
     format (parquet ou csv, None si on ne l'a pas trouve) et d'ou viennent
@@ -351,9 +352,10 @@ def file_columns(
                 (f"deduit des {n} ligne(s) de {csv_files[0]}"),
             )
         if p.is_file() and p.suffix.lower()[1:] in EXCEL_FORMATS:
-            cols, types = excel_types(p)
+            cols, types = excel_types(p, sheet)
             fmt = p.suffix.lower()[1:]
-            return cols, types, fmt, f"deduit de la 1re feuille de {p}"
+            where = f"la feuille {sheet}" if sheet else "la 1re feuille"
+            return cols, types, fmt, f"deduit de {where} de {p}"
     return [], {}, None, ""
 
 
@@ -439,11 +441,14 @@ def parquet_types(path: Path) -> dict[str, str]:
 PANDAS_TYPES = (("int", "bigint"), ("float", "double"), ("datetime", "timestamp"))
 
 
-def excel_types(path: Path) -> tuple[list[str], dict[str, str]]:
-    """Colonnes et types de la 1re feuille d'un fichier Excel (5 000 lignes).
+def excel_types(
+    path: Path, sheet: str | None = None
+) -> tuple[list[str], dict[str, str]]:
+    """Colonnes et types d'une feuille d'un fichier Excel (5 000 lignes).
 
     Args:
         path: le fichier .xlsx ou .xls.
+        sheet: la feuille lue, la 1re par defaut.
 
     Returns:
         (colonnes, types).
@@ -454,14 +459,14 @@ def excel_types(path: Path) -> tuple[list[str], dict[str, str]]:
     try:
         import pandas as pd
 
-        sheet = pd.read_excel(path, sheet_name=0, nrows=5000)
+        table = pd.read_excel(path, sheet_name=sheet or 0, nrows=5000)
     except ImportError as exc:
         raise missing_library(
             "pandas ou openpyxl", f"lecture des types de {path}"
         ) from exc
     types = {
         str(c): next((t for p_, t in PANDAS_TYPES if str(d).startswith(p_)), "string")
-        for c, d in sheet.dtypes.items()
+        for c, d in table.dtypes.items()
     }
     return list(types), types
 
@@ -847,11 +852,15 @@ def collect_io(
                     cols, star = [], False
                 for src in i.sources[:1]:
                     # par chemin : commandes.csv et commandes.qvd sont deux
-                    # fichiers, meme s'ils ont le meme nom
+                    # fichiers, meme s'ils ont le meme nom. Un fichier Excel
+                    # lu sur deux feuilles donne deux lectures : leurs
+                    # colonnes ne sont pas les memes.
+                    sheet = getattr(src, "sheet", None)
                     r = reads.setdefault(
-                        norm_path(src),
+                        norm_path(src) + (f"#{sheet}" if sheet else ""),
                         {
                             "path": src,
+                            "sheet": sheet,
                             "columns": [],
                             "star": False,
                             "scripts": set(),
@@ -905,7 +914,11 @@ def output_entries(
 
 
 def first_readable(
-    candidates: list[str], header: bool, name: str, warnings: list[str]
+    candidates: list[str],
+    header: bool,
+    name: str,
+    warnings: list[str],
+    sheet: str | None = None,
 ) -> tuple[list[str], dict[str, str], str | None, str, str | None]:
     """Colonnes et types du premier fichier de donnees qu'on arrive a lire.
 
@@ -914,6 +927,7 @@ def first_readable(
         header: le CSV a une ligne d'en-tete.
         name: le nom de l'entree, pour les messages.
         warnings: les remarques, completees si un fichier est illisible.
+        sheet: pour un fichier Excel, la feuille lue (la 1re sinon).
 
     Returns:
         (colonnes, types, format, d'ou viennent les types, chemin lu), tout
@@ -921,7 +935,7 @@ def first_readable(
     """
     for loc in candidates:
         try:
-            cols, types, fmt, how = file_columns(loc, header)
+            cols, types, fmt, how = file_columns(loc, header, sheet)
         except Exception as exc:  # fichier illisible
             warnings.append(f"{name} : {loc} illisible ({exc})")
             continue
@@ -1072,9 +1086,14 @@ def main(argv: list[str] | None = None) -> int:
         same_name = [x for x in reads.values() if io_name(x["path"]) == name]
         entry_name = (
             f"{name}_{file_ext(r['path'])[1:]}"
-            if len(same_name) > 1 and file_ext(r["path"])
+            if len({file_ext(x["path"]) for x in same_name}) > 1 and file_ext(r["path"])
             else name
         )
+        # le meme fichier Excel lu sur plusieurs feuilles : une entree par
+        # feuille (tarifs_feuil1, tarifs_feuil2), chacune son schema
+        sheets = {x.get("sheet") for x in same_name if x["path"] == r["path"]}
+        if r.get("sheet") and len(sheets) > 1:
+            entry_name = f"{entry_name}_{io_key(r['sheet'])}"
         # Produit par un STORE : meme chemin, ou meme nom et meme extension
         # ecrit par un AUTRE script. Un script qui lit Sources/produits.qvd
         # et ecrit QVD/produits.qvd lit bien la source, pas sa propre sortie ;
@@ -1084,7 +1103,9 @@ def main(argv: list[str] | None = None) -> int:
             and writes[name]["scripts"] - r["scripts"]
             and file_ext(writes[name]["path"]) == file_ext(r["path"])
         )
-        entry = conf.find(r["path"], "input", produced=is_produced, strict=True)
+        entry = conf.find(
+            r["path"], "input", produced=is_produced, strict=True, sheet=r.get("sheet")
+        )
         if entry and entry.from_output:
             continue  # relit une sortie : rien a decrire, le Parquet a ses types
         if is_produced and entry:
@@ -1145,7 +1166,9 @@ def main(argv: list[str] | None = None) -> int:
         # CSV ses options, dont l'en-tete (no labels : pas d'en-tete).
         qlik_fmt, options = source_format(r["path"], r["spec"])
         header = options.get("header", "true") == "true"
-        cols, types, fmt, how, origin = first_readable(found, header, name, warnings)
+        cols, types, fmt, how, origin = first_readable(
+            found, header, name, warnings, r.get("sheet")
+        )
         if not fmt and "${" in found[0]:
             # Cause la plus frequente de types devines : le Parquet existe,
             # mais sa location contient une variable qu'on ne connait pas.
