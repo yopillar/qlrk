@@ -324,7 +324,49 @@ class ExprCtx:
 
 
 class Bool(str):
-    """Expression SQL booleenne (comparaison, AND, IsNull...)."""
+    """Expression SQL booleenne (comparaison, AND, IsNull...).
+
+    negated : la meme condition niee, quand elle a une forme lisible
+    (x IS NOT NULL plutot que NOT (x IS NULL)) ; None sinon.
+    """
+
+    negated: str | None = None
+
+
+def condition(text: str, negated: str | None = None) -> Bool:
+    """Une condition, avec sa forme niee lisible si elle en a une.
+
+    Args:
+        text: la condition.
+        negated: la meme condition niee, ou None.
+
+    Returns:
+        La condition.
+    """
+    out = Bool(text)
+    out.negated = negated
+    return out
+
+
+# NOT a = b est a <> b, NOT a > b est a <= b... y compris avec NULL : les
+# deux formes valent alors NULL.
+NEGATED_OP = {"=": "<>", "<>": "=", "<": ">=", ">": "<=", "<=": ">", ">=": "<"}
+
+
+def negate(cond: str) -> Bool:
+    """NOT d'une condition, sous sa forme la plus lisible : x IS NOT NULL,
+    a <> b, x NOT LIKE ..., v NOT IN (...), et NOT NOT c redonne c.
+
+    Args:
+        cond: la condition.
+
+    Returns:
+        La condition niee.
+    """
+    negated = getattr(cond, "negated", None)
+    if negated is not None:
+        return condition(negated, cond)
+    return condition(f"(NOT {cond})", cond)
 
 
 class DateSql(str):
@@ -547,9 +589,9 @@ def date_vs_number(d: DateSql, op: str, n: str) -> str:
         La condition.
     """
     if str(n).strip("() ") == "0" and op in (">", ">=", "<>"):
-        return Bool(f"({d} IS NOT NULL)")
-    target = shift_date(DateSql(QLIK_DAY_ZERO), "+", n)
-    return Bool(f"({d} {op} {as_value(target)})")
+        return condition(f"({d} IS NOT NULL)", f"({d} IS NULL)")
+    target = as_value(shift_date(DateSql(QLIK_DAY_ZERO), "+", n))
+    return condition(f"({d} {op} {target})", f"({d} {NEGATED_OP[op]} {target})")
 
 
 def round_date(n: str, x: DateSql, step: float | None) -> str:
@@ -812,7 +854,7 @@ class ExprParser:
         """NOT."""
         if self.peek() == ("kw", "NOT"):
             self.take()
-            return Bool(f"(NOT {as_cond(self.p_not())})")
+            return negate(as_cond(self.p_not()))
         return self.p_cmp()
 
     def p_cmp(self) -> str:
@@ -858,7 +900,8 @@ class ExprParser:
                 return date_vs_number(left, v, right)
             if isinstance(right, DateSql) and is_numeric(left):
                 return date_vs_number(right, FLIPPED[v], left)
-            return Bool(f"({as_value(left)} {v} {as_value(right)})")
+            a, b = as_value(left), as_value(right)
+            return condition(f"({a} {v} {b})", f"({a} {NEGATED_OP[v]} {b})")
         if (kind, v) == ("kw", "LIKE"):
             self.take()
             pk, pv = self.take()
@@ -872,7 +915,8 @@ class ExprParser:
                 .replace("?", "_")
             )
             # le LIKE de Qlik : jokers * et ?, et pas sensible a la casse
-            return Bool(f"(lower({as_value(left)}) LIKE lower({sql_string(pat)}))")
+            a, b = f"lower({as_value(left)})", f"lower({sql_string(pat)})"
+            return condition(f"({a} LIKE {b})", f"({a} NOT LIKE {b})")
         if kind == "kw" and v in ("PRECEDES", "FOLLOWS"):
             raise Untranslatable(f"operateur {v}")
         return left
@@ -913,10 +957,7 @@ class ExprParser:
             elif op == "+" and isinstance(right, DateSql):
                 left = shift_date(right, op, left)
             else:
-                left = NumSql(
-                    f"({as_value(as_number(left, self.ctx))} {op} "
-                    f"{as_value(as_number(right, self.ctx))})"
-                )
+                left = arith(left, op, right, self.ctx)
         return left
 
     def p_mul(self) -> str:
@@ -925,17 +966,16 @@ class ExprParser:
         while self.peek() in (("op", "*"), ("op", "/")):
             op = self.take()[1]
             right = self.p_unary()
-            left = NumSql(
-                f"({as_value(as_number(left, self.ctx))} {op} "
-                f"{as_value(as_number(right, self.ctx))})"
-            )
+            left = arith(left, op, right, self.ctx)
         return left
 
     def p_unary(self) -> str:
         """Signe + ou - devant une valeur."""
         if self.peek() == ("op", "-"):
             self.take()
-            return NumSql(f"(- {as_value(as_number(self.p_unary(), self.ctx))})")
+            value = as_number(self.p_unary(), self.ctx)
+            out = f"(- {as_value(value)})"
+            return NumSql(out) if known_number(value) else out
         if self.peek() == ("op", "+"):
             self.take()
         return self.p_primary()
@@ -1131,6 +1171,32 @@ NUMBER_ARG_FUNCTIONS = {
 }
 
 
+def known_number(sql: str) -> bool:
+    """Dit si une valeur est surement un nombre : un litteral, une colonne
+    typee en nombre, ou un calcul sur des nombres. Une colonne au type
+    inconnu n'en est pas un : c'est souvent une date relue par RESIDENT."""
+    return is_numeric(sql)
+
+
+def arith(left: str, op: str, right: str, ctx: ExprCtx) -> str:
+    """Calcul a + b, a * b... Le resultat n'est un nombre que si ses deux
+    termes en sont. Sinon son type reste inconnu : x + 1, avec x une date
+    relue, est une date en Spark, et Date(x + 1) un simple CAST AS DATE.
+
+    Args:
+        left: le terme de gauche.
+        op: l'operateur.
+        right: le terme de droite.
+        ctx: le contexte (separateurs du script).
+
+    Returns:
+        Le calcul.
+    """
+    a, b = as_number(left, ctx), as_number(right, ctx)
+    out = f"({as_value(a)} {op} {as_value(b)})"
+    return NumSql(out) if known_number(a) and known_number(b) else out
+
+
 def is_numeric(sql: str) -> bool:
     """Dit si une expression SQL est un nombre : un litteral, ou un calcul.
 
@@ -1192,6 +1258,8 @@ def translate_function(
     if n in ("date", "timestamp") and len(a) == 1 and is_numeric(a[0]):
         # un nombre Qlik : des jours depuis le 30/12/1899
         if n == "date":
+            if re.fullmatch(r"\d+", str(a[0]).strip()):
+                return DateSql(f"date_add({QLIK_DAY_ZERO}, {str(a[0]).strip()})")
             days = a[0] if whole_days(a[0]) else f"floor({as_value(a[0])})"
             return DateSql(f"date_add({QLIK_DAY_ZERO}, CAST({days} AS INT))")
         return shift_date(DateSql(QLIK_DAY_ZERO), "+", NumSql(as_value(a[0])))
@@ -1492,7 +1560,8 @@ def _translate_function(
             else f"{ctx.qualifier + '.' if ctx.qualifier else ''}{ident(field_name)}"
         )
         value_tokens = [v.lower() for _, v in raw[1]] if k == 2 else None
-        return Bool(ctx.exists(field_name, value, value_tokens))
+        found = ctx.exists(field_name, value, value_tokens)
+        return found if isinstance(found, Bool) else Bool(found)
     if n == "makedate":
         need(1, 2, 3)
         m = a[1] if k > 1 else "1"
@@ -1588,7 +1657,7 @@ def _translate_function(
         return "NULL"
     if n == "isnull":
         need(1)
-        return Bool(f"({a[0]} IS NULL)")
+        return condition(f"({a[0]} IS NULL)", f"({a[0]} IS NOT NULL)")
     if n in ("match", "mixmatch", "wildmatch"):
         if k < 2:
             raise Untranslatable(f"{name} sans valeur")
@@ -2540,8 +2609,12 @@ class SectionTranslator:
         )
         constant = re.fullmatch(r"'(?:[^']|'')*'|-?\d+(\.\d+)?", value.strip())
         if negated and not constant:
-            return f"({value} IS NOT NULL AND {value} IN ({union}))"
-        return f"({value} IN ({union}))"
+            # forme niee : v IS NULL OR v NOT IN (...), sans le NOT devant
+            return condition(
+                f"({value} IS NOT NULL AND {value} IN ({union}))",
+                f"({value} IS NULL OR {value} NOT IN ({union}))",
+            )
+        return condition(f"({value} IN ({union}))", f"({value} NOT IN ({union}))")
 
     def mapping_cte(self, mname: str) -> str:
         """CTE d'un mapping, ecrite une seule fois et lue par chaque ApplyMap.

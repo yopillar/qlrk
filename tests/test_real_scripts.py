@@ -787,3 +787,65 @@ def test_exists_as_in_and_mapping_ctes(project: Project) -> None:
     tables = run_sections(work)
     assert tables["Connus"] == [("a", 1, "FR")]
     assert tables["Inconnus"] == sorted([("c", 2), (None, 3)], key=str)
+
+
+@pytest.mark.spark
+def test_readable_not_same_result() -> None:
+    """NOT s'ecrit sous sa forme lisible (x IS NOT NULL, a <> b, NOT LIKE,
+    NOT NOT c = c) et donne le meme resultat que NOT (...), NULL compris."""
+    from check import get_parser
+    from qlik2sql import cond
+
+    spark = get_parser().spark
+    ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
+    ctx.column_types = {"a": "int", "b": "int", "x": "string", "d": "date"}
+    rows = (
+        "VALUES (1, 2, 'Abc', DATE'2024-01-30'), (2, 2, 'zz', CAST(NULL AS DATE)),"
+        " (NULL, 2, NULL, DATE'2024-01-30') AS t(a, b, x, d)"
+    )
+    readable = {
+        "NOT IsNull(x)": "(x IS NOT NULL)",
+        "NOT a = b": "(a <> b)",
+        "NOT a > b": "(a <= b)",
+        "NOT x LIKE 'A*'": "(lower(x) NOT LIKE lower('A%'))",
+        "NOT NOT a = b": "(a = b)",
+        "NOT d > 0": "(d IS NULL)",
+    }
+
+    def values(where: str) -> list:
+        """Vrai, faux ou NULL pour chaque ligne."""
+        return [
+            r[0]
+            for r in spark.sql(
+                f"SELECT CASE WHEN {where} THEN 1 WHEN NOT ({where}) THEN 0 END "
+                f"FROM {rows}"
+            ).collect()
+        ]
+
+    for text, want in readable.items():
+        sql = cond(text, ctx)
+        assert sql == want, text
+        assert values(sql) == values(f"NOT ({cond(text[4:], ctx)})"), text
+
+
+@pytest.mark.spark
+def test_date_of_unknown_plus_days() -> None:
+    """Date(x + 1), x au type inconnu (une date relue par RESIDENT) : un
+    CAST AS DATE, pas une conversion de numero de serie Qlik, que Spark
+    refusait (int et date). Avec un entier connu, c'est un numero Qlik."""
+    from check import get_parser
+
+    spark = get_parser().spark
+    ctx = ExprCtx("", None, "DD/MM/YYYY", "DD/MM/YYYY hh:mm:ss")
+    ctx.column_types = {"n": "int"}
+    for text, value, want in [
+        ("Date(x + 1)", "DATE'2024-01-30'", "2024-01-31"),
+        ("Date(x - 1)", "DATE'2024-01-30'", "2024-01-29"),
+        ("Date(n + 1)", "45321", "2024-01-31"),
+        ("Date(45321)", "0", "2024-01-30"),
+    ]:
+        sql = expr(text, ctx)
+        rows = spark.sql(
+            f"SELECT {sql} FROM (SELECT {value} AS x, {value} AS n)"
+        ).collect()
+        assert str(rows[0][0]) == want, (text, sql)
