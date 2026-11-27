@@ -976,7 +976,8 @@ def test_calendar_and_peek_in_spark_style(project: Project) -> None:
     assert "posexplode(sequence((SELECT MinDate FROM peek_mindate)" in sql
     assert sql.count("ORDER BY _qlik_order\n  LIMIT 1") == 2
     assert "RecNo" not in sql and "__jour AS Jour" in sql
-    assert sql.rstrip().endswith("SELECT *\nFROM calendrier_1")
+    # une ligne vide entre la derniere CTE et la requete finale
+    assert sql.rstrip().endswith(")\n\nSELECT *\nFROM calendrier_1")
 
 
 @pytest.mark.spark

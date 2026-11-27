@@ -2611,7 +2611,8 @@ class SectionTranslator:
         if where_sql:
             sql += f"\nWHERE {safe_where(where_sql)}"
         if group_sql:
-            sql += "\nGROUP BY " + ", ".join(group_sql)
+            # un champ par ligne, alignes comme ceux du SELECT
+            sql += "\nGROUP BY " + ",\n         ".join(group_sql)
         if first:
             sql += f"\nORDER BY {ectx.order_by}\nLIMIT {first}"
         return sql, out_cols
@@ -2857,7 +2858,9 @@ class SectionTranslator:
         if seg.group_by or ectx.aggregate_used:
             order = f"min({ORD})"
             if seg.group_by:
-                group = " GROUP BY " + ", ".join(expr(g, ectx) for g in seg.group_by)
+                group = " GROUP BY " + ",\n           ".join(
+                    expr(g, ectx) for g in seg.group_by
+                )
         # cle en double : Qlik garde la premiere valeur chargee
         group_line = f"\n  {group.strip()}" if group else ""
         where_line = f"\n  {where.strip()}" if where else ""
@@ -3510,7 +3513,8 @@ class SectionTranslator:
         if condensed and cols and len(cols) > FEW_COLUMNS:
             # le SELECT final est ecrit par l'outil, pas par le modele
             sel = f"...  -- {len(cols)} columns + {ORD}, listed by the tool"
-        out.append(f"SELECT {sel}\nFROM {final}")
+        # une ligne vide entre la derniere CTE et la requete finale
+        out.append(f"\nSELECT {sel}\nFROM {final}")
         return "\n".join(out) + "\n", cols
 
 
