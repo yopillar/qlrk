@@ -234,12 +234,13 @@ def test_excel_sheets_get_their_own_entry(project: Project) -> None:
         pd.DataFrame({"Site": ["S1"], "Region": ["Nord"], "Surface": [120.5]}).to_excel(
             writer, sheet_name="Sites", index=False
         )
+    # la feuille entre crochets, comme Qlik l'ecrit
     (project / "script_qvd/ref.qvs").write_text(
         "Produits:\nLOAD Code, Libelle\n"
-        "FROM [lib://in/ref.xlsx] (ooxml, embedded labels, table is Produits);\n"
+        "FROM [lib://in/ref.xlsx]\n(ooxml, embedded labels, table is [Produits]);\n"
         "STORE Produits INTO [lib://out/produits.qvd] (qvd);\n"
         "Sites:\nLOAD Site, Region, Surface\n"
-        "FROM [lib://in/ref.xlsx] (ooxml, embedded labels, table is Sites);\n"
+        "FROM [lib://in/ref.xlsx]\n(ooxml, embedded labels, table is [Sites]);\n"
         "STORE Sites INTO [lib://out/sites.qvd] (qvd);\n"
     )
     project.run("prepare.py", "--collect", "script_qvd/ref.qvs")
@@ -468,3 +469,49 @@ def test_french_dates_typed_in_csv(tmp_path: Path) -> None:
         "Court": "string",
         "Mix": "string",
     }
+
+
+def test_excel_sheet_never_uses_another_sheet_entry(project: Project) -> None:
+    """Une ancienne entree pour la feuille 1 seulement : la lecture de la
+    feuille 2 ne la reprend pas, elle recoit sa propre entree ; et des
+    crochets dans sheets sont signales (le socle chercherait [Feuil1])."""
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("openpyxl")
+    with pd.ExcelWriter(project / "data/input/ref.xlsx") as writer:
+        pd.DataFrame({"Code": [1]}).to_excel(writer, sheet_name="Feuil1", index=False)
+        pd.DataFrame({"Site": ["S1"]}).to_excel(
+            writer, sheet_name="Feuil2", index=False
+        )
+    io_yml = project / "conf/io.yml"
+    io_yml.write_text(
+        io_yml.read_text(encoding="utf-8").replace(
+            "inputs:\n",
+            "inputs:\n   ref:\n       format: xlsx\n"
+            "       schema_file: schemas/ref.yml\n"
+            "       location: ${entrees}/ref.xlsx\n"
+            "       options: {sheets: '[Feuil1]'}\n",
+        ),
+        encoding="utf-8",
+    )
+    (project / "conf/schemas/ref.yml").write_text(
+        "columns:\n  Code: BIGINT\n", encoding="utf-8"
+    )
+    (project / "script_qvd/ref.qvs").write_text(
+        "A:\nLOAD Code FROM [lib://in/ref.xlsx] (ooxml, embedded labels, "
+        "table is [Feuil1]);\nSTORE A INTO [lib://out/a.qvd] (qvd);\n"
+        "B:\nLOAD Site FROM [lib://in/ref.xlsx] (ooxml, embedded labels, "
+        "table is [Feuil2]);\nSTORE B INTO [lib://out/b.qvd] (qvd);\n"
+    )
+    project.run("prepare.py", "--collect", "script_qvd/ref.qvs")
+    res = project.run("fill_conf.py", "script_qvd/ref.qvs")
+    assert "Ecrire sheets: Feuil1" in res.stdout, res.stdout
+    conf = yaml.safe_load(io_yml.read_text(encoding="utf-8"))
+    assert conf["inputs"]["ref_feuil2"]["options"] == {"sheets": "Feuil2"}
+    project.run("prepare.py", "script_qvd/ref.qvs")
+    manifest = json.loads(
+        (project / "work/ref/manifest.json").read_text(encoding="utf-8")
+    )
+    views = {
+        s["table"]: set(s["views"]) for s in manifest["sections"] if s.get("views")
+    }
+    assert views == {"A": {"in_ref"}, "B": {"in_ref_feuil2"}}

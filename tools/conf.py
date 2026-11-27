@@ -231,8 +231,23 @@ def excel_sheet(spec: str | None) -> str | None:
     )
     if not m:
         return None
-    name = m.group(1).strip().strip("[]\"'").strip()
-    return name.removesuffix("$") or None
+    return clean_sheet(m.group(1))
+
+
+def clean_sheet(name: str | None) -> str | None:
+    """Nom d'une feuille sans ce qui l'entoure dans Qlik : [Feuil1],
+    'Feuil 1', [Feuil1$] donnent Feuil1 et Feuil 1. "*" reste "*".
+
+    Args:
+        name: le nom tel qu'ecrit.
+
+    Returns:
+        Le nom de la feuille, ou None s'il est vide.
+    """
+    if name is None:
+        return None
+    text = str(name).strip().strip("[]\"'").strip()
+    return text.removesuffix("$").strip() or None
 
 
 def io_key(text: str) -> str:
@@ -452,12 +467,17 @@ class IoConf:
             found = [
                 e for e in found if Path(e.location).suffix.lower() in (ext, "")
             ] or found
-        # un fichier Excel a plusieurs feuilles : l'entree de la feuille lue
-        sheet = sheet or getattr(qlik_path, "sheet", None)
-        if len(found) > 1 and sheet:
+        # Un fichier Excel lu sur une feuille : seulement l'entree de cette
+        # feuille. Celle d'une autre feuille (ou de toutes, "*") lirait les
+        # mauvaises colonnes : sans entree pour cette feuille, fill_conf.py
+        # en ajoute une.
+        sheet = clean_sheet(sheet or getattr(qlik_path, "sheet", None))
+        if sheet and found and any(e.sheets is not None for e in found):
             found = [
-                e for e in found if (e.sheets or "").lower() == sheet.lower()
-            ] or found
+                e
+                for e in found
+                if (clean_sheet(e.sheets) or "").lower() == sheet.lower()
+            ]
         if kind != "input" or produced is None:
             return found[0] if found else None
         same = [e for e in found if self.rereads_output(e) == produced]

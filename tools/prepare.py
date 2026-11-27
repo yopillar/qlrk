@@ -1806,15 +1806,8 @@ def source_format(
     fmt = QLIK_FORMATS.get(words[0] if words else "") or QLIK_FORMATS.get(ext)
     options: dict[str, str] = {}
     if fmt in EXCEL_FORMATS:
-        sheet = next(
-            (
-                unquote(p.strip()[m.end() :].strip())
-                for p in parts
-                if (m := re.match(r"table\s+is\s+", p.strip(), re.I))
-            ),
-            "*",
-        )
-        return fmt, {"sheets": sheet}
+        # [Feuil1] et [Feuil1$] de Qlik : la feuille Feuil1
+        return fmt, {"sheets": excel_sheet(spec) or "*"}
     if fmt != "csv":
         return fmt, options
     for orig in parts:

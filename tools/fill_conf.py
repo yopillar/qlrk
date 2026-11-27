@@ -56,6 +56,7 @@ from conf import (
     WORK,
     IoConf,
     _load_yaml,
+    clean_sheet,
     find_scripts,
     io_key,
     missing_library,
@@ -1106,6 +1107,12 @@ def main(argv: list[str] | None = None) -> int:
         entry = conf.find(
             r["path"], "input", produced=is_produced, strict=True, sheet=r.get("sheet")
         )
+        if entry and entry.sheets and clean_sheet(entry.sheets) != entry.sheets:
+            warnings.append(
+                f"{entry.name} : options sheets '{entry.sheets}' : le socle "
+                "cherche une feuille de ce nom, crochets compris. Ecrire "
+                f"sheets: {clean_sheet(entry.sheets)}"
+            )
         if entry and entry.from_output:
             continue  # relit une sortie : rien a decrire, le Parquet a ses types
         if is_produced and entry:

@@ -66,7 +66,7 @@ def test_source_format_from_qlik_spec() -> None:
     )
     assert source_format(
         "lib://s/a.xls", "biff, embedded labels, table is [Feuil 1$]"
-    ) == ("xls", {"sheets": "[Feuil 1$]"})
+    ) == ("xls", {"sheets": "Feuil 1"})  # la feuille, sans [ ] ni $
     assert source_format("table_en_base") == (None, {})
 
 
