@@ -2980,7 +2980,10 @@ def prepare(
         # RESIDENT, et Floor d'une date n'est pas floor d'un nombre).
         for c_, t_ in (old.get("output_types") or {}).items():
             if old.get("output_types_sure") or str(t_).upper() != "STRING":
-                conf_types.setdefault(c_, str(t_).lower())
+                # le type calcule par Spark vaut mieux qu'un "calcule, type
+                # inconnu"
+                if conf_types.get(c_) in (None, "computed"):
+                    conf_types[c_] = str(t_).lower()
         sections.append(sec)
 
     # avertissements de l'analyse (auto-concatenation, cle de jointure

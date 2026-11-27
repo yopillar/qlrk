@@ -385,6 +385,11 @@ class StrField(str):
     faut le lui dire."""
 
 
+# Type d'une colonne calculee par le script dont l'expression n'a pas de
+# type connu : on ne la devine pas d'apres son nom.
+COMPUTED = "computed"
+
+
 class GuessedTs(TsSql):
     """Colonne au type inconnu dont le nom dit une date (DateFin, dt_cmd).
     Traitee comme un horodatage, sans CAST : les fonctions employees pour les
@@ -1101,6 +1106,8 @@ class ExprParser:
             return StrField(sql)
         if t in NUM_TYPES:
             return NumSql(sql)
+        if t == COMPUTED:
+            return sql  # calculee par le script, de type inconnu
         if not t and looks_like_date(name):
             return GuessedTs(sql)
         return sql
@@ -1364,6 +1371,8 @@ def translate_function(
         known = [v for v in values if str(v).strip().upper() != "NULL"]
         if known and all(isinstance(v, DateSql) for v in known):
             return (TsSql if any(isinstance(v, TsSql) for v in known) else DateSql)(sql)
+        if known and all(known_number(v) for v in known):
+            return NumSql(sql)  # If(cond, 1, 0) est un nombre
     if n in NUMBER_ARG_FUNCTIONS:
         out = NumSql(sql)
         if n in ROUNDING and len(original) == 1:
@@ -2515,6 +2524,13 @@ class SectionTranslator:
                 self.derived_types[alias] = (
                     "timestamp" if isinstance(sql, TsSql) else "date"
                 )
+            elif alias:
+                # Colonne calculee par le script : son type est celui de son
+                # expression, jamais devine d'apres son nom (ColDate_F, un
+                # indicateur 0/1, n'est pas une date).
+                self.derived_types[alias] = (
+                    "double" if isinstance(sql, NumSql) else COMPUTED
+                )
             if alias is None:
                 if not re.fullmatch(r"\[[^\]]+\]|\"[^\"]+\"|[^\W\d][\w.#%@$]*", e):
                     raise Untranslatable(f"expression sans alias : {e[:40]}")
@@ -3453,7 +3469,7 @@ class SectionTranslator:
             if re.search(rf"\b{re.escape(c.name)}\b", todo_text)
         }
         for k, c in enumerate(self.ctes):
-            body = _indent(tidy_parens(c.sql), 2)
+            body = _indent(pretty_sql(c.sql), 2)
             if condensed and c not in todo:
                 if c.name in read:
                     known = (
@@ -3791,6 +3807,141 @@ def tidy_parens(sql: str) -> str:
                 break
         if not removed:
             return sql
+
+
+def _case_spans(sql: str) -> list[tuple[int, int, list[int]]]:
+    """CASE ... END les plus exterieurs : (debut, fin, positions des WHEN et
+    du ELSE de ce CASE)."""
+    spans: list[tuple[int, int, list[int]]] = []
+    clauses: list[int] = []
+    level, start, depth, base_depth = 0, 0, 0, 0
+    for kind, text, pos in _sql_tokens(sql):
+        up = text.upper() if kind == "word" else ""
+        if text == "(":
+            depth += 1
+        elif text == ")":
+            depth -= 1
+        if up == "CASE":
+            if level == 0:
+                start, base_depth, clauses = pos, depth, []
+            level += 1
+        elif up == "END" and level:
+            level -= 1
+            if level == 0:
+                spans.append((start, pos + 3, clauses))
+        elif up in ("WHEN", "ELSE") and level == 1 and depth == base_depth:
+            clauses.append(pos)
+    return spans
+
+
+def _format_cases(sql: str) -> str:
+    """Un CASE par ligne de WHEN : CASE, puis chaque WHEN et le ELSE sur sa
+    ligne, puis END, aligne sur CASE."""
+    for start, end, clauses in reversed(_case_spans(sql)):
+        if not clauses:
+            continue
+        line_start = sql.rfind("\n", 0, start) + 1
+        base = " " * (start - line_start)
+        head = sql[start : clauses[0]].strip()  # CASE (ou CASE x pour Pick)
+        bounds = clauses + [end - 3]
+        # retours a la ligne seulement : un texte 'a  b' garde ses espaces
+        parts = [
+            re.sub(r"\s*\n\s*", " ", sql[a:b]).strip()
+            for a, b in zip(bounds, bounds[1:])
+        ]
+        body = "".join(f"\n{base}  {part}" for part in parts)
+        sql = sql[:start] + head + body + f"\n{base}END" + sql[end:]
+    return sql
+
+
+SUBQUERY_BREAKS = ("FROM", "WHERE", "GROUP", "ORDER", "LEFT", "INNER", "UNION")
+
+
+def _first_cut(line: str) -> tuple[int, str] | None:
+    """Premier endroit ou couper une ligne trop longue : le FROM, le WHERE...
+    d'une sous-requete assez longue (alignes sous son SELECT), ou un AND d'un
+    WHERE. None s'il n'y en a pas."""
+    toks = _sql_tokens(line)
+    stripped = line.lstrip()
+    margin = len(line) - len(stripped)
+    first_word = stripped.split(" ", 1)[0].upper()
+    # un WHERE, ou sa suite deja coupee (AND ..., OR ...)
+    where = first_word in ("WHERE", "AND", "OR")
+    and_indent = " " * (margin + 2 if first_word == "WHERE" else margin)
+    selects: dict[int, int] = {}  # profondeur -> indice du jeton SELECT
+    opens: list[int] = []
+    depth = level_case = 0
+    for k, (kind, text, pos) in enumerate(toks):
+        up = text.upper() if kind == "word" else ""
+        if text == "(":
+            depth += 1
+            opens.append(pos)
+        elif text == ")":
+            selects.pop(depth, None)
+            depth -= 1
+            if opens:
+                opens.pop()
+        elif up == "CASE":
+            level_case += 1
+        elif up == "END":
+            level_case -= 1
+        elif up == "SELECT":
+            selects[depth] = k
+        elif up in SUBQUERY_BREAKS and depth in selects:
+            first = toks[selects[depth]]
+            # sous-requete courte, une seule colonne : on la laisse sur une ligne
+            close = _matching_paren(line, opens[-1]) if opens and depth else len(line)
+            listed = line[first[2] : pos]
+            if "," in listed or close - first[2] > 40:
+                return pos, " " * first[2]
+        elif (
+            where
+            and up in ("AND", "OR")
+            and depth == 0
+            and not level_case
+            and pos > margin
+        ):
+            return pos, and_indent
+    return None
+
+
+def _matching_paren(text: str, open_pos: int) -> int:
+    """Position de la parenthese qui ferme celle de open_pos."""
+    depth = 0
+    for _kind, tok, pos in _sql_tokens(text[open_pos:]):
+        if tok == "(":
+            depth += 1
+        elif tok == ")":
+            depth -= 1
+            if depth == 0:
+                return open_pos + pos
+    return len(text)
+
+
+def _break_long_lines(sql: str, width: int = 88) -> str:
+    """Coupe les lignes trop longues, une coupe a la fois (les colonnes sont
+    recalculees apres chaque coupe) : FROM, WHERE, GROUP BY... d'une
+    sous-requete alignes sous son SELECT, et un WHERE a chaque AND."""
+    lines = sql.split("\n")
+    k = 0
+    while k < len(lines):
+        line = lines[k]
+        # une ligne qui commence par AND vient d'un WHERE deja coupe : on le
+        # coupe a chacun de ses AND, meme court
+        cont = line.lstrip().split(" ", 1)[0].upper() in ("AND", "OR")
+        cut = _first_cut(line) if len(line) > width or cont else None
+        if cut is None:
+            k += 1
+            continue
+        pos, indent = cut
+        lines[k : k + 1] = [line[:pos].rstrip(), indent + line[pos:]]
+    return "\n".join(lines)
+
+
+def pretty_sql(sql: str) -> str:
+    """Mise en page lisible d'une requete : parentheses inutiles enlevees,
+    CASE sur plusieurs lignes, lignes trop longues coupees."""
+    return _break_long_lines(_format_cases(tidy_parens(sql)))
 
 
 def _indent(text: str, n: int) -> str:

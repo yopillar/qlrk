@@ -977,3 +977,50 @@ def test_calendar_and_peek_in_spark_style(project: Project) -> None:
     assert sql.count("ORDER BY _qlik_order\n  LIMIT 1") == 2
     assert "RecNo" not in sql and "__jour AS Jour" in sql
     assert sql.rstrip().endswith("SELECT *\nFROM calendrier_1")
+
+
+@pytest.mark.spark
+def test_computed_flag_named_like_a_date(project: Project) -> None:
+    """ColDate_F, calcule par If(IsNull(ColDate), 1, 0), est un nombre : son
+    nom ne fait pas d'elle une date. ColDate_F = 1 reste une comparaison de
+    nombres, pas avec DATE'1899-12-30' + 1."""
+    (project / "script_qvd/flag.qvs").write_text(
+        "Src:\nLOAD * INLINE [\nId, ColDate\n1, 30/01/2024\n2, \n];\n"
+        "T1:\nNoConcatenate LOAD Id, If(IsNull(ColDate) or Len(ColDate) = 0, 1, 0)"
+        " AS ColDate_F RESIDENT Src;\n"
+        "T2:\nNoConcatenate LOAD Id, If(ColDate_F = 1, 'sans date', 'avec date')"
+        " AS Etat RESIDENT T1;\n"
+        "STORE T2 INTO [lib://o/t2.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    project.run("prepare.py", "script_qvd/flag.qvs")
+    sql = next((project / "work/flag").glob("*_t2/query.sql")).read_text(
+        encoding="utf-8"
+    )
+    assert "WHEN ColDate_F = 1 THEN 'sans date'" in sql and "1899" not in sql
+    assert run_sections(project / "work/flag")["T2"] == [
+        (1, "avec date"),
+        (2, "sans date"),
+    ]
+
+
+@pytest.mark.spark
+def test_pretty_sql_layout_same_result() -> None:
+    """Chaque WHEN sur sa ligne, un WHERE long coupe a chaque AND, les
+    espaces d'un texte gardes ; le resultat dans Spark ne change pas."""
+    from check import get_parser
+    from qlik2sql import pretty_sql
+
+    spark = get_parser().spark
+    before = (
+        "SELECT CASE WHEN (a = 1) THEN 'un  deux' WHEN (a = 2) THEN 'b' ELSE 'c' END"
+        " AS Lib\nFROM VALUES (1, 'A'), (2, NULL), (3, 'Z') AS t(a, Code)\n"
+        "WHERE ((a > 0) AND ((Code IS NULL) OR (Code <> 'Z')) AND (a < 10) AND "
+        "(length(coalesce(Code, '')) >= 0) AND (a IN (SELECT 1 UNION SELECT 2)))"
+    )
+    after = pretty_sql(before)
+    assert "CASE\n         WHEN a = 1 THEN 'un  deux'\n         WHEN a = 2" in after
+    assert "\n       END AS Lib" in after
+    assert "\n  AND (Code IS NULL OR Code <> 'Z')\n  AND a < 10" in after
+    got = [spark.sql(q).collect() for q in (before, after)]
+    assert got[0] == got[1]
