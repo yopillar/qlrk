@@ -192,9 +192,32 @@ def csv_options(options: dict[str, str]) -> dict[str, str | bool]:
         # dates a la francaise par defaut : seules les colonnes a ce format
         # sont typees date ou timestamp (value_kind)
         **CSV_DATE_OPTIONS,
+        # UTF-8 par defaut, pour les accents ; remplace par l'encodage du
+        # fichier s'il est la (csv_encoding)
+        "encoding": "UTF-8",
     }
     out.update({k: v for k, v in options.items() if k != "header"})
     return out
+
+
+def csv_encoding(path: Path) -> str:
+    """Encodage d'un CSV : UTF-8 s'il se lit en UTF-8 (de preference, et
+    c'est le cas de tout fichier sans accent), sinon windows-1252, l'ANSI
+    francais de Windows, pour que "Libelle" et "ete" gardent leurs accents.
+
+    Args:
+        path: le fichier.
+
+    Returns:
+        "UTF-8" ou "windows-1252".
+    """
+    try:
+        with path.open(encoding="utf-8-sig") as f:
+            for _ in f:
+                pass
+    except UnicodeDecodeError:
+        return "windows-1252"
+    return "UTF-8"
 
 
 def flow_map(values: dict) -> str:
@@ -489,7 +512,8 @@ def csv_types(path: Path, header: bool = True) -> tuple[list[str], dict[str, str
     colonnes s'appellent _c0, _c1... comme Spark les nomme."""
     import csv as csv_mod
 
-    with path.open(encoding="utf-8-sig", errors="replace", newline="") as f:
+    encoding = "utf-8-sig" if csv_encoding(path) == "UTF-8" else "cp1252"
+    with path.open(encoding=encoding, errors="replace", newline="") as f:
         head = f.readline()
         sep = max((";", ",", "\t", "|"), key=head.count) if head else ","
         f.seek(0)
@@ -1176,6 +1200,15 @@ def main(argv: list[str] | None = None) -> int:
         cols, types, fmt, how, origin = first_readable(
             found, header, name, warnings, r.get("sheet")
         )
+        if fmt == "csv" and origin:
+            # l'encodage reel du fichier, plutot que celui que dit Qlik
+            files = (
+                [Path(origin)]
+                if Path(origin).is_file()
+                else sorted(Path(origin).glob("*.csv"))
+            )
+            if files:
+                options["encoding"] = csv_encoding(files[0])
         if not fmt and "${" in found[0]:
             # Cause la plus frequente de types devines : le Parquet existe,
             # mais sa location contient une variable qu'on ne connait pas.

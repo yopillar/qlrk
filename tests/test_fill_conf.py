@@ -100,6 +100,7 @@ def test_csv_without_header_file_absent(project: Project) -> None:
         "mode": "PERMISSIVE",
         "dateFormat": "dd/MM/yyyy",
         "timestampFormat": "dd/MM/yyyy HH:mm:ss",
+        "encoding": "UTF-8",
         "sep": ";",
     }
     schema = yaml.safe_load(
@@ -515,3 +516,44 @@ def test_excel_sheet_never_uses_another_sheet_entry(project: Project) -> None:
         s["table"]: set(s["views"]) for s in manifest["sections"] if s.get("views")
     }
     assert views == {"A": {"in_ref"}, "B": {"in_ref_feuil2"}}
+
+
+@pytest.mark.spark
+def test_csv_accents_read_in_their_encoding(project: Project, tmp_path: Path) -> None:
+    """Un CSV en UTF-8 est declare en UTF-8, un CSV en ANSI de Windows en
+    windows-1252 : les accents des noms de colonnes et des valeurs sont
+    gardes, au schema comme a la lecture par Spark."""
+    from check import get_parser
+    from fill_conf import csv_encoding
+
+    header, row = "Code;Libell\u00e9\n", "1;\u00e9t\u00e9\n"
+    utf8, ansi = tmp_path / "u.csv", tmp_path / "a.csv"
+    utf8.write_text(header + row, encoding="utf-8")
+    ansi.write_text(header + row, encoding="cp1252")
+    assert csv_encoding(utf8) == "UTF-8"
+    assert csv_encoding(ansi) == "windows-1252"
+    assert csv_types(ansi)[0] == ["Code", "Libell\u00e9"]
+    spark = get_parser().spark
+    # Spark 3.5 (la cible) lit le windows-1252 ; Spark 4 ne l'accepte plus
+    # sans spark.sql.legacy.javaCharsets
+    files = [(utf8, "UTF-8")]
+    if spark.version.startswith("3."):
+        files.append((ansi, "windows-1252"))
+    for path, encoding in files:
+        df = spark.read.options(header=True, sep=";", encoding=encoding).csv(str(path))
+        assert df.columns == ["Code", "Libell\u00e9"]
+        assert df.collect()[0][1] == "\u00e9t\u00e9"
+    # de bout en bout : l'entree ajoutee a io.yml porte l'encodage du fichier
+    (project / "data/input/produits.csv").write_bytes(ansi.read_bytes())
+    (project / "script_qvd/p.qvs").write_text(
+        "P:\nLOAD * FROM [lib://in/produits.csv] (txt, embedded labels, "
+        "delimiter is ';');\nSTORE P INTO [lib://out/p.qvd] (qvd);\n"
+    )
+    project.run("prepare.py", "--collect", "script_qvd/p.qvs")
+    project.run("fill_conf.py", "script_qvd/p.qvs")
+    conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
+    assert conf["inputs"]["produits"]["options"]["encoding"] == "windows-1252"
+    schema = yaml.safe_load(
+        (project / "conf/schemas/produits.yml").read_text(encoding="utf-8")
+    )
+    assert "Libell\u00e9" in schema["columns"]

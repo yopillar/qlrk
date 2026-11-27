@@ -371,7 +371,10 @@ D'ou viennent les informations :
   ```
 - **Un CSV** recoit une cle `options` avec les noms des options du lecteur
   CSV de Spark, d'apres la specification Qlik : `header` (toujours ecrit),
-  `sep`, `encoding`, `quote`.
+  `sep`, `encoding`, `quote`. L'encodage est `UTF-8` par defaut ; si le
+  fichier est la, c'est le sien : `UTF-8` s'il se lit en UTF-8, sinon
+  `windows-1252` (l'ANSI de Windows), pour garder les accents. Spark 3.5 lit
+  le `windows-1252` ; Spark 4 demande `spark.sql.legacy.javaCharsets`.
 
   ```yaml
   codes:
