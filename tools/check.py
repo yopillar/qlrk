@@ -599,11 +599,19 @@ def check_section(
     # colonnes de sortie
     cols = section.get("columns") or []
     if cols and "*" not in cols and "?" not in cols:
-        missing = [
-            c
-            for c in cols
-            if not re.search(r"(?<![\w])" + re.escape(c) + r"(?![\w])", code)
-        ]
+        if re.search(r"\bSELECT\s+\*\s+FROM\s+[\w`]+\s*$", code, re.I):
+            # SELECT * final : les colonnes recopiees (LOAD *, RESIDENT) ne
+            # sont ecrites nulle part, on demande a Spark ce qui sort
+            produced = parser.columns_of(section, raw) if parser else None
+            missing = (
+                [c for c in cols if c not in produced] if produced is not None else []
+            )
+        else:
+            missing = [
+                c
+                for c in cols
+                if not re.search(r"(?<![\w])" + re.escape(c) + r"(?![\w])", code)
+            ]
         if missing:
             errors.append(f"colonnes de sortie absentes : {missing}")
 

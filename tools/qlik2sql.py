@@ -3471,10 +3471,18 @@ class SectionTranslator:
         # La derniere CTE produit deja ces colonnes, dans cet ordre : un
         # SELECT * suffit. La liste ne reste que s'il y a un doublon a ecarter
         # ou une partie que le modele ecrit (ses colonnes ne sont pas sures).
+        # Avec a.* ou *, les colonnes et leur ordre viennent de l'etoile
+        # (_qlik_order au milieu) : la liste garde l'ordre attendu.
+        star = re.search(
+            r"(?:\bSELECT\s+(?:DISTINCT\s+)?|[\w`]\.|,\s*)\*(?=\s*(?:,|FROM\b|$))",
+            last.sql,
+            re.I | re.M,
+        )
         exact = (
             cols is not None
             and len(set(cols)) == len(cols)
             and "TODO(model)" not in last.sql
+            and not star
         )
         if cols:
             cols = list(dict.fromkeys(cols))

@@ -99,3 +99,45 @@ def test_missing_column_same_rule_everywhere(tmp_path: Path) -> None:
         else:
             assert not errors
             assert any("non bloquant" in w for w in warnings)
+
+
+@pytest.mark.spark
+def test_select_star_output_columns_checked_by_spark(
+    project: Project, tmp_path: Path
+) -> None:
+    """Une requete qui finit par SELECT * : ses colonnes recopiees (LOAD *,
+    RESIDENT) ne sont ecrites nulle part, le controle demande a Spark ce qui
+    sort. Pas de fausse colonne absente ; une vraie l'est toujours."""
+    (project / "script_qvd/copie.qvs").write_text(
+        "Src:\nLOAD * INLINE [\nCode, Lib, M\na, x, 1\n];\n"
+        "STORE Src INTO [lib://o/src.qvd] (qvd);\n"
+        "T:\nNoConcatenate LOAD * RESIDENT Src;\n"
+        "STORE T INTO [lib://o/t.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    (project / "script_qvd/jointure.qvs").write_text(
+        "Clients:\nLOAD * INLINE [\nIdClient, Ville\n1, Lyon\n];\n"
+        "STORE Clients INTO [lib://o/clients.qvd] (qvd);\n"
+        "Cdes:\nLOAD * INLINE [\nIdCde, IdClient\n10, 1\n];\n"
+        "LEFT JOIN (Cdes) LOAD IdClient, Ville RESIDENT Clients;\n"
+        "STORE Cdes INTO [lib://o/cdes.qvd] (qvd);\n",
+        encoding="utf-8",
+    )
+    for script in ("copie", "jointure"):
+        project.run("prepare.py", f"script_qvd/{script}.qvs")
+        res = project.run("check.py", f"work/{script}", "--parse", check=False)
+        assert "colonnes de sortie absentes" not in res.stdout, res.stdout
+    # apres a.*, la liste finale revient : elle garde l'ordre attendu
+    joined = next((project / "work/jointure").glob("*_cdes/query.sql"))
+    assert "Ville,\n       _qlik_order\nFROM cdes_2" in joined.read_text(
+        encoding="utf-8"
+    )
+    query = tmp_path / "query.sql"
+    query.write_text("-- l.1 : T\nSELECT *\nFROM in_a\n", encoding="utf-8")
+    section = {
+        "views": {"in_a": {"columns": ["Code", "Lib"], "columns_sure": True}},
+        "columns": ["Code", "Lib", "Absente"],
+        "statement_lines": [1],
+    }
+    errors, _ = check.check_section(section, query, check.get_parser())
+    assert any("colonnes de sortie absentes : ['Absente']" in e for e in errors)
