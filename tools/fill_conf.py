@@ -51,10 +51,13 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from conf import (
     CONF,
+    CSV_DATE_OPTIONS,
     IO_FILE,
+    WORK,
     IoConf,
     _load_yaml,
     find_scripts,
+    io_key,
     missing_library,
     reread_name,
     resolve_location,
@@ -64,11 +67,13 @@ from prepare import (
     INPUT_DIR,
     KEEP_FILE_NAME,
     analyze_script,
+    file_ext,
     file_stem,  # noqa: E402
     mask_strings,
     norm_path,
     source_format,
     strip_comments,
+    write_stores,
 )
 from qlik2sql import (  # noqa: E402
     Untranslatable,
@@ -183,6 +188,9 @@ def csv_options(options: dict[str, str]) -> dict[str, str | bool]:
     out: dict[str, str | bool] = {
         "header": options.get("header", "true") == "true",
         "mode": "PERMISSIVE",
+        # dates a la francaise par defaut : seules les colonnes a ce format
+        # sont typees date ou timestamp (value_kind)
+        **CSV_DATE_OPTIONS,
     }
     out.update({k: v for k, v in options.items() if k != "header"})
     return out
@@ -221,6 +229,15 @@ def columns_read(text: str) -> tuple[list[str], bool]:
             continue
         for k, (kind, val) in enumerate(toks):
             nxt = toks[k + 1] if k + 1 < len(toks) else None
+            # Exists(champ, expr) : champ est deja charge, pas lu dans la
+            # source. Avec un seul argument, il est bien lu dans la source.
+            if (
+                k >= 2
+                and toks[k - 1] == ("op", "(")
+                and str(toks[k - 2][1]).lower() == "exists"
+                and nxt == ("op", ",")
+            ):
+                continue
             if kind == "field":
                 cols.append(val[1:-1])
             elif kind == "word" and nxt != ("op", "("):
@@ -276,7 +293,7 @@ def suggest(col: str, counter: Counter | None) -> tuple[str | None, str]:
         # colonne de dates utilisee seulement dans Min() ou Max(), comme
         # dans un calendrier, n'a pas d'autre indice, et c'est justement la
         # que le type compte.
-        if re.search(r"(^|[_ ])(date|dt)([_ ]|$)|^date", col, re.I):
+        if re.search(r"(?i:(^|[_ ])(date|dt)([_ ]|$)|^date)|(?<=[a-z0-9])Date", col):
             return "date", "devine d'apres le nom de la colonne, a verifier"
         return "string", "type inconnu : string par defaut, a verifier"
     by_type: dict[str, list[str]] = {}
@@ -297,7 +314,7 @@ def suggest(col: str, counter: Counter | None) -> tuple[str | None, str]:
 
 
 def file_columns(
-    location: str, header: bool = True
+    location: str, header: bool = True, sheet: str | None = None
 ) -> tuple[list[str], dict[str, str], str | None, str]:
     """Colonnes et types d'un fichier de donnees present sur le disque, son
     format (parquet ou csv, None si on ne l'a pas trouve) et d'ou viennent
@@ -335,9 +352,10 @@ def file_columns(
                 (f"deduit des {n} ligne(s) de {csv_files[0]}"),
             )
         if p.is_file() and p.suffix.lower()[1:] in EXCEL_FORMATS:
-            cols, types = excel_types(p)
+            cols, types = excel_types(p, sheet)
             fmt = p.suffix.lower()[1:]
-            return cols, types, fmt, f"deduit de la 1re feuille de {p}"
+            where = f"la feuille {sheet}" if sheet else "la 1re feuille"
+            return cols, types, fmt, f"deduit de {where} de {p}"
     return [], {}, None, ""
 
 
@@ -423,11 +441,14 @@ def parquet_types(path: Path) -> dict[str, str]:
 PANDAS_TYPES = (("int", "bigint"), ("float", "double"), ("datetime", "timestamp"))
 
 
-def excel_types(path: Path) -> tuple[list[str], dict[str, str]]:
-    """Colonnes et types de la 1re feuille d'un fichier Excel (5 000 lignes).
+def excel_types(
+    path: Path, sheet: str | None = None
+) -> tuple[list[str], dict[str, str]]:
+    """Colonnes et types d'une feuille d'un fichier Excel (5 000 lignes).
 
     Args:
         path: le fichier .xlsx ou .xls.
+        sheet: la feuille lue, la 1re par defaut.
 
     Returns:
         (colonnes, types).
@@ -438,26 +459,26 @@ def excel_types(path: Path) -> tuple[list[str], dict[str, str]]:
     try:
         import pandas as pd
 
-        sheet = pd.read_excel(path, sheet_name=0, nrows=5000)
+        table = pd.read_excel(path, sheet_name=sheet or 0, nrows=5000)
     except ImportError as exc:
         raise missing_library(
             "pandas ou openpyxl", f"lecture des types de {path}"
         ) from exc
     types = {
         str(c): next((t for p_, t in PANDAS_TYPES if str(d).startswith(p_)), "string")
-        for c, d in sheet.dtypes.items()
+        for c, d in table.dtypes.items()
     }
     return list(types), types
 
 
 def csv_types(path: Path, header: bool = True) -> tuple[list[str], dict[str, str], int]:
     """En-tete d'un CSV et types deduits de ses valeurs (sur place : rien
-    n'en sort du poste). On ne retient que des types que Spark relit sans
-    option : entier, decimal a point, date et horodatage ISO (2024-01-31,
-    2024-01-31 10:00:00), booleen true/false. Une date a la francaise
-    (29/12/2024) ou un decimal a virgule restent en string, car Spark ne les
-    lirait pas sans options ; le kit lit deja comme une date un texte au
-    DateFormat du script.
+    n'en sort du poste). On ne retient que des types que Spark relit avec
+    les options ecrites par le kit : entier, decimal a point, date et
+    horodatage au format de lecture (31/01/2024, 31/01/2024 10:00:00),
+    booleen true/false. Une date ISO ou un decimal a virgule restent en
+    string, car Spark les lirait en null ; le kit lit deja comme une date un
+    texte au DateFormat du script, ou en ISO.
 
     On lit tout le fichier : une seule valeur texte, meme a la millionieme
     ligne, met la colonne en string. Un echantillon la laissait en bigint, et
@@ -500,8 +521,10 @@ def csv_types(path: Path, header: bool = True) -> tuple[list[str], dict[str, str
 CSV_TYPES = (
     ("bigint", {"bigint"}),
     ("double", {"bigint", "double"}),
+    # une seule forme par colonne : Spark lit une date avec dateFormat et un
+    # horodatage avec timestampFormat, sans melange possible
     ("date", {"date"}),
-    ("timestamp", {"date", "timestamp"}),
+    ("timestamp", {"timestamp"}),
     ("boolean", {"boolean"}),
 )
 
@@ -517,19 +540,26 @@ def value_kind(v: str) -> str:
     Returns:
         Sa sorte.
     """
-    if re.fullmatch(r"-?\d{1,18}", v):
+    # Un zero en tete (001, 007.5) garde la valeur en texte : c'est un code,
+    # Qlik affiche ses zeros. Meme regle que pour un INLINE.
+    if re.fullmatch(r"-?(0|[1-9]\d{0,17})", v):
         return "bigint"
-    if re.fullmatch(r"-?\d*\.\d+([eE][-+]?\d+)?", v):
+    if re.fullmatch(r"-?(0|[1-9]\d*)?\.\d+([eE][-+]?\d+)?", v):
         return "double"
     if v.lower() in ("true", "false"):
         return "boolean"
-    m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})([ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?", v)
+    # Exactement les formats de lecture (CSV_DATE_OPTIONS) : dd/MM/yyyy et
+    # dd/MM/yyyy HH:mm:ss. Spark lit une autre forme (ISO, 1/2/2024) en null.
+    m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})( (\d{2}):(\d{2}):(\d{2}))?", v)
     if m:
+        d, mo, y = (int(m.group(k)) for k in (1, 2, 3))
         try:
-            dt.datetime.fromisoformat(v.replace("T", " "))
+            dt.date(y, mo, d)
+            if m.group(4):
+                dt.time(int(m.group(5)), int(m.group(6)), int(m.group(7)))
         except ValueError:
             return "string"
-        return "timestamp" if m.group(2) else "date"
+        return "timestamp" if m.group(4) else "date"
     return "string"
 
 
@@ -544,9 +574,8 @@ def var_prefix(conf: IoConf, kind: str, default: str) -> str:
 
 
 DRAFT_HEADER = [
-    "# Brouillon ecrit par tools/fill_conf.py --draft : a relire,",
-    "# puis a recopier dans conf/io.yml. Ni le kit ni le socle",
-    "# ne lisent ce fichier.",
+    "# Brouillon : a relire, puis a recopier dans conf/io.yml.",
+    "# Ni le kit ni le socle ne lisent ce fichier.",
     "",
 ]
 
@@ -576,8 +605,7 @@ def yaml_value(value: str) -> str:
 def entry_lines(name: str, props: dict, why: str) -> list[tuple[int, str]]:
     """Lignes d'une entree, avec leur niveau (0 : la cle, 1 : ses
     proprietes). Une propriete dictionnaire (options) tient sur une ligne."""
-    today = dt.date.today().isoformat()
-    return [(0, f"{yaml_key(name)}:  # ajoute le {today} : {why}")] + [
+    return [(0, f"{yaml_key(name)}:  # {why}")] + [
         (1, f"{k}: {flow_map(v) if isinstance(v, dict) else yaml_value(str(v))}")
         for k, v in props.items()
     ]
@@ -727,22 +755,18 @@ def type_text(t: str, style: dict) -> str:
     return t.upper()
 
 
-def schema_text(why: str, lines: list, style: dict) -> str:
-    """Texte d'un schema a creer, dans la forme des schemas existants.
+def schema_text(lines: list, style: dict) -> str:
+    """Texte d'un schema a creer, dans la forme des schemas existants. Ni
+    date ni en-tete : le fichier ne change que si les types changent.
 
     Args:
-        why: pourquoi il est cree (commentaire d'en-tete).
         lines: (colonne, type, d'ou vient le type) dans l'ordre.
         style: forme des schemas existants (voir schema_style).
 
     Returns:
         Le contenu du fichier.
     """
-    today = dt.date.today().isoformat()
-    body = [
-        f"# Cree par tools/fill_conf.py le {today} ({why}).",
-        "# Les types suivis de 'a verifier' ont ete devines.",
-    ]
+    body: list[str] = []
     pad = " " * style["indent"] if style["wrap"] else ""
     if style["wrap"]:
         body.append(f"{style['wrap']}:")
@@ -827,10 +851,16 @@ def collect_io(
                     )
                     cols, star = [], False
                 for src in i.sources[:1]:
+                    # par chemin : commandes.csv et commandes.qvd sont deux
+                    # fichiers, meme s'ils ont le meme nom. Un fichier Excel
+                    # lu sur deux feuilles donne deux lectures : leurs
+                    # colonnes ne sont pas les memes.
+                    sheet = getattr(src, "sheet", None)
                     r = reads.setdefault(
-                        io_name(src),
+                        norm_path(src) + (f"#{sheet}" if sheet else ""),
                         {
                             "path": src,
+                            "sheet": sheet,
                             "columns": [],
                             "star": False,
                             "scripts": set(),
@@ -884,7 +914,11 @@ def output_entries(
 
 
 def first_readable(
-    candidates: list[str], header: bool, name: str, warnings: list[str]
+    candidates: list[str],
+    header: bool,
+    name: str,
+    warnings: list[str],
+    sheet: str | None = None,
 ) -> tuple[list[str], dict[str, str], str | None, str, str | None]:
     """Colonnes et types du premier fichier de donnees qu'on arrive a lire.
 
@@ -893,6 +927,7 @@ def first_readable(
         header: le CSV a une ligne d'en-tete.
         name: le nom de l'entree, pour les messages.
         warnings: les remarques, completees si un fichier est illisible.
+        sheet: pour un fichier Excel, la feuille lue (la 1re sinon).
 
     Returns:
         (colonnes, types, format, d'ou viennent les types, chemin lu), tout
@@ -900,7 +935,7 @@ def first_readable(
     """
     for loc in candidates:
         try:
-            cols, types, fmt, how = file_columns(loc, header)
+            cols, types, fmt, how = file_columns(loc, header, sheet)
         except Exception as exc:  # fichier illisible
             warnings.append(f"{name} : {loc} illisible ({exc})")
             continue
@@ -1012,6 +1047,10 @@ def main(argv: list[str] | None = None) -> int:
     if not scripts:
         print(f"Aucun script Qlik dans {args.path} (.qvs, .txt ou sans extension)")
         return 1
+    # Le recensement d'abord : une table du modele (sans STORE) qui existe
+    # dans plusieurs scripts prend le nom <script>_<table>, comme dans
+    # prepare.py. Sans lui, toutes partageaient une seule sortie.
+    write_stores(scripts, WORK / "stores.json")
 
     conf = IoConf()
     raw = _load_yaml(IO_FILE) if IO_FILE.exists() else {}
@@ -1040,13 +1079,32 @@ def main(argv: list[str] | None = None) -> int:
 
     new_outputs = output_entries(writes, conf, out_prefix)
 
-    for name, r in sorted(reads.items()):
-        entry = conf.find(r["path"], "input")
-        # Produit par un STORE : meme chemin, ou meme nom ecrit par un AUTRE
-        # script. Un script qui lit Sources/produits.qvd et ecrit
-        # QVD/produits.qvd lit bien la source, pas sa propre sortie.
+    for _, r in sorted(reads.items()):
+        name = io_name(r["path"])
+        # airports.csv et airports.xlsx : deux entrees, airports_csv et
+        # airports_xlsx (une cle YAML en double n'en garderait qu'une)
+        same_name = [x for x in reads.values() if io_name(x["path"]) == name]
+        entry_name = (
+            f"{name}_{file_ext(r['path'])[1:]}"
+            if len({file_ext(x["path"]) for x in same_name}) > 1 and file_ext(r["path"])
+            else name
+        )
+        # le meme fichier Excel lu sur plusieurs feuilles : une entree par
+        # feuille (tarifs_feuil1, tarifs_feuil2), chacune son schema
+        sheets = {x.get("sheet") for x in same_name if x["path"] == r["path"]}
+        if r.get("sheet") and len(sheets) > 1:
+            entry_name = f"{entry_name}_{io_key(r['sheet'])}"
+        # Produit par un STORE : meme chemin, ou meme nom et meme extension
+        # ecrit par un AUTRE script. Un script qui lit Sources/produits.qvd
+        # et ecrit QVD/produits.qvd lit bien la source, pas sa propre sortie ;
+        # commandes.csv, la source brute, n'est pas commandes.qvd.
         is_produced = norm_path(r["path"]) in produced or bool(
-            name in writes and writes[name]["scripts"] - r["scripts"]
+            name in writes
+            and writes[name]["scripts"] - r["scripts"]
+            and file_ext(writes[name]["path"]) == file_ext(r["path"])
+        )
+        entry = conf.find(
+            r["path"], "input", produced=is_produced, strict=True, sheet=r.get("sheet")
         )
         if entry and entry.from_output:
             continue  # relit une sortie : rien a decrire, le Parquet a ses types
@@ -1108,7 +1166,9 @@ def main(argv: list[str] | None = None) -> int:
         # CSV ses options, dont l'en-tete (no labels : pas d'en-tete).
         qlik_fmt, options = source_format(r["path"], r["spec"])
         header = options.get("header", "true") == "true"
-        cols, types, fmt, how, origin = first_readable(found, header, name, warnings)
+        cols, types, fmt, how, origin = first_readable(
+            found, header, name, warnings, r.get("sheet")
+        )
         if not fmt and "${" in found[0]:
             # Cause la plus frequente de types devines : le Parquet existe,
             # mais sa location contient une variable qu'on ne connait pas.
@@ -1117,7 +1177,7 @@ def main(argv: list[str] | None = None) -> int:
         absent = [c for c in r["columns"] if from_file and c not in cols]
         if absent:
             warnings.append(
-                f"{name} : colonnes lues par les scripts mais "
+                f"{entry_name} : colonnes lues par les scripts mais "
                 f"absentes de {origin} : {', '.join(absent)}"
             )
         if not cols:
@@ -1136,7 +1196,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 col_type, note = suggest(c, hints.get(c))
             lines.append((c, col_type, note))
-        schema_file = f"{schema_dir}/{name}.yml"
+        schema_file = f"{schema_dir}/{entry_name}.yml"
         why = f"lu par {', '.join(sorted(r['scripts']))}"
         if r["star"] and not from_file:
             why += " ; LOAD * : colonnes incompletes sans le fichier"
@@ -1154,14 +1214,14 @@ def main(argv: list[str] | None = None) -> int:
             # risquerait de faire planter la lecture par le socle. On declare
             # l'entree sans schema_file et on le signale.
             warnings.append(
-                f"{name} : colonnes inconnues ({why}), pas de "
+                f"{entry_name} : colonnes inconnues ({why}), pas de "
                 "schema cree. Deposer le fichier dans data/input/ "
                 "et relancer, ou ecrire le schema a la main."
             )
             if not entry:
                 new_inputs.append(
                     (
-                        name,
+                        entry_name,
                         {"format": fmt or "parquet", "location": location, **extra},
                         why + " ; pas de schema, colonnes inconnues",
                     )
@@ -1185,7 +1245,9 @@ def main(argv: list[str] | None = None) -> int:
             "location": location,
             **extra,
         }
-        new_inputs.append((name, props, why if fmt else why + " ; format a verifier"))
+        new_inputs.append(
+            (entry_name, props, why if fmt else why + " ; format a verifier")
+        )
 
     propagate_types(schemas_out, conf)
     blocks = {
@@ -1205,12 +1267,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         schema_root, where = base, "conf/"
     created = []
-    for schema_file, (why, lines) in schemas_out.items():
+    for schema_file, (_, lines) in schemas_out.items():
         target = schema_root / schema_file
         if target.exists() and not args.draft:
             continue  # jamais d'ecrasement d'un vrai schema
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(schema_text(why, lines, style), encoding="utf-8")
+        target.write_text(schema_text(lines, style), encoding="utf-8")
         created.append(target)
 
     print_summary(

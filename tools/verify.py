@@ -12,6 +12,9 @@ n'a pas pu tourner, 3 si aucune sortie n'avait d'export Qlik pour comparer.
 Un ecart dans l'ordre des lignes est signale ("identique, ordre
 different") mais ne compte comme ecart qu'avec --strict-order.
 
+Le job est lance en entier, comme avec spark-submit, sans --only : la
+facon dont le socle nomme les scripts n'entre pas en jeu.
+
 Usage :
     python tools/verify.py work/ventes            # lance le job puis compare
     python tools/verify.py work/ventes --no-run   # compare seulement
@@ -30,13 +33,14 @@ import datetime as dt
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from compare import compare_files  # noqa: E402
-from conf import resolve_location, work_dir  # noqa: E402
-from job_template import function_name, job_path  # noqa: E402
+from conf import query_sha, resolve_location, work_dir  # noqa: E402
+from job_template import job_path  # noqa: E402
 
 QLIK_DIR = Path("data") / "qlik_outputs"
 EXTENSIONS = (".qvd", ".csv", ".txt", ".parquet")
@@ -53,6 +57,20 @@ def find_reference(name: str) -> Path | None:
         ):
             return f
     return None
+
+
+def written_since(path: Path, start: float) -> bool:
+    """Dit si une sortie a ete ecrite apres le lancement du job.
+
+    Args:
+        path: le fichier, ou le dossier d'un Parquet.
+        start: l'heure de lancement du job.
+
+    Returns:
+        True si au moins un de ses fichiers est plus recent.
+    """
+    files = [path] if path.is_file() else [f for f in path.rglob("*") if f.is_file()]
+    return any(f.stat().st_mtime >= start for f in files)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -87,6 +105,12 @@ def main(argv: list[str] | None = None) -> int:
         "l'environnement",
     )
     p.add_argument(
+        "--started",
+        type=float,
+        help="avec --no-run : heure (epoch) du lancement du job, pour ne pas "
+        "comparer une sortie qu'il n'a pas reecrite (utilise par migrate.py)",
+    )
+    p.add_argument(
         "--strict-order",
         action="store_true",
         help="un ecart dans l'ordre des lignes compte comme un ecart",
@@ -103,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
     date_formats = [manifest.get("date_format"), manifest.get("timestamp_format")]
 
     job_failed = False
+    started = args.started or time.time()
+    check_age = not args.no_run or args.started is not None
     if not args.no_run:
         if not job.exists():
             print(
@@ -111,7 +137,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         print(f"Execution de {job} ...")
-        res = subprocess.run([sys.executable, str(job), "--only", function_name(stem)])
+        # le job en entier, comme spark-submit : --only depend de la facon dont
+        # le socle nomme les scripts, qui n'est pas la meme partout
+        res = subprocess.run([sys.executable, str(job)])
         if res.returncode:
             # Le script s'est arrete a l'etape en echec, mais il a pu ecrire
             # les sorties d'avant : on compare quand meme ce qui existe.
@@ -154,6 +182,14 @@ def main(argv: list[str] | None = None) -> int:
             elif not Path(out_path).exists():
                 verdict, detail = "sortie absente", f"{out_path} n'existe pas"
                 n_ko += 1
+            elif check_age and not written_since(Path(out_path), started):
+                # l'etape en echec ne l'a pas reecrite : c'est celle d'un
+                # lancement precedent, elle ne dit rien de la requete actuelle
+                verdict, detail = (
+                    "sortie non regeneree",
+                    f"{out_path} date d'un lancement precedent du job",
+                )
+                n_ko += 1
             else:
                 # Les cles AutoNumber / Hash ne peuvent pas avoir les memes
                 # valeurs que dans Qlik, on les sort de la comparaison.
@@ -178,8 +214,13 @@ def main(argv: list[str] | None = None) -> int:
                 n_ok += ok
                 n_ko += not ok
             sec["compare"] = verdict
-            # le contenu suffit, que l'ordre des lignes soit le bon ou non
-            if verdict.startswith("identique"):
+            # Le contenu suffit, que l'ordre des lignes soit le bon ou non.
+            # Une requete retouchee a la main depuis la traduction ne dit
+            # rien des reponses du modele : on ne les valide pas. Une
+            # traduction plus ancienne que l'empreinte (query_sha) passe.
+            query = args.workdir / sec["id"] / "query.sql"
+            untouched = sec.get("query_sha") in (None, query_sha(query))
+            if verdict.startswith("identique") and untouched:
                 verified.update(sec.get("hole_answers", {}))
             print(f"  {sec['id']:<35} {table:<25} {verdict}")
             report += [f"## {sec['id']} - {table} : {verdict}", "", detail, ""]

@@ -28,6 +28,11 @@ a RECURSIVE Peek, such as a running total.
   table) -> scalar subquery on that table's view or CTE.
 - Window functions cannot be used in WHERE: compute them in one CTE, filter
   in the next.
+- Range functions ignore nulls: `RangeSum(a, b)` is
+  `coalesce(a, 0) + coalesce(b, 0)`, `RangeMax(a, b)` is `greatest(a, b)`,
+  `RangeMin(a, b)` is `least(a, b)`.
+- Qlik `If(cond, x)` with 2 arguments is `CASE WHEN cond THEN x END`: Spark
+  `if` needs 3 arguments.
 
 ```sql
 -- l.40 : cumul des montants par client, dans l'ordre des dates
@@ -46,4 +51,4 @@ step_2 AS (
 |---|---|
 | `FirstValue(x)` / `LastValue(x)` (with GROUP BY) | `first_value(x) OVER (PARTITION BY <group> ORDER BY _qlik_order)` / `last_value(...)` with `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`, then one row per group |
 | `FirstSortedValue(x, sort)` | `max_by(x, -sort)` / `min_by(x, sort)` ; Qlik returns null when several rows share the best sort value |
-| `WHERE NOT Exists(Key)` while the same LOAD produces `Key` | keep the first row per key in load order: `row_number() OVER (PARTITION BY Key ORDER BY _qlik_order) = 1`, and exclude keys already present in the earlier tables (`NOT EXISTS (...)`) |
+| `WHERE NOT Exists(Key)` while the same LOAD produces `Key` | keep the first row per key in load order: `row_number() OVER (PARTITION BY Key ORDER BY _qlik_order) = 1`, and exclude keys already present in the earlier tables (`NOT (Key IS NOT NULL AND Key IN (SELECT Key FROM t WHERE Key IS NOT NULL))`) |

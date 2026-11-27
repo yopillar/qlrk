@@ -63,8 +63,11 @@ def test_migrate_demo_identical_to_qlik(project: Project) -> None:
         "--var",
         "sorties=data/output",
     )
-    job = (project / "src/job_demo.py").read_text(encoding="utf-8")
-    assert "spark-submit" in job
+    # le code genere survit au kit : ni ses outils ni de commande a lancer
+    for f in (project / "src").rglob("*"):
+        if f.is_file() and f.suffix in (".py", ".sql"):
+            text = f.read_text(encoding="utf-8")
+            assert "tools/" not in text and "spark-submit" not in text, f
 
 
 def test_csv_without_header(project: Project) -> None:
@@ -121,34 +124,24 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
     # une liste par script Qlik, une seule boucle, rien sur les entrees
     assert '("ventes__01_ventes.sql", "Ventes", "ventes_enrichies_v2"),' in step
     assert step.count("run_sql(") == 1 and "read_input" not in step
-    assert "@script\ndef ventes() -> None:" in step
-    # l'ordre des scripts est l'ordre des appels dans run()
-    calls = step[step.index("def run() -> None:") :]
-    assert (
-        calls.index("calendrier()")
-        < calls.index("ventes()")
-        < calls.index("synthese()")
-    )
+    # pas de decorateur : un seul run() et sa boucle, dans l'ordre des scripts
+    assert "@script" not in step and "def ventes" not in step
+    assert "for sql_file, table, output in CALENDRIER + VENTES + SYNTHESE:" in step
     check_generated_code(project)
     # le job n'est jamais reecrit : on peut y ajouter ses etapes
     (src / "job_demo.py").write_text(job + "# mon etape\n", encoding="utf-8")
     project.run("orchestrate.py")
     assert (src / "job_demo.py").read_text(encoding="utf-8").endswith("# mon etape\n")
-    # le metastore local garde les tables d'un lancement a l'autre ; on
-    # relance ventes pour verifier qu'une table existante est bien remplacee
-    res = project.run_job("--only", "ventes")
-    # des logs lisibles : projet, etape, script, et ce qui est fait
+    # le metastore local garde les tables d'un lancement a l'autre : on
+    # relance le job pour verifier qu'une table existante est bien remplacee
+    res = project.run_job()
+    # des logs lisibles : projet, requete (prefixee par son script), table
     for line in (
-        "[demo] step_010_run_sql > calendrier : saute (--from / --only)",
-        "[demo] step_010_run_sql > ventes : lecture ventes <- ",
-        "[demo] step_010_run_sql > ventes : sql ventes__01_ventes.sql -> Ventes ",
-        "[demo] step_010_run_sql > ventes : ecriture Ventes -> ventes_enrichies_v2 ",
+        "[demo] : lecture ventes <- ",
+        "[demo] : sql ventes__01_ventes.sql -> Ventes ",
+        "[demo] : ecriture Ventes -> ventes_enrichies_v2 ",
     ):
         assert line in res.stderr, res.stderr[-3000:]
-    # reprise a un script, et nom de script inconnu
-    project.run_job("--from", "synthese")
-    with pytest.raises(AssertionError, match="Script inconnu : ventess"):
-        project.run_job("--only", "ventess")
     check = (
         "from core.session import get_session\n"
         "spark = get_session('demo')\n"
@@ -161,22 +154,16 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
         capture_output=True,
         text=True,
     )
-    assert "ventes__ventes" in res.stdout, res.stderr[-2000:]
-    # une requete cassee : le log dit quel fichier, quelle table, et comment
-    # reprendre
+    assert "__ventes" in res.stdout, res.stderr[-2000:]
+    # une requete cassee arrete le job, avec l'erreur de Spark
     sql = project / "src/sql/ventes__01_ventes.sql"
     sql.write_text(
         sql.read_text(encoding="utf-8").replace("s.Montant", "s.Montantt", 1),
         encoding="utf-8",
     )
     with pytest.raises(AssertionError) as failed:
-        project.run_job("--only", "ventes")
-    message = str(failed.value)
-    assert (
-        "[demo] step_010_run_sql > ventes : ECHEC pendant "
-        "sql/ventes__01_ventes.sql (table Ventes)"
-    ) in message
-    assert "Montantt" in message and "relancer le job avec --from ventes" in message
+        project.run_job()
+    assert "Montantt" in str(failed.value)
 
 
 def check_generated_code(project: Project) -> None:

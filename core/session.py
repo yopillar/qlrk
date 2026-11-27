@@ -8,11 +8,14 @@ from pyspark.sql import SparkSession
 QLIK_SETTINGS = {
     # Qlik est sensible a la casse des noms de champs (IDBid et IdBid)
     "spark.sql.caseSensitive": "true",
-    # Les requetes sont verifiees hors mode ANSI (check.py) : une conversion
-    # impossible y donne null, comme dans Qlik, au lieu d'une erreur.
+    # Hors mode ANSI, une conversion impossible donne null, comme dans
+    # Qlik, au lieu d'une erreur.
     "spark.sql.ansi.enabled": "false",
     # Sinon try_to_timestamp leve une erreur sur une date incoherente.
     "spark.sql.legacy.timeParserPolicy": "CORRECTED",
+    # Une longue chaine de tables (une CTE par LOAD) depasse les 100
+    # iterations par defaut de l'analyseur.
+    "spark.sql.analyzer.maxIterations": "10000",
 }
 
 

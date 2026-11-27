@@ -99,28 +99,27 @@ def run(spark: SparkSession, args: list[str]) -> None:
     demo_step_010_run_sql.run()
 ```
 
-L'etape 010 contient une liste de tables par script Qlik, une seule boucle,
-et `run()` qui appelle les scripts dans l'ordre. Avec 50 tables, on a 50
-lignes dans une liste, pas 140 appels de fonction :
+L'etape 010 contient une liste de tables par script Qlik, puis `run()` et
+sa boucle unique, qui enchaine les scripts dans l'ordre. Avec 50 tables, on
+a 50 lignes dans une liste, pas 140 appels de fonction :
 
 ```python
+# Script Qlik ventes.qvs
 VENTES: list[tuple[str, str, str | None]] = [
     ("ventes__01_ventes.sql", "Ventes", "ventes_enrichies_v2"),
     ("ventes__02_clients.sql", "Clients", None),  # None : pas de STORE
 ]
 
-
-@script
-def ventes() -> None:
-    """Script Qlik ventes.qvs."""
-    run_tables(VENTES)
+# Script Qlik synthese.qvs, apres ventes dont il lit les sorties
+SYNTHESE: list[tuple[str, str, str | None]] = [...]
 
 
 def run() -> None:
     """Fait tourner les scripts Qlik du projet, dans l'ordre."""
-    calendrier()
-    ventes()
-    synthese()  # apres ventes, dont il lit les sorties
+    for sql_file, table, output in CALENDRIER + VENTES + SYNTHESE:
+        run_sql(sql_file, table=table)
+        if output:
+            write_output(output, table=table)
 ```
 
 Chaque ligne de `VENTES` donne la requete, le nom de la table Qlik et, si
@@ -154,8 +153,11 @@ spark-submit --name <projet> --deploy-mode client \
 En mode client, le driver lit `src/scripts/` et `src/sql/` sur place. Le
 mode cluster demanderait d'envoyer aussi ces dossiers et `conf/` : ce n'est
 pas prevu pour l'instant. Les reglages SQL dont dependent les requetes
-(sensibilite a la casse, ANSI desactive, `timeParserPolicy=CORRECTED`) sont
-poses par le socle, il n'y a pas de `--conf` a passer.
+(sensibilite a la casse, ANSI desactive, `timeParserPolicy=CORRECTED`,
+`analyzer.maxIterations=10000`) sont poses par le socle, il n'y a pas de
+`--conf` a passer. Chaque entree CSV ajoutee a `conf/io.yml` indique les
+formats de date a la francaise dans ses options de lecture
+(`dateFormat: dd/MM/yyyy`, `timestampFormat: dd/MM/yyyy HH:mm:ss`).
 
 ### Les logs
 
@@ -185,18 +187,20 @@ il les affiche au niveau INFO, sur la sortie d'erreur, que YARN recupere.
   lui, comme dans l'enchainement des taches de rechargement Qlik.
   `orchestrate.py` le calcule a partir de `work/stores.json` (ce que chaque
   script lit et ecrit) et le note en commentaire.
-- **Le job s'arrete au premier script en echec**, comme un rechargement
-  Qlik : les suivants liraient des donnees absentes ou d'hier. On corrige,
-  puis on relance avec `--from <script>`. Toutes les ecritures sont en
-  overwrite, relancer ne cree donc pas de doublon. Un nom inconnu passe a
-  `--from` ou `--only` est signale.
-- **`@script` marche aussi sur vos etapes** : posez-le sur leur fonction
-  pour pouvoir les viser avec `--from` et `--only`.
-- **Chaque script a ses propres vues**, supprimees a la fin, pour que deux
-  scripts puissent avoir une table du meme nom.
-- **Chaque table Qlik est ecrite dans le catalogue**, sous
-  `<base>.<script>__<table>` (base `<projet>_qlik` par defaut, `--database`
-  pour en changer), en overwrite, puis relue de la. C'est pour OpenLineage :
+- **Le job s'arrete a la premiere table en echec**, comme un rechargement
+  Qlik : les suivantes liraient des donnees absentes ou d'hier. On corrige,
+  puis on relance le job. Toutes les ecritures sont en overwrite, relancer
+  ne cree donc pas de doublon. Le nom de chaque requete commence par celui
+  de son script (`ventes__03_t2.sql`) : les logs disent ou on en est.
+- **`@script` du socle reste disponible pour vos etapes** : posez-le sur
+  leur fonction pour pouvoir les viser avec `--from` et `--only`. Le code
+  genere ne s'en sert pas.
+- **Chaque table Qlik est ecrite dans le catalogue**, sous `<base>.__<table>`
+  (`<base>.<script>__<table>` dans une etape sous `@script` ; base
+  `<projet>_qlik` par defaut, `--database` pour en changer), en overwrite,
+  puis relue de la. Deux scripts avec une table du meme nom ecrivent donc la
+  meme table du catalogue, l'un apres l'autre : sans effet sur les
+  resultats, mais la lignee ne garde que la derniere. C'est pour OpenLineage :
   une vue temporaire n'est pas un jeu de donnees, et la lignee irait des
   fichiers lus aux sorties sans montrer les tables entre les deux. Avec
   `--temp-views`, le job garde des vues temporaires : plus rapide, mais rien
@@ -293,6 +297,16 @@ a ecrire). Elle ne peut pas porter le meme nom que la sortie : Spark refuse
 une entree et une sortie du meme nom. Le controle des requetes qui la lisent
 prend les types de la requete Spark qui ecrit la sortie.
 
+Un fichier lu n'est rattache a une sortie que par son chemin, ou par son nom
+avec la meme extension : `commandes.csv`, la source brute, et
+`commandes.qvd`, ecrit par un autre script, restent deux entrees
+differentes (`commandes` et `commandes_relue`). Deux fichiers du meme nom
+mais d'extensions differentes (`airports.csv`, `airports.xlsx`) donnent
+`airports_csv` et `airports_xlsx`. Une table sans STORE presente dans
+plusieurs scripts prend une sortie par script (`<script>_<table>`), que
+`fill_conf.py` soit lance seul ou par `migrate.py`. Dans un CSV, une valeur a
+zero en tete (`001`) reste du texte, comme dans un `INLINE`.
+
 `fill_conf.py` ne modifie jamais une entree existante : une ancienne entree
 qui relit une sortie avec sa propre location (et souvent le meme nom que la
 sortie) est a supprimer a la main, il ecrira alors le `from_output`.
@@ -342,7 +356,10 @@ D'ou viennent les informations :
   du `table is ...` de Qlik, sinon `"*"`, toutes les feuilles mises bout a
   bout (elles doivent avoir les memes colonnes). Le socle le lit en
   binaire, puis l'ouvre avec pandas sur le driver (`openpyxl` requis), et
-  le convertit aux types du schema.
+  le convertit aux types du schema. Un meme fichier lu sur plusieurs
+  feuilles donne une entree par feuille (`tarifs_prix`, `tarifs_remises`),
+  chacune avec sa feuille, son schema, et les types lus sur cette feuille :
+  chaque requete lit la vue de sa feuille.
 
   ```yaml
   tarifs:
@@ -437,8 +454,13 @@ relit avec ce format.
   `Previous`, `Peek` (champ simple, ou `Peek('f', n, 'T')` sur une autre
   table), `FirstValue`, `LastValue`, `NoOfRows`, et les mappings, qui gardent
   la premiere valeur chargee comme Qlik.
-- **`Exists(champ[, expr])` et `NOT Exists(...)`**, y compris le
-  dedoublonnage quand le LOAD charge lui-meme le champ.
+- **`Exists(champ[, expr])` et `NOT Exists(...)`**, en
+  `valeur IN (SELECT champ FROM ...)`, y compris le dedoublonnage quand le
+  LOAD charge lui-meme le champ. Une valeur NULL n'existe jamais, comme
+  dans Qlik : `NOT Exists` garde la ligne.
+- **Les mappings**, chacun en une CTE `map_<mapping>` en tete de la requete
+  (ou juste avant la table qui l'utilise, s'il lit une table de la
+  requete), et chaque `ApplyMap` en `LEFT JOIN map_<mapping>`.
 - **`FileTime()`** dans un `LOAD ... FROM fichier` (ou `FileTime('fichier')`
   sur ce meme fichier) : la date de modification du fichier lu. Pour un
   autre fichier, c'est laisse au modele, car il n'est peut-etre pas declare
@@ -454,7 +476,31 @@ relit avec ce format.
   Qlik le fait au chargement.
 - **La casse des noms de champs** est respectee, comme dans Qlik.
 - **`Dual(texte, nombre)`** : on garde le texte, Parquet n'ayant qu'un type
-  par colonne (choix a valider).
+  par colonne (choix a valider). Pareil pour `Class(x, pas)`, qui donne
+  `3000 <= x < 4000`.
+- **Les nombres ecrits en texte** : avec `SET DecimalSep=','` (et
+  `ThousandSep`), une colonne texte comme `1 200,50` utilisee dans un calcul,
+  une comparaison a un nombre, `Sum`, `Avg`, `Round`, `RangeSum`... est lue
+  comme Qlik la lit. Sans cela, Spark donnait NULL. Une simple copie garde le
+  texte d'origine.
+- **Les valeurs formatees** : `Num(x, '00')` ou `Date(d, 'YYYY-MM')` donnent
+  leur texte affiche dans une concatenation (`'W' & Num(Week(d), '00')`
+  donne `W05`) ou comme texte d'un `Dual`, et restent un nombre ou une date
+  dans un calcul.
+- **`Even`**, **`Odd`**, **`DayNumberOfYear`**, **`QuarterStart`**, et un
+  alias entre apostrophes (`AS 'Nom'`), que Qlik accepte.
+- **`TextBetween`** (premiere occurrence), **`SubStringCount`**,
+  **`CROSSTABLE (attribut, donnee[, n])`** quand les colonnes sont connues, et
+  **`RENAME FIELD a TO b`** (pas `USING`, qui depend d'un mapping).
+- **Une table lue par une autre puis modifiee** (`JOIN`, `CONCATENATE`,
+  `DROP FIELD`, `RENAME FIELD`) : la lecture voit la table d'avant, comme
+  dans Qlik. Un agregat calcule avant un `CONCATENATE` ne compte pas les
+  lignes ajoutees ensuite.
+- **Les etiquettes repetees** : une boucle `FOR` qui recharge `Stocks:` avec
+  les memes champs ajoute ses lignes a `Stocks` ; avec d'autres champs, Qlik
+  cree `Stocks-1`. Un mapping utilise avant d'etre charge, ou une etiquette
+  ecrite apres le prefixe (`LEFT KEEP (A) T: LOAD`), est signale dans le
+  rapport.
 - **`JOIN`** (cles implicites, ordre des colonnes de Qlik), **`KEEP`**,
   **`CONCATENATE`**, l'auto-concatenation et **`DROP FIELD`**.
 - **`ApplyMap`**, traduit en `LEFT JOIN` sur la source du mapping, avec un
@@ -543,8 +589,20 @@ Parquet. A la retraduction, le modele recoit la liste des vraies colonnes
 que donne Spark et peut corriger le nom. Quand une table amont a ses
 colonnes deduites d'un autre script (`RESIDENT`, `STORE`), elles peuvent
 etre incompletes : la colonne introuvable est seulement signalee
-("non bloquant"). `fill_conf.py`, lance avec les vrais fichiers dans
-`data/`, remplit les schemas et rend ces colonnes sures.
+("non bloquant"). La regle est la meme pendant la traduction : une
+reponse du modele n'y est pas refusee pour une colonne que le controle
+accepterait. `fill_conf.py`, lance avec les vrais fichiers dans `data/`,
+remplit les schemas et rend ces colonnes sures.
+
+Si les colonnes d'une table lue sont inconnues (ni schema, ni fichier, ni
+script qui l'ecrit), Spark ne peut pas analyser la requete. Le controle le
+dit ("non analysee par Spark"), au lieu de laisser croire que la table est
+validee : ses erreurs n'apparaitront qu'au lancement du job, et ses types
+de sortie ne sont pas calcules.
+
+Un script dont une table n'est pas validee sort du job jusqu'a sa
+correction : le job ne garde pas une ancienne version de ses requetes. Le
+resume de `migrate.py` le signale ("retire du job").
 
 Une table bloquee ici perd ses reponses du modele non verifiees dans
 `work/expressions.json` : sans cela, la retraduction les lui redonnerait
@@ -575,9 +633,21 @@ de son fait.
 Chaque expression traduite par le modele y est enregistree comme non
 verifiee. Elle passe en verifiee quand la comparaison de sa table avec Qlik
 est identique : elle est alors reutilisee telle quelle, sans modele, dans
-les scripts suivants. Avant cela, elle est juste proposee au modele comme
+les scripts suivants. Une sortie que le job n'a pas reecrite (etape en
+echec) n'est pas comparee : elle date d'un lancement precedent. Une
+requete retouchee a la main depuis la traduction ne valide pas les
+reponses du modele. Avant cela, elle est juste proposee au modele comme
 piste. Le fichier se corrige a la main ; attention a ne pas le supprimer en
 vidant `work/`.
+
+### Les reponses du modele reparees en Python
+
+Avant de controler une reponse du modele, le kit corrige ce qui se deduit
+sans risque, plutot que de lui redemander (dans `translate.py`) : un nom avec
+`#` (ou une colonne connue avec un espace) laisse sans backticks,
+`SELECT * EXCEPT (a, b)` (absent de Spark 3.5) remplace par la liste des
+colonnes gardees, et `if(cond, x)` a deux arguments complete par `NULL`,
+comme Qlik. Le modele n'est relance que pour le reste.
 
 ### Verifier que le modele repond
 
@@ -634,7 +704,6 @@ Le code genere n'importe que ceci :
 | Import | Fichier du socle | Role |
 |---|---|---|
 | `from spark_foundation import pipeline` | `runner.py` | `@pipeline("<projet>")` ouvre la session, configure les logs, lit les options du job et trouve `sql/` a cote du job |
-| `from spark_foundation.runner import script` | `runner.py` | `@script` sur un script : `--from` / `--only`, vues du script, logs, arret au premier echec |
 | `from spark_foundation.tables import run_sql` | `tables.py` | calcule une table Qlik avec sa requete, apres avoir lu les entrees dont elle a besoin |
 | `from spark_foundation.datasets import write_output` | `datasets.py` | ecrit une table dans une sortie de `conf/io.yml` |
 
@@ -709,7 +778,7 @@ pyspark, ils sont sautes.
 | `assemble.py` | copie des requetes d'un script dans `src/sql/` |
 | `orchestrate.py` | ordonne les scripts, ecrit l'etape 010 (et le job s'il manque) |
 | `job_template.py` | texte du job et de l'etape 010 |
-| `verify.py` | lance le job et compare avec `data/qlik_outputs/` |
+| `verify.py` | lance le job en entier (sans `--only`) et compare avec `data/qlik_outputs/` ; `migrate.py` lance le job une seule fois puis compare chaque script |
 | `compare.py` | comparaison de deux tables |
 | `conf.py` | lecture de `conf/io.yml` et des schemas |
 | `journal.py` | tenue de `work/journal.csv` |
@@ -730,6 +799,10 @@ pyspark, ils sont sautes.
 - **`FieldValue('F', RecNo())`** numerote les valeurs dans l'ordre trie,
   alors que Qlik suit l'ordre de chargement.
 - **`Date(x)` sur un nombre** (date Qlik en jours) n'est pas converti.
+- **Une valeur vide dans un CSV** est une chaine vide pour Qlik, NULL pour
+  Spark : `IsText`, `Len(x) = 0` ou `x = ''` peuvent donner un autre
+  resultat. Ecrire `IsNull(x) or Len(Trim(x)) = 0`, ou le traiter dans la
+  conf de lecture.
 - **Le typage des dates repose sur `conf/schema`.** Une colonne de dates
   sans type declare n'est pas reconnue comme date par `Min`, `Max` ou
   `Peek`, et c'est le job qui plantera sur `date - date`.

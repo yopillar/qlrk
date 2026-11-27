@@ -27,6 +27,15 @@ from typing import Any
 CONF = Path("conf")
 IO_FILE = CONF / "io.yml"
 
+# Formats de date par defaut, a la francaise : ceux d'un script Qlik sans
+# SET DateFormat, et ceux de la lecture des CSV (format Spark).
+DEFAULT_DATE_FORMAT = "DD/MM/YYYY"
+DEFAULT_TIMESTAMP_FORMAT = "DD/MM/YYYY hh:mm:ss"
+CSV_DATE_OPTIONS = {
+    "dateFormat": "dd/MM/yyyy",
+    "timestampFormat": "dd/MM/yyyy HH:mm:ss",
+}
+
 
 # ---------------------------------------------------------------------------
 # Chemins du projet, communs a tous les outils (tous partent du dossier
@@ -132,6 +141,8 @@ class IoEntry:
     types: dict[str, str] = field(default_factory=dict)
     # entree qui relit une sortie : le nom de cette sortie
     from_output: str | None = None
+    # fichier Excel : la feuille lue (options sheets), "*" pour toutes
+    sheets: str | None = None
 
 
 def reread_name(output: str) -> str:
@@ -178,6 +189,50 @@ def _stem(text: str) -> str:
     return re.sub(
         r"\.(qvd|txt|csv|parquet|xlsx?|json|orc|delta)$", "", name, flags=re.I
     ).lower()
+
+
+class SheetPath(str):
+    """Chemin d'un fichier Excel lu sur une feuille (table is Feuil2) : le
+    meme chemin pour tout le kit, qui porte en plus la feuille lue, pour
+    trouver l'entree de io.yml de cette feuille."""
+
+    sheet: str | None = None
+
+
+def sheet_path(path: str, sheet: str | None) -> str:
+    """Le chemin, avec la feuille lue s'il y en a une.
+
+    Args:
+        path: le chemin du fichier.
+        sheet: la feuille, ou None.
+
+    Returns:
+        Le chemin, en SheetPath si une feuille est donnee.
+    """
+    if not sheet:
+        return path
+    out = SheetPath(path)
+    out.sheet = sheet
+    return out
+
+
+def excel_sheet(spec: str | None) -> str | None:
+    """Feuille lue d'apres la specification Qlik : (ooxml, table is Feuil2),
+    (biff, table is [Feuil2$]). None sans "table is".
+
+    Args:
+        spec: la specification entre parentheses.
+
+    Returns:
+        Le nom de la feuille, ou None.
+    """
+    m = re.search(
+        r"table\s+is\s+(\[[^\]]*\]|\"[^\"]*\"|'[^']*'|[^,)]+)", spec or "", re.I
+    )
+    if not m:
+        return None
+    name = m.group(1).strip().strip("[]\"'").strip()
+    return name.removesuffix("$") or None
 
 
 def io_key(text: str) -> str:
@@ -284,12 +339,15 @@ def _entries(section: Any, kind: str) -> Iterator[IoEntry]:
         location = props.get("location") or props.get("path")
         if not location:
             continue
+        options = props.get("options")
+        sheets = options.get("sheets") if isinstance(options, dict) else None
         yield IoEntry(
             name or _stem(location),
             kind,
             str(location),
             str(props.get("format", "parquet")).lower(),
             props.get("schema_file") or props.get("schema"),
+            sheets=str(sheets) if sheets is not None else None,
         )
 
 
@@ -355,19 +413,70 @@ class IoConf:
             f"{entry.name} : schema_file introuvable ({entry.schema_file})"
         )
 
-    def find(self, qlik_path: str, kind: str) -> IoEntry | None:
+    def find(
+        self,
+        qlik_path: str,
+        kind: str,
+        produced: bool | None = None,
+        strict: bool = False,
+        sheet: str | None = None,
+    ) -> IoEntry | None:
         """Cherche l'entree qui correspond a un fichier Qlik, soit par le nom
         de l'entree, soit par le nom de fichier de sa location.
 
         On compare en ramenant espaces, accents, # et ponctuation a "_",
         comme les noms que fill_conf.py donne aux entrees :
-        [anon]-Ventes#2024.qvd retrouve l'entree anon_ventes_2024."""
+        [anon]-Ventes#2024.qvd retrouve l'entree anon_ventes_2024.
+
+        Args:
+            qlik_path: le fichier, tel que le script Qlik le nomme.
+            kind: "input" ou "output".
+            produced: pour une entree, si le fichier est ecrit par un STORE
+                du projet. Quand deux entrees ont le meme nom (le CSV brut
+                commandes.csv et la relecture de la sortie commandes), on
+                prend celle qui relit une sortie pour un fichier produit, et
+                l'autre sinon.
+            strict: ne rien renvoyer plutot qu'une entree de l'autre sorte.
+            sheet: pour un fichier Excel, la feuille lue ; par defaut celle
+                que porte qlik_path (SheetPath).
+
+        Returns:
+            L'entree, ou None.
+        """
         stem = io_key(qlik_path)
         pool = self.inputs if kind == "input" else self.outputs
-        for e in pool:
-            if io_key(e.name) == stem or io_key(e.location) == stem:
-                return e
-        return None
+        found = [e for e in pool if stem in (io_key(e.name), io_key(e.location))]
+        # airports.csv et airports.xlsx : celle qui a la meme extension
+        ext = Path(qlik_path.replace("\\", "/")).suffix.lower()
+        if len(found) > 1 and ext:
+            found = [
+                e for e in found if Path(e.location).suffix.lower() in (ext, "")
+            ] or found
+        # un fichier Excel a plusieurs feuilles : l'entree de la feuille lue
+        sheet = sheet or getattr(qlik_path, "sheet", None)
+        if len(found) > 1 and sheet:
+            found = [
+                e for e in found if (e.sheets or "").lower() == sheet.lower()
+            ] or found
+        if kind != "input" or produced is None:
+            return found[0] if found else None
+        same = [e for e in found if self.rereads_output(e) == produced]
+        if same or strict:
+            return same[0] if same else None
+        return found[0] if found else None
+
+    def rereads_output(self, entry: IoEntry) -> bool:
+        """Dit si une entree relit une sortie du projet.
+
+        Args:
+            entry: l'entree.
+
+        Returns:
+            True pour un from_output, ou une ancienne entree dont la
+            location est celle d'une sortie.
+        """
+        outputs = {o.location for o in self.outputs}
+        return bool(entry.from_output) or entry.location in outputs
 
 
 def main() -> int:

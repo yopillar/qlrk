@@ -15,7 +15,9 @@ l'existant, --no-conf pour s'en passer). Puis, pour chaque script :
                    puis orchestrate.py regenere l'etape 010
                    (src/scripts/<projet>_step_010_run_sql.py)
   4. verify.py     compare avec Qlik, s'il y a des sorties dans
-                   data/qlik_outputs/
+                   data/qlik_outputs/ : une fois tous les scripts assembles,
+                   le job est lance une seule fois, en entier (comme
+                   spark-submit), puis chaque script est compare
 
 Au bout, l'etape 010 contient tous les scripts assembles, dans l'ordre de
 leurs dependances, et src/job_<projet>.py la lance.
@@ -30,6 +32,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent
@@ -37,6 +40,50 @@ sys.path.insert(0, str(TOOLS))
 from conf import WORK, find_scripts  # noqa: E402
 from job_template import job_path  # noqa: E402
 from orchestrate import STORES, order_scripts  # noqa: E402
+
+
+def compare_all(
+    assembled: list[tuple[int, Path]],
+    summary: list[tuple[str, str, list[str]]],
+    variables: list[str],
+) -> None:
+    """Lance le job une seule fois, en entier comme spark-submit, puis
+    compare chaque script assemble avec les exports Qlik.
+
+    Le job n'est pas lance script par script avec --only : la facon dont le
+    socle nomme les scripts n'entre pas en jeu.
+
+    Args:
+        assembled: (rang dans le resume, work/<script>) des scripts
+            assembles.
+        summary: le resume, complete avec le verdict de chaque script.
+        variables: les --var de la ligne de commande.
+    """
+    print(f"\nExecution du job {job_path()} pour la comparaison avec Qlik ...")
+    started = time.time()
+    failed = subprocess.run([sys.executable, str(job_path())]).returncode != 0
+    if failed:
+        print(
+            "[!] Une ou plusieurs etapes du job ont echoue (voir la trace "
+            "ci-dessus) : seules les sorties qu'il a reecrites sont comparees."
+        )
+    for rank, workdir in assembled:
+        rc = run(
+            "verify.py",
+            str(workdir),
+            "--no-run",
+            f"--started={started}",
+            *[f"--var={v}" for v in variables],
+        )
+        verdict = {
+            0: "donnees identiques a Qlik",
+            1: "ecarts avec Qlik : voir comparaison.md",
+            3: "pas d'export Qlik dans data/qlik_outputs/ pour comparer",
+        }.get(rc, "comparaison impossible (voir ci-dessus)")
+        if failed:
+            verdict += " (le job a echoue en route)"
+        name, state, to_fix = summary[rank]
+        summary[rank] = (name, f"{state}, {verdict}", to_fix)
 
 
 def run(script: str, *args: str) -> int:
@@ -105,9 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     # data/output.
     folder = args.path if args.path.is_dir() else args.path.parent
     run("prepare.py", "--collect", *map(str, find_scripts(folder)))
-    # On traite les scripts dans l'ordre de leurs dependances, comme le job :
-    # verify.py lance un script seul, et il doit trouver les fichiers ecrits
-    # par ceux dont il depend.
+    # On traite les scripts dans l'ordre de leurs dependances, comme le job.
     if STORES.exists():
         rank = {
             s: i
@@ -138,6 +183,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     summary: list[tuple[str, str, list[str]]] = []
+    assembled: list[tuple[int, Path]] = []  # scripts a comparer avec Qlik
     stopped = False
     for script in scripts:
         print(f"\n{'#' * 70}\n# {script.name}\n{'#' * 70}")
@@ -192,10 +238,15 @@ def main(argv: list[str] | None = None) -> int:
             if s["status"] in ("escalade", "erreur_modele")
         ]
         if todo or to_fix:
+            # Pas assemble : une ancienne version du script ne doit pas
+            # rester dans le job sans qu'on le sache.
+            was_in_job = (workdir / "assembly.json").exists()
+            (workdir / "assembly.json").unlink(missing_ok=True)
             summary.append(
                 (
                     script.name,
-                    f"{todo} a traduire, {len(to_fix)} a corriger a la main",
+                    f"{todo} a traduire, {len(to_fix)} a corriger a la main"
+                    + (", retire du job jusqu'a correction" if was_in_job else ""),
                     to_fix,
                 )
             )
@@ -210,25 +261,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             run("orchestrate.py")  # ajoute ce script au job
-            state = "assemble dans src/"
-            if compare:
-                rc = run("verify.py", str(workdir), *[f"--var={v}" for v in args.var])
-                verdict = {
-                    0: "donnees identiques a Qlik",
-                    1: "ecarts avec Qlik : voir comparaison.md",
-                    3: "pas d'export Qlik dans data/qlik_outputs/ pour comparer",
-                }.get(
-                    rc,
-                    "des etapes du job ont echoue (voir la trace), les "
-                    "sorties produites sont identiques a Qlik",
-                )
-                state += f", {verdict}"
-            summary.append((script.name, state, []))
+            assembled.append((len(summary), workdir))
+            summary.append((script.name, "assemble dans src/", []))
         if args.pilot:
             break
 
     print()
     run("orchestrate.py")  # regenere l'etape 010 (et cree le job)
+    if compare and assembled:
+        compare_all(assembled, summary, args.var)
 
     print(f"\n{'=' * 70}\nRESUME")
     print(f"Conf : {conf_state}")

@@ -16,11 +16,14 @@ named `step_1`, `step_2`... with a `-- l.<n>` comment, then the final SELECT.
 | `... WHERE cond` | `WHERE cond` |
 | `... GROUP BY a` | `GROUP BY a` |
 | `... ORDER BY a` | ignored, UNLESS Peek/Previous/RowNo: then `OVER (ORDER BY a)` |
-| `DROP FIELD x FROM T` | next CTE listing all remaining columns explicitly |
+| `DROP FIELD x FROM T` | next CTE listing all remaining columns explicitly (no `SELECT * EXCEPT`: Spark 3.5 has none) |
 | `DROP TABLE T` | nothing |
 | stacked LOAD (LOAD without FROM above a LOAD) | read BOTTOM-UP: the lower LOAD is the earlier CTE |
 
 - A column created in a LOAD can only be used in the NEXT LOAD: next CTE.
+- A table read by RESIDENT sees the table as it is AT THAT LINE: a later
+  JOIN, CONCATENATE or DROP FIELD on it does not change what was read.
+- A name with a special character (#, space) stays in backticks: `TST#TEST`.
 - The final SELECT lists the output columns explicitly, in Qlik order.
 
 ```sql
